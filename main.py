@@ -19,7 +19,10 @@ from aiogram.types import (
     BufferedInputFile
 )
 
-# PDF hisobot yaratish
+# Render.com dagi bepul Web Service uchun port ochish va Timed out ni bartaraf etish
+from aiohttp import web
+
+# PDF hisobot tayyorlash
 from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
@@ -35,7 +38,7 @@ CARD_OWNER = "Azizbek Ibrohimov"
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
-# Barcha darslar bazasi (Siz bergan aniq ro'yxat)
+# Darslar bazasi
 DEFAULT_LESSONS = [
     # 1-BLOK: Dastlabki kimyo va atom
     ("dastlabki_5", "cat_1", "🧪 Dastlabki tushunchalar (5 ta mavzu)", 15000),
@@ -129,14 +132,12 @@ def init_db():
         )
     """)
 
-    # Darslarni bazaga kiritish (agar bo'sh bo'lsa)
     for lid, cat, title, price in DEFAULT_LESSONS:
         cursor.execute("""
             INSERT OR IGNORE INTO lessons (id, category, title, price, theory_file_id, problem_file_id)
             VALUES (?, ?, ?, ?, NULL, NULL)
         """, (lid, cat, title, price))
 
-    # Birlamchi test kalitlari
     cursor.execute("SELECT value FROM settings WHERE key = 'test_keys_30'")
     if not cursor.fetchone():
         cursor.execute(
@@ -274,7 +275,7 @@ def get_all_users():
     conn.close()
     return users
 
-# Holatlar (States)
+# FSM Holatlar
 class PaymentState(StatesGroup):
     waiting_for_receipt = State()
 
@@ -289,7 +290,7 @@ class AdminState(StatesGroup):
     waiting_for_broadcast = State()
     waiting_for_new_keys = State()
 
-# 30 talik test PDF hisoboti
+# 30 talik test PDF generatori
 def generate_test_pdf(full_name: str, user_id: int, user_answers: str, correct_keys: str):
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=A4, rightMargin=36, leftMargin=36, topMargin=36, bottomMargin=36)
@@ -368,7 +369,6 @@ def generate_test_pdf(full_name: str, user_id: int, user_answers: str, correct_k
     buffer.seek(0)
     return buffer.getvalue(), correct_count, percentage, total_ball
 
-# Asosiy tugmalar menyusi
 def get_main_keyboard():
     return ReplyKeyboardMarkup(
         keyboard=[
@@ -393,14 +393,14 @@ async def start_handler(message: types.Message, state: FSMContext):
         f"Assalomu alaykum, <b>{full_name}</b>! 👋\n\n"
         f"🧪 <b>A+ Kimyo</b> rasmiy ta'lim va imtihon botiga xush kelibsiz!\n\n"
         f"Bu yerda siz:\n"
-        f"• <b>Nazariya va masala</b> video darslarini to'g'ridan-to'g'ri xarid qilib ko'rishingiz;\n"
+        f"• <b>Nazariya va masala</b> video darslarini xarid qilib ko'rishingiz;\n"
         f"• <b>41, 42, 43-maxsus masalalar</b> tahlilini o'rganishingiz;\n"
         f"• <b>30 talik test</b> topshirib, rasmiy PDF hisobot olishingiz mumkin.\n\n"
         f"Kerakli bo'limni tanlang 👇"
     )
     await message.answer(welcome, parse_mode="HTML", reply_markup=get_main_keyboard())
 
-# 1. Darslar katalogi toifalari
+# Darslar katalogi
 @dp.message(F.text == "📚 Video Darslar Katalogi")
 async def catalog_categories_handler(message: types.Message):
     kb = InlineKeyboardMarkup(
@@ -468,7 +468,6 @@ async def back_to_cats_handler(callback: types.CallbackQuery):
     )
     await callback.answer()
 
-# Dars ma'lumotlari va xarid oynasi
 @dp.callback_query(F.data.startswith("view_lesson:"))
 async def view_lesson_handler(callback: types.CallbackQuery):
     lid = callback.data.split(":")[1]
@@ -489,7 +488,7 @@ async def view_lesson_handler(callback: types.CallbackQuery):
 
     btns = []
     if is_purchased:
-        text += "✅ <i>Siz ushbu darsni xarid qilgansiz! Quyidagi tugma orqali videolarni ko'rishingiz mumkin:</i>"
+        text += "✅ <i>Siz ushbu darsni xarid qilgansiz! Videolarni quyidagi tugma orqali ko'rishingiz mumkin:</i>"
         btns.append([InlineKeyboardButton(text="▶️ Videolarni ko'rish", callback_data=f"play_lesson:{lid}")])
     else:
         text += "Videolarni bot ichida ko'rish uchun to'lov qiling 👇"
@@ -499,7 +498,6 @@ async def view_lesson_handler(callback: types.CallbackQuery):
     await callback.message.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=btns))
     await callback.answer()
 
-# Darsni sotib olish jarayoni
 @dp.callback_query(F.data.startswith("buy_lesson:"))
 async def buy_lesson_callback(callback: types.CallbackQuery, state: FSMContext):
     lid = callback.data.split(":")[1]
@@ -523,7 +521,6 @@ async def buy_lesson_callback(callback: types.CallbackQuery, state: FSMContext):
     await callback.message.answer(text, parse_mode="HTML", reply_markup=cancel_kb)
     await callback.answer()
 
-# Jonli dars (30 000)
 @dp.message(F.text == "🔴 Jonli dars (30 000)")
 async def live_lesson_handler(message: types.Message, state: FSMContext):
     await state.update_data(item_id="live_lesson", item_name="🔴 Jonli Dars & Savol-Javob", item_price=30000)
@@ -545,7 +542,6 @@ async def cancel_handler(message: types.Message, state: FSMContext):
     await state.clear()
     await message.answer("Jarayon bekor qilindi.", reply_markup=get_main_keyboard())
 
-# Chekni qabul qilish va adminga yuborish
 @dp.message(PaymentState.waiting_for_receipt, F.photo)
 async def receive_receipt_handler(message: types.Message, state: FSMContext):
     data = await state.get_data()
@@ -597,7 +593,6 @@ async def receive_receipt_handler(message: types.Message, state: FSMContext):
         reply_markup=admin_kb
     )
 
-# Admin to'lovni tasdiqlaganda
 @dp.callback_query(F.data.startswith("pay_ok:"))
 async def approve_payment_handler(callback: types.CallbackQuery):
     pay_id = int(callback.data.split(":")[1])
@@ -613,7 +608,6 @@ async def approve_payment_handler(callback: types.CallbackQuery):
 
     update_payment_status(pay_id, "approved")
 
-    # Agar maxsus dars bo'lsa
     if item_id != "live_lesson":
         record_purchase(user_id, item_id)
         lesson = get_lesson_by_id(item_id)
@@ -623,25 +617,23 @@ async def approve_payment_handler(callback: types.CallbackQuery):
         student_text = (
             f"🎉 <b>To'lovingiz tasdiqlandi!</b>\n\n"
             f"📚 <b>Mavzu:</b> {item_name}\n\n"
-            f"Videolar quyida shaxsiy xabar tarzida taqdim etilmoqda 👇"
+            f"Videolar quyida siz uchun shaxsiy tarzda taqdim etilmoqda 👇"
         )
         await bot.send_message(chat_id=user_id, text=student_text, parse_mode="HTML")
 
-        # Nazariya videosi bormi?
         if theory_id:
             await bot.send_video(
                 chat_id=user_id,
                 video=theory_id,
-                caption=f"📘 <b>Nazariya darsi:</b> {item_name}\n<i>Faqat siz uchun! O'g'irlash va uzatishdan himoyalangan.</i>",
+                caption=f"📘 <b>Nazariya darsi:</b> {item_name}\n<i>Faqat siz uchun! Nusxa olish va uzatishdan himoyalangan.</i>",
                 parse_mode="HTML",
                 protect_content=True
             )
-        # Masala videosi bormi?
         if problem_id:
             await bot.send_video(
                 chat_id=user_id,
                 video=problem_id,
-                caption=f"📝 <b>Masala yechish darsi:</b> {item_name}\n<i>Faqat siz uchun! O'g'irlash va uzatishdan himoyalangan.</i>",
+                caption=f"📝 <b>Masala yechish darsi:</b> {item_name}\n<i>Faqat siz uchun! Nusxa olish va uzatishdan himoyalangan.</i>",
                 parse_mode="HTML",
                 protect_content=True
             )
@@ -649,11 +641,10 @@ async def approve_payment_handler(callback: types.CallbackQuery):
         if not theory_id and not problem_id:
             await bot.send_message(
                 chat_id=user_id,
-                text="⏳ <i>Dars videosi ustoz tomonidan suratga olinmoqda va tez orada botga yuklanishi bilan sizga to'g'ridan-to'g'ri tashlab beriladi!</i>",
+                text="⏳ <i>Dars videosi ustoz tomonidan yuklanishi bilan bot sizga darhol yetkazib beradi!</i>",
                 parse_mode="HTML"
             )
     else:
-        # Jonli dars havolasi
         channel_link = get_setting("channel_link", "https://t.me/onlyibrohimov")
         kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🚀 Jonli Dars Guruhiga Kirish", url=channel_link)]])
         await bot.send_message(
@@ -689,7 +680,6 @@ async def reject_payment_handler(callback: types.CallbackQuery):
     )
     await callback.answer("Rad etildi!")
 
-# O'quvchi xarid qilgan darslarini qayta ko'rishi
 @dp.message(F.text == "📁 Xarid qilingan darslarim")
 async def my_purchased_lessons_handler(message: types.Message):
     purchases = get_user_purchases(message.from_user.id)
@@ -738,7 +728,7 @@ async def play_lesson_handler(callback: types.CallbackQuery):
         )
     await callback.answer()
 
-# ==================== ADMIN: VIDEOLARNI BOTGA YUKLASH TIZIMI ====================
+# Admin panel
 @dp.message(Command("admin"))
 async def admin_main_panel(message: types.Message):
     if message.from_user.id != ADMIN_ID:
@@ -816,7 +806,7 @@ async def admin_wait_video(callback: types.CallbackQuery, state: FSMContext):
 
     await callback.message.answer(
         f"📹 <b>{type_name} darsi videosini shu yerga yuboring:</b>\n\n"
-        f"Telegramda videoni oddiygina yuborsangiz, bot uni avtomat saqlab oladi.",
+        f"Videoni Telegram orqali yuboring, bot uni avtomatik saqlaydi.",
         parse_mode="HTML",
         reply_markup=cancel_kb
     )
@@ -838,12 +828,12 @@ async def admin_save_video(message: types.Message, state: FSMContext):
         f"✅ <b>Muvaffaqiyatli saqlandi!</b>\n\n"
         f"Mavzu: <b>{title}</b>\n"
         f"Turi: <b>{type_str}</b>\n\n"
-        f"Endi ushbu mavzuni xarid qilgan o'quvchilarga video avtomatik yetkazib beriladi!",
+        f"Endi ushbu darsni xarid qilgan o'quvchilarga video avtomatik yetkazib beriladi!",
         parse_mode="HTML",
         reply_markup=get_main_keyboard()
     )
 
-# 30 talik test topshirish
+# 30 talik test
 @dp.message(F.text == "📝 30 talik test tekshirish (PDF)")
 async def test_30_start(message: types.Message, state: FSMContext):
     await state.set_state(Test30State.waiting_for_answers)
@@ -852,7 +842,7 @@ async def test_30_start(message: types.Message, state: FSMContext):
         "📝 <b>30 talik test javoblaringizni yuboring!</b>\n\n"
         "Javoblarni ketma-ket 30 ta harf ko'rinishida yozing (A, B, C, D):\n"
         "Masalan: <code>abcdabcdabcdabcdabcdabcdabcdab</code>\n\n"
-        "Bot sizga darhol PDF hisobot tayyorlab beradi! 📄",
+        "Bot sizga darhol rasmiy PDF hisobot tayyorlab beradi! 📄",
         parse_mode="HTML",
         reply_markup=cancel_kb
     )
@@ -861,7 +851,7 @@ async def test_30_start(message: types.Message, state: FSMContext):
 async def test_30_process(message: types.Message, state: FSMContext):
     user_keys = message.text.strip().lower().replace(" ", "").replace("\n", "")
     if len(user_keys) != 30:
-        await message.answer(f"❗️ Siz kiritgan javoblar soni: <b>{len(user_keys)} ta</b>. Testda qat'iy 30 ta bo'lishi kerak:")
+        await message.answer(f"❗️ Siz kiritgan javoblar soni: <b>{len(user_keys)} ta</b>. Testda qat'iy 30 ta bo'lishi kerak!")
         return
 
     official_keys = get_setting("test_keys_30", "abcdabcdabcdabcdabcdabcdabcdab")
@@ -886,7 +876,7 @@ async def test_30_process(message: types.Message, state: FSMContext):
     pdf_file = BufferedInputFile(pdf_bytes, filename=f"Natija_{message.from_user.id}.pdf")
     await message.answer_document(document=pdf_file, caption=caption, parse_mode="HTML", reply_markup=get_main_keyboard())
 
-# Statistika va boshqa admin funksiyalar
+# Admin qo'shimcha amallari
 @dp.callback_query(F.data == "admin_stats")
 async def admin_stats(callback: types.CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
@@ -918,7 +908,7 @@ async def process_new_keys(message: types.Message, state: FSMContext):
         return
     k = message.text.strip().lower().replace(" ", "")
     if len(k) != 30:
-        await message.answer("Kalit 30 ta bo'lishi shart!")
+        await message.answer("Kalit 30 ta harf bo'lishi shart!")
         return
     set_setting("test_keys_30", k)
     await state.clear()
@@ -929,7 +919,7 @@ async def admin_change_link(callback: types.CallbackQuery, state: FSMContext):
     if callback.from_user.id != ADMIN_ID:
         return
     cur = get_setting("channel_link", "https://t.me/onlyibrohimov")
-    await callback.message.answer(f"Hozirgi havola: {cur}\n\nYangi havola yuboring:")
+    await callback.message.answer(f"Hozirgi havola: {cur}\n\nYangi havolani yuboring:")
     await callback.answer()
 
 @dp.callback_query(F.data == "admin_broadcast")
@@ -964,13 +954,28 @@ async def teacher_info(message: types.Message):
         "👨‍🏫 <b>Ustoz haqida:</b>\n\n"
         "• Azizbek Ibrohimov — Kimyo fani bo'yicha maxsus uslubiyot muallifi;\n"
         "• DTM va Milliy Sertifikat imtihonlariga tayyorlovchi murabbiy;\n"
-        "• Masalalarni formulalarsiz va mantiqiy usullarda oson yechish tizimi.",
+        "• Masalalarni formulalarsiz va mantiqiy usullarda oson yechish tizimi muallifi.",
         parse_mode="HTML"
     )
 
 @dp.message(F.text == "📞 Bog'lanish")
 async def contact_info(message: types.Message):
-    await message.answer(f"📞 Savollar bo'yicha admin: {ADMIN_USERNAME}", parse_mode="HTML")
+    await message.answer(f"📞 Savollar bo'yicha administrator: {ADMIN_USERNAME}", parse_mode="HTML")
+
+# Render Web Service uchun port ochish funksiyasi (Timed out bo'lmasligi uchun)
+async def handle_ping(request):
+    return web.Response(text="A+ Kimyo Bot is active 24/7!")
+
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get("/", handle_ping)
+    app.router.add_get("/health", handle_ping)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.getenv("PORT", 8080))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    print(f">>> Render Web Port {port} faollashdi!")
 
 async def main():
     init_db()
@@ -978,6 +983,9 @@ async def main():
     print(">>> A+ Kimyo Boti (Yangi Darslar Katalogi & Video Baza) ishga tushdi!")
     print(f">>> Admin ID: {ADMIN_ID} | Admin: {ADMIN_USERNAME}")
     print("=" * 60)
+    # 1. Render tekshiruvi uchun veb-server ishga tushadi
+    await start_web_server()
+    # 2. Telegram bot ishga tushadi
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
