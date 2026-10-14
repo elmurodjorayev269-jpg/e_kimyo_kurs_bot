@@ -1,11 +1,16 @@
 import asyncio
+import base64
 import io
+import json
 import logging
 import os
+import re
 import sqlite3
 import sys
 from datetime import datetime
 
+import aiohttp
+from aiohttp import web
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
@@ -16,79 +21,26 @@ from aiogram.types import (
     KeyboardButton,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
-    BufferedInputFile
 )
 
-# Render.com dagi bepul Web Service uchun port ochish va Timed out ni bartaraf etish
-from aiohttp import web
-
-# PDF hisobot tayyorlash
-from reportlab.lib.pagesizes import A4
-from reportlab.lib import colors
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-
+# -------------------------------------------------------------
+# SOZLAMALAR VA XAVFSIZLIK
+# -------------------------------------------------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8636730483:AAFU8mRl0pH5AjmCASWETCNLy35q4lMpB-s")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "6734050237"))
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "@onlyibrohimov")
-
-CARD_NUMBER = "9860 3501 4209 7954"
-CARD_OWNER = "Azizbek Ibrohimov"
+DEFAULT_GEMINI_KEY = os.getenv("GEMINI_API_KEY", "")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
-# Darslar bazasi
-DEFAULT_LESSONS = [
-    # 1-BLOK: Dastlabki kimyo va atom
-    ("dastlabki_5", "cat_1", "🧪 Dastlabki tushunchalar (5 ta mavzu)", 15000),
-    ("mol", "cat_1", "⚖️ Modda miqdori mol", 15000),
-    ("ekvivalent", "cat_1", "📐 Ekvivalent", 15000),
-    ("kimyoviy_bog", "cat_1", "🔗 Kimyoviy bog'lanish", 15000),
-    ("kimyoviy_reaksiya", "cat_1", "💥 Kimyoviy reaksiya", 15000),
-    ("atom_tuzilishi", "cat_1", "⚛️ Atom tuzilishi", 15000),
-    ("kvant_sonlar", "cat_1", "🔢 Kvant sonlar", 15000),
-    ("yadro_reaksiya", "cat_1", "☢️ Yadro reaksiyalari", 15000),
-
-    # 2-BLOK: Gazlar, eritmalar va muvozanat
-    ("gazlar_aralashmasi", "cat_2", "💨 Gazlar aralashmasi", 15000),
-    ("aralashmalar", "cat_2", "🥣 Aralashmalar", 15000),
-    ("klapeyron", "cat_2", "🌡 Mendeleyev-Klapeyron tenglamasi", 15000),
-    ("gibridlanish", "cat_2", "🔄 Gibridlanish", 15000),
-    ("eritmalar_to'liq", "cat_2", "💧 Eritmalar (Foiz, molyar, molyal, normal, titr)", 15000),
-    ("eruvchanlik", "cat_2", "🧊 Eruvchanlik", 15000),
-    ("elektroliz", "cat_2", "⚡️ Elektroliz", 15000),
-    ("dissotsiyalanish", "cat_2", "⚡️ Dissotsiyalanish", 15000),
-    ("suv_ioni", "cat_2", "💧 Suvning ion ko'paytmasi va pH", 15000),
-    ("oleum", "cat_2", "🧪 Oleum masalalari", 15000),
-    ("plastinka", "cat_2", "🔩 Plastinka masalalari", 15000),
-
-    # 3-BLOK: Organik kimyo
-    ("alkanlar", "cat_3", "🛢 Alkanlar", 15000),
-    ("alkenlar", "cat_3", "🌿 Alkenlar", 15000),
-    ("alkinlar", "cat_3", "🔥 Alkinlar", 15000),
-    ("alkadiyenlar", "cat_3", "⛓ Alkadiyenlar", 15000),
-    ("aromatik", "cat_3", "💠 Aromatik uglevodorodlar (Arenlar)", 15000),
-    ("spirtlar", "cat_3", "🍷 Spirtlar", 15000),
-    ("aminokislotalar", "cat_3", "🧬 Aminokislotalar", 15000),
-
-    # 4-BLOK: Milliy Sertifikat Maxsus Qism
-    ("masala_41", "cat_4", "🎯 41-masala ishlash usuli & namuna tahlili", 30000),
-    ("band_42", "cat_4", "🔥 42-band murakkab masalalar tahlili", 50000),
-    ("analitik_43", "cat_4", "🔬 43 - Analitik kimyo masalalari", 30000),
-]
-
-CATEGORIES = {
-    "cat_1": "🧪 Dastlabki kimyo & Atom",
-    "cat_2": "⚗️ Gazlar, Eritmalar & Reaksiyalar",
-    "cat_3": "🧬 Organik kimyo",
-    "cat_4": "🎯 Milliy Sertifikat Maxsus (41, 42, 43)"
-}
-
+# -------------------------------------------------------------
+# MA'LUMOTLAR BAZASI
+# -------------------------------------------------------------
 def init_db():
     conn = sqlite3.connect("database.db")
-    cursor = conn.cursor()
-    cursor.execute("""
+    c = conn.cursor()
+    c.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
             full_name TEXT,
@@ -96,875 +48,1210 @@ def init_db():
             joined_at TEXT
         )
     """)
-    cursor.execute("""
+    c.execute("""
         CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
             value TEXT
         )
     """)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS payments (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            item_id TEXT,
-            item_name TEXT,
-            price INTEGER,
-            status TEXT,
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS tests (
+            test_code TEXT PRIMARY KEY,
+            test_type TEXT,
+            title TEXT,
+            keys_json TEXT,
+            ai_explanation TEXT,
+            file_id TEXT,
+            file_type TEXT,
             created_at TEXT
         )
     """)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS lessons (
-            id TEXT PRIMARY KEY,
-            category TEXT,
-            title TEXT,
-            price INTEGER,
-            theory_file_id TEXT,
-            problem_file_id TEXT
-        )
-    """)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS user_purchases (
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS test_results (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            test_code TEXT,
             user_id INTEGER,
-            lesson_id TEXT,
-            purchased_at TEXT,
-            PRIMARY KEY (user_id, lesson_id)
+            full_name TEXT,
+            correct_count INTEGER,
+            total_score REAL,
+            grade TEXT,
+            submitted_at TEXT
         )
     """)
-
-    for lid, cat, title, price in DEFAULT_LESSONS:
-        cursor.execute("""
-            INSERT OR IGNORE INTO lessons (id, category, title, price, theory_file_id, problem_file_id)
-            VALUES (?, ?, ?, ?, NULL, NULL)
-        """, (lid, cat, title, price))
-
-    cursor.execute("SELECT value FROM settings WHERE key = 'test_keys_30'")
-    if not cursor.fetchone():
-        cursor.execute(
-            "INSERT INTO settings (key, value) VALUES ('test_keys_30', ?)",
-            ("abcdabcdabcdabcdabcdabcdabcdab",)
-        )
-
     conn.commit()
     conn.close()
 
-def add_user(user_id: int, full_name: str, username: str):
+def db_add_user(user_id: int, full_name: str, username: str):
     conn = sqlite3.connect("database.db")
-    cursor = conn.cursor()
-    cursor.execute("""
-        INSERT OR IGNORE INTO users (user_id, full_name, username, joined_at)
-        VALUES (?, ?, ?, ?)
-    """, (user_id, full_name, username, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+    c = conn.cursor()
+    c.execute(
+        "INSERT OR IGNORE INTO users (user_id, full_name, username, joined_at) VALUES (?, ?, ?, ?)",
+        (user_id, full_name, username, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    )
     conn.commit()
     conn.close()
 
-def get_lessons_by_category(category_key: str):
+def db_get_setting(key: str, default: str = "") -> str:
     conn = sqlite3.connect("database.db")
-    cursor = conn.cursor()
-    cursor.execute("SELECT id, title, price, theory_file_id, problem_file_id FROM lessons WHERE category = ?", (category_key,))
-    rows = cursor.fetchall()
-    conn.close()
-    return rows
-
-def get_lesson_by_id(lesson_id: str):
-    conn = sqlite3.connect("database.db")
-    cursor = conn.cursor()
-    cursor.execute("SELECT id, title, price, theory_file_id, problem_file_id FROM lessons WHERE id = ?", (lesson_id,))
-    row = cursor.fetchone()
-    conn.close()
-    return row
-
-def update_lesson_video(lesson_id: str, video_type: str, file_id: str):
-    conn = sqlite3.connect("database.db")
-    cursor = conn.cursor()
-    field = "theory_file_id" if video_type == "theory" else "problem_file_id"
-    cursor.execute(f"UPDATE lessons SET {field} = ? WHERE id = ?", (file_id, lesson_id))
-    conn.commit()
-    conn.close()
-
-def record_purchase(user_id: int, lesson_id: str):
-    conn = sqlite3.connect("database.db")
-    cursor = conn.cursor()
-    cursor.execute("""
-        INSERT OR REPLACE INTO user_purchases (user_id, lesson_id, purchased_at)
-        VALUES (?, ?, ?)
-    """, (user_id, lesson_id, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
-    conn.commit()
-    conn.close()
-
-def user_has_lesson(user_id: int, lesson_id: str) -> bool:
-    conn = sqlite3.connect("database.db")
-    cursor = conn.cursor()
-    cursor.execute("SELECT 1 FROM user_purchases WHERE user_id = ? AND lesson_id = ?", (user_id, lesson_id))
-    row = cursor.fetchone()
-    conn.close()
-    return bool(row)
-
-def get_user_purchases(user_id: int):
-    conn = sqlite3.connect("database.db")
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT l.id, l.title, l.theory_file_id, l.problem_file_id 
-        FROM user_purchases up
-        JOIN lessons l ON up.lesson_id = l.id
-        WHERE up.user_id = ?
-    """, (user_id,))
-    rows = cursor.fetchall()
-    conn.close()
-    return rows
-
-def record_payment(user_id: int, item_id: str, item_name: str, price: int):
-    conn = sqlite3.connect("database.db")
-    cursor = conn.cursor()
-    cursor.execute("""
-        INSERT INTO payments (user_id, item_id, item_name, price, status, created_at)
-        VALUES (?, ?, ?, ?, 'pending', ?)
-    """, (user_id, item_id, item_name, price, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
-    p_id = cursor.lastrowid
-    conn.commit()
-    conn.close()
-    return p_id
-
-def get_payment(payment_id: int):
-    conn = sqlite3.connect("database.db")
-    cursor = conn.cursor()
-    cursor.execute("SELECT id, user_id, item_id, item_name, price, status FROM payments WHERE id = ?", (payment_id,))
-    row = cursor.fetchone()
-    conn.close()
-    return row
-
-def update_payment_status(payment_id: int, status: str):
-    conn = sqlite3.connect("database.db")
-    cursor = conn.cursor()
-    cursor.execute("UPDATE payments SET status = ? WHERE id = ?", (status, payment_id))
-    conn.commit()
-    conn.close()
-
-def get_stats():
-    conn = sqlite3.connect("database.db")
-    cursor = conn.cursor()
-    cursor.execute("SELECT COUNT(*) FROM users")
-    total_users = cursor.fetchone()[0]
-    cursor.execute("SELECT COUNT(*) FROM payments WHERE status = 'approved'")
-    approved = cursor.fetchone()[0]
-    cursor.execute("SELECT COUNT(*) FROM payments WHERE status = 'pending'")
-    pending = cursor.fetchone()[0]
-    conn.close()
-    return {"users": total_users, "approved": approved, "pending": pending}
-
-def get_setting(key: str, default: str = ""):
-    conn = sqlite3.connect("database.db")
-    cursor = conn.cursor()
-    cursor.execute("SELECT value FROM settings WHERE key = ?", (key,))
-    row = cursor.fetchone()
+    c = conn.cursor()
+    c.execute("SELECT value FROM settings WHERE key = ?", (key,))
+    row = c.fetchone()
     conn.close()
     return row[0] if row else default
 
-def set_setting(key: str, val: str):
+def db_set_setting(key: str, val: str):
     conn = sqlite3.connect("database.db")
-    cursor = conn.cursor()
-    cursor.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, val))
+    c = conn.cursor()
+    c.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, val))
     conn.commit()
     conn.close()
 
-def get_all_users():
+def db_save_test(test_code: str, test_type: str, title: str, keys_dict: dict, explanation: str = "", file_id: str = "", file_type: str = ""):
     conn = sqlite3.connect("database.db")
-    cursor = conn.cursor()
-    cursor.execute("SELECT user_id FROM users")
-    users = [row[0] for row in cursor.fetchall()]
+    c = conn.cursor()
+    c.execute(
+        """INSERT OR REPLACE INTO tests 
+           (test_code, test_type, title, keys_json, ai_explanation, file_id, file_type, created_at) 
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            test_code.upper(),
+            test_type,
+            title,
+            json.dumps(keys_dict, ensure_ascii=False),
+            explanation,
+            file_id,
+            file_type,
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        )
+    )
+    conn.commit()
+    conn.close()
+
+def db_get_test(test_code: str):
+    conn = sqlite3.connect("database.db")
+    c = conn.cursor()
+    c.execute(
+        "SELECT test_code, test_type, title, keys_json, ai_explanation, file_id, file_type FROM tests WHERE test_code = ?",
+        (test_code.upper().strip(),)
+    )
+    row = c.fetchone()
+    conn.close()
+    return row
+
+def db_delete_test(test_code: str) -> bool:
+    conn = sqlite3.connect("database.db")
+    c = conn.cursor()
+    c.execute("DELETE FROM tests WHERE test_code = ?", (test_code.upper().strip(),))
+    deleted = c.rowcount > 0
+    conn.commit()
+    conn.close()
+    return deleted
+
+def db_get_recent_tests(limit: int = 10):
+    conn = sqlite3.connect("database.db")
+    c = conn.cursor()
+    c.execute("SELECT test_code, test_type, title, created_at FROM tests ORDER BY created_at DESC LIMIT ?", (limit,))
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+def db_save_result(test_code: str, user_id: int, full_name: str, correct_count: int, total_score: float, grade: str):
+    conn = sqlite3.connect("database.db")
+    c = conn.cursor()
+    c.execute(
+        """INSERT INTO test_results (test_code, user_id, full_name, correct_count, total_score, grade, submitted_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (test_code.upper(), user_id, full_name, correct_count, total_score, grade, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    )
+    conn.commit()
+    conn.close()
+
+def db_get_top_results(test_code: str, limit: int = 15):
+    conn = sqlite3.connect("database.db")
+    c = conn.cursor()
+    c.execute(
+        """SELECT full_name, correct_count, total_score, grade 
+           FROM test_results 
+           WHERE test_code = ? 
+           ORDER BY total_score DESC, correct_count DESC 
+           LIMIT ?""",
+        (test_code.upper().strip(), limit)
+    )
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+def db_get_stats():
+    conn = sqlite3.connect("database.db")
+    c = conn.cursor()
+    c.execute("SELECT COUNT(*) FROM users")
+    users = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM tests")
+    tests_cnt = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM test_results")
+    results_cnt = c.fetchone()[0]
+    conn.close()
+    return {"users": users, "tests": tests_cnt, "results": results_cnt}
+
+def db_get_all_users():
+    conn = sqlite3.connect("database.db")
+    c = conn.cursor()
+    c.execute("SELECT user_id FROM users")
+    users = [row[0] for row in c.fetchall()]
     conn.close()
     return users
 
-# FSM Holatlar
-class PaymentState(StatesGroup):
-    waiting_for_receipt = State()
+# -------------------------------------------------------------
+# SUN'IY INTELLEKT (GEMINI AI) MOTORI
+# -------------------------------------------------------------
+def get_gemini_api_key() -> str:
+    saved_key = db_get_setting("gemini_api_key", "").strip()
+    return saved_key if saved_key else DEFAULT_GEMINI_KEY
 
-class Test30State(StatesGroup):
-    waiting_for_answers = State()
+async def ai_analyze_test_document(file_bytes: bytes, mime_type: str, test_type: str) -> dict:
+    """
+    PDF yoki rasmni o'qib, barcha savollarni yechadi va javoblar kalitini JSON ko'rinishida qaytaradi.
+    test_type: '30_talik' | '43_ms' | '90_dtm'
+    """
+    api_key = get_gemini_api_key()
+    if not api_key:
+        return {"error": "API_KEY_MISSING"}
 
-class AdminVideoUploadState(StatesGroup):
-    choosing_type = State()
-    waiting_for_video = State()
+    b64_data = base64.b64encode(file_bytes).decode("utf-8")
 
-class AdminState(StatesGroup):
-    waiting_for_broadcast = State()
-    waiting_for_new_keys = State()
+    if test_type == "30_talik":
+        prompt = (
+            "Sen Kimyo va aniq fanlar bo'yicha oliy toifali ekspertsan. "
+            "Yuborilgan fayldagi (PDF yoki rasm) 30 talik test savollarini (yoki tayyor javoblar varaqasini) diqqat bilan tahlil qil. "
+            "Har bir savol va masalani aniq yechib chiq. "
+            "Natijani FAQAT quyidagi JSON formatda qaytar (boshqa ortiqcha so'z qo'shma):\n"
+            "{\n"
+            '  "title": "Test mavzusi yoki nomi",\n'
+            '  "keys": {"1": "A", "2": "B", "3": "C", ... "30": "D"},\n'
+            '  "explanation": "Eng muhim yoki murakkab masalalarning qisqacha yechim izohi"\n'
+            "}"
+        )
+    elif test_type == "43_ms":
+        prompt = (
+            "Sen O'zbekiston Milliy Sertifikat (43 talik Rasch modeli) bo'yicha oliy toifali kimyo va aniq fanlar ekspertisan. "
+            "Yuborilgan PDF yoki rasmdagi testni diqqat bilan o'qi va har bir savolni yechib kalit tuz:\n"
+            "- 1 dan 32 gacha: Yopiq test (A, B, C yoki D)\n"
+            "- 33 dan 35 gacha: Moslashtirish testi (A, B, C, D, E yoki F)\n"
+            "- 36 dan 43 gacha: Ochiq yozma masalalar (aniq son, formula yoki javob qiymati).\n"
+            "Natijani FAQAT quyidagi toza JSON formatda qaytar:\n"
+            "{\n"
+            '  "title": "Milliy Sertifikat 43 talik test",\n'
+            '  "keys": {"1": "A", ..., "32": "D", "33": "E", "34": "A", "35": "F", "36": "9", ..., "43": "22.4"},\n'
+            '  "explanation": "36-43 ochiq masalalarning qisqa mantiqiy yechimlari"\n'
+            "}"
+        )
+    else:  # 90_dtm
+        prompt = (
+            "Sen DTM (Bilim va malakalarni baholash agentligi) 90 talik blok testlari bo'yicha oliy toifali ekspertsan. "
+            "Yuborilgan PDF yoki rasmdagi savollarni (1-30 majburiy fanlar, 31-60 1-mutaxassislik fani, 61-90 2-mutaxassislik fani) "
+            "yoki javoblar jadvalini o'qib, har bir savolning to'g'ri javobini (A, B, C yoki D) aniqla. "
+            "Natijani FAQAT quyidagi toza JSON formatda qaytar:\n"
+            "{\n"
+            '  "title": "90 talik DTM Blok Testi",\n'
+            '  "keys": {"1": "A", "2": "C", ..., "90": "B"},\n'
+            '  "explanation": "Asosiy bloklar bo\'yicha qisqacha tahlil"\n'
+            "}"
+        )
 
-# 30 talik test PDF generatori
-def generate_test_pdf(full_name: str, user_id: int, user_answers: str, correct_keys: str):
-    buffer = io.BytesIO()
-    doc = SimpleDocTemplate(buffer, pagesize=A4, rightMargin=36, leftMargin=36, topMargin=36, bottomMargin=36)
-    story = []
-    styles = getSampleStyleSheet()
-
-    title_style = ParagraphStyle(
-        'DocTitle', parent=styles['Heading1'], fontName='Helvetica-Bold', fontSize=20, leading=24, textColor=colors.HexColor("#0f172a"), alignment=1
-    )
-    subtitle_style = ParagraphStyle(
-        'DocSubtitle', parent=styles['Normal'], fontName='Helvetica', fontSize=11, leading=14, textColor=colors.HexColor("#2563eb"), alignment=1
-    )
-    info_style = ParagraphStyle(
-        'InfoText', parent=styles['Normal'], fontName='Helvetica', fontSize=10, leading=15, textColor=colors.HexColor("#1e293b")
-    )
-
-    story.append(Paragraph("A+ KIMYO TA'LIM PLATFORMASI", title_style))
-    story.append(Spacer(1, 4))
-    story.append(Paragraph("30 TALIK TEST TAHLILI VA SERTIFIKATI", subtitle_style))
-    story.append(Spacer(1, 15))
-
-    correct_count = 0
-    results_detail = []
-    for idx, (u, c) in enumerate(zip(user_answers.upper(), correct_keys.upper()), start=1):
-        is_correct = (u == c)
-        if is_correct:
-            correct_count += 1
-        results_detail.append((idx, u, c, "+" if is_correct else "-"))
-
-    percentage = round((correct_count / 30) * 100, 1)
-    total_ball = round(correct_count * 3.1, 1)
-
-    info_data = [
-        [Paragraph(f"<b>O'quvchi:</b> {full_name}", info_style), Paragraph(f"<b>Sana:</b> {datetime.now().strftime('%Y-%m-%d %H:%M')}", info_style)],
-        [Paragraph(f"<b>Telegram ID:</b> {user_id}", info_style), Paragraph(f"<b>To'g'ri javoblar:</b> {correct_count} / 30 ta ({percentage}%)", info_style)],
-        [Paragraph("<b>Fan:</b> Kimyo", info_style), Paragraph(f"<b>To'plangan ball:</b> <b>{total_ball}</b> / 93.0 ball", info_style)]
-    ]
-    info_table = Table(info_data, colWidths=[260, 260])
-    info_table.setStyle(TableStyle([
-        ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor("#f8fafc")),
-        ('BOX', (0, 0), (-1, -1), 1, colors.HexColor("#cbd5e1")),
-        ('INNERGRID', (0, 0), (-1, -1), 0.5, colors.HexColor("#e2e8f0")),
-        ('PADDING', (0, 0), (-1, -1), 6),
-    ]))
-    story.append(info_table)
-    story.append(Spacer(1, 16))
-
-    table_header = ["№", "Siz", "Kalit", "Holat", "№", "Siz", "Kalit", "Holat"]
-    table_rows = [table_header]
-    for i in range(15):
-        left = results_detail[i]
-        right = results_detail[i + 15]
-        table_rows.append([str(left[0]), left[1], left[2], left[3], str(right[0]), right[1], right[2], right[3]])
-
-    detail_table = Table(table_rows, colWidths=[35, 45, 45, 45, 35, 45, 45, 45])
-    t_style = [
-        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor("#0f172a")),
-        ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
-        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-        ('FONTSIZE', (0, 0), (-1, 0), 9),
-        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-        ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor("#cbd5e1")),
-    ]
-    for r_idx in range(1, 16):
-        for col_flag, col_idx in [(results_detail[r_idx - 1][3], 3), (results_detail[r_idx + 14][3], 7)]:
-            if col_flag == "+":
-                t_style.append(('BACKGROUND', (col_idx, r_idx), (col_idx, r_idx), colors.HexColor("#dcfce7")))
-                t_style.append(('TEXTCOLOR', (col_idx, r_idx), (col_idx, r_idx), colors.HexColor("#166534")))
-            else:
-                t_style.append(('BACKGROUND', (col_idx, r_idx), (col_idx, r_idx), colors.HexColor("#fee2e2")))
-                t_style.append(('TEXTCOLOR', (col_idx, r_idx), (col_idx, r_idx), colors.HexColor("#991b1b")))
-
-    detail_table.setStyle(TableStyle(t_style))
-    story.append(detail_table)
-    doc.build(story)
-    buffer.seek(0)
-    return buffer.getvalue(), correct_count, percentage, total_ball
-
-def get_main_keyboard():
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="📚 Video Darslar Katalogi")],
-            [KeyboardButton(text="🎯 Maxsus Masalalar (41, 42, 43)")],
-            [KeyboardButton(text="📝 30 talik test tekshirish (PDF)")],
-            [KeyboardButton(text="📁 Xarid qilingan darslarim"), KeyboardButton(text="🔴 Jonli dars (30 000)")],
-            [KeyboardButton(text="👨‍🏫 Ustoz haqida"), KeyboardButton(text="📞 Bog'lanish")]
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {"text": prompt},
+                    {
+                        "inline_data": {
+                            "mime_type": mime_type,
+                            "data": b64_data
+                        }
+                    }
+                ]
+            }
         ],
-        resize_keyboard=True
+        "generationConfig": {
+            "temperature": 0.1,
+            "responseMimeType": "application/json"
+        }
+    }
+
+    models_to_try = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
+    last_error = ""
+
+    async with aiohttp.ClientSession() as session:
+        for model_name in models_to_try:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
+            try:
+                async with session.post(url, json=payload, timeout=120) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        raw_text = data["candidates"][0]["content"]["parts"][0]["text"]
+                        raw_text = raw_text.strip()
+                        if raw_text.startswith("```"):
+                            raw_text = re.sub(r"^```(?:json)?|```$", "", raw_text, flags=re.MULTILINE).strip()
+                        parsed = json.loads(raw_text)
+                        return parsed
+                    else:
+                        err_body = await resp.text()
+                        last_error = f"HTTP {resp.status}: {err_body[:200]}"
+            except Exception as e:
+                last_error = str(e)
+
+    return {"error": f"AI tahlilda xatolik: {last_error}"}
+
+async def ai_solve_photo_problem(file_bytes: bytes, mime_type: str) -> str:
+    """
+    O'quvchi yoki ustoz rasm yuborganda masalani mantiqiy usulda yechib beradi.
+    """
+    api_key = get_gemini_api_key()
+    if not api_key:
+        return "⚠️ AI xizmati uchun Gemini API kaliti kiritilmagan. Admin paneldan (/admin) API kalitni kiriting."
+
+    b64_data = base64.b64encode(file_bytes).decode("utf-8")
+    prompt = (
+        "Sen A+ Kimyo maktabining eng tajribali ustozi Azizbek Ibrohimovning yordamchi sun'iy intellektisan. "
+        "Rasmdagi kimyo (yoki aniq fan) masalasini o'zbek tilida eng oson, formulalarsiz mantiqiy va proporsiya usulida "
+        "bosqichma-bosqich yechib tushuntirib ber va yakuniy to'g'ri javobni ko'rsat."
     )
 
-@dp.message(CommandStart())
-async def start_handler(message: types.Message, state: FSMContext):
-    await state.clear()
-    user_id = message.from_user.id
-    full_name = message.from_user.full_name or "O'quvchi"
-    username = f"@{message.from_user.username}" if message.from_user.username else ""
-    add_user(user_id, full_name, username)
+    payload = {
+        "contents": [{
+            "parts": [
+                {"text": prompt},
+                {"inline_data": {"mime_type": mime_type, "data": b64_data}}
+            ]
+        }],
+        "generationConfig": {"temperature": 0.2}
+    }
 
-    welcome = (
-        f"Assalomu alaykum, <b>{full_name}</b>! 👋\n\n"
-        f"🧪 <b>A+ Kimyo</b> rasmiy ta'lim va imtihon botiga xush kelibsiz!\n\n"
-        f"Bu yerda siz:\n"
-        f"• <b>Nazariya va masala</b> video darslarini xarid qilib ko'rishingiz;\n"
-        f"• <b>41, 42, 43-maxsus masalalar</b> tahlilini o'rganishingiz;\n"
-        f"• <b>30 talik test</b> topshirib, rasmiy PDF hisobot olishingiz mumkin.\n\n"
+    async with aiohttp.ClientSession() as session:
+        for model_name in ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
+            try:
+                async with session.post(url, json=payload, timeout=90) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        return data["candidates"][0]["content"]["parts"][0]["text"]
+            except Exception:
+                continue
+    return "❌ Rasmni tahlil qilishda xatolik yuz berdi. Qaytadan urinib ko'ring."
+
+# -------------------------------------------------------------
+# JAVOBLARNI O'QISH VA BALL HISOBLASH (30, 43, 90 TALIK)
+# -------------------------------------------------------------
+def parse_input_answers(raw_text: str, test_type: str) -> dict:
+    """
+    Foydalanuvchi kiritgan javoblarni har qanday formatdan o'qib oladi:
+    1) '1a 2b 3c ... 36=9 37=18'
+    2) 'ABCDABCD...' (ketma-ket harflar)
+    3) '1-A, 2-B, 3-C...'
+    """
+    text = raw_text.strip()
+    answers = {}
+
+    # 1. Raqamlangan formatni qidirish: 1a, 1-a, 1:a, 36=12.5, 36: 9
+    pairs = re.findall(r"(\d{1,2})\s*[-:=.)]?\s*([A-Za-z0-9.,/+-]+)", text)
+    if len(pairs) >= 3:
+        for q_num, ans_val in pairs:
+            q_str = str(int(q_num))
+            answers[q_str] = ans_val.strip().upper()
+        return answers
+
+    # 2. Faqat harflar ketma-ketligi yozilgan bo'lsa: masalan ABCDABCD...
+    clean_letters = re.sub(r"[^A-Fa-f]", "", text).upper()
+    max_q = 30 if test_type == "30_talik" else (90 if test_type == "90_dtm" else 35)
+    if len(clean_letters) >= 5:
+        for idx, ch in enumerate(clean_letters[:max_q], start=1):
+            answers[str(idx)] = ch
+
+    return answers
+
+def evaluate_student_submission(test_type: str, correct_keys: dict, student_ans: dict) -> dict:
+    """
+    30 talik, 43 talik Milliy Sertifikat va 90 talik DTM testlarini rasmiy mezon asosida hisoblaydi.
+    """
+    mistakes = []
+    correct_count = 0
+
+    if test_type == "30_talik":
+        total_q = len(correct_keys) or 30
+        for q in range(1, total_q + 1):
+            qs = str(q)
+            k_val = str(correct_keys.get(qs, "")).strip().upper()
+            s_val = str(student_ans.get(qs, "")).strip().upper()
+            if k_val and s_val == k_val:
+                correct_count += 1
+            elif k_val:
+                mistakes.append(f"{q}-savol (Siz: {s_val or '—'} | To'g'ri: {k_val})")
+
+        score = round(correct_count * 3.1, 1)
+        percent = round((correct_count / total_q) * 100, 1) if total_q else 0
+        grade = "A'lo (Yuqori)" if percent >= 85 else ("Yaxshi" if percent >= 65 else "Qoniqarli")
+
+        summary = (
+            f"📋 <b>30 TALIK TEST NATIJASI:</b>\n"
+            f"────────────────────────\n"
+            f"✅ To'g'ri javoblar: <b>{correct_count} / {total_q} ta</b>\n"
+            f"📊 Ko'rsatkich: <b>{percent}%</b>\n"
+            f"💎 To'plangan ball: <b>{score} ball</b> (maks. {round(total_q*3.1, 1)})\n"
+            f"🏅 Daraja: <b>{grade}</b>"
+        )
+        return {
+            "correct_count": correct_count,
+            "total_score": score,
+            "grade": grade,
+            "summary": summary,
+            "mistakes": mistakes
+        }
+
+    elif test_type == "90_dtm":
+        b1_correct = 0  # 1-30: 1.1 ball
+        b2_correct = 0  # 31-60: 3.1 ball
+        b3_correct = 0  # 61-90: 2.1 ball
+
+        for q in range(1, 91):
+            qs = str(q)
+            k_val = str(correct_keys.get(qs, "")).strip().upper()
+            s_val = str(student_ans.get(qs, "")).strip().upper()
+            if not k_val:
+                continue
+            if s_val == k_val:
+                correct_count += 1
+                if 1 <= q <= 30:
+                    b1_correct += 1
+                elif 31 <= q <= 60:
+                    b2_correct += 1
+                else:
+                    b3_correct += 1
+            else:
+                mistakes.append(f"{q}:{s_val or '—'}({k_val})")
+
+        b1_score = round(b1_correct * 1.1, 1)
+        b2_score = round(b2_correct * 3.1, 1)
+        b3_score = round(b3_correct * 2.1, 1)
+        total_score = round(b1_score + b2_score + b3_score, 1)
+
+        grade = "Davlat Granti darajasi 🏆" if total_score >= 150 else ("To'lov-kontrakt darajasi 🎯" if total_score >= 100 else "Qo'shimcha tayyorgarlik kerak 📚")
+
+        summary = (
+            f"🏛 <b>90 TALIK DTM BLOK TEST NATIJASI:</b>\n"
+            f"────────────────────────\n"
+            f"1️⃣ <b>Majburiy fanlar (1–30):</b> {b1_correct}/30 ta = <b>{b1_score} ball</b> (1.1)\n"
+            f"2️⃣ <b>1-Mutaxassislik fani (31–60):</b> {b2_correct}/30 ta = <b>{b2_score} ball</b> (3.1)\n"
+            f"3️⃣ <b>2-Mutaxassislik fani (61–90):</b> {b3_correct}/30 ta = <b>{b3_score} ball</b> (2.1)\n"
+            f"────────────────────────\n"
+            f"✅ Jami to'g'ri: <b>{correct_count} / 90 ta</b>\n"
+            f"🔥 <b>UMUMIY DTM BALL: {total_score} / 189.0 ball</b>\n"
+            f"🏅 Xulosa: <b>{grade}</b>"
+        )
+        return {
+            "correct_count": correct_count,
+            "total_score": total_score,
+            "grade": grade,
+            "summary": summary,
+            "mistakes": mistakes
+        }
+
+    else:  # 43_ms (Milliy Sertifikat)
+        p1_correct = 0  # 1-32 (ABCD)
+        p2_correct = 0  # 33-35 (ABCDEF)
+        p3_correct = 0  # 36-43 (Ochiq masalalar)
+        weighted_points = 0.0
+
+        for q in range(1, 44):
+            qs = str(q)
+            k_val = str(correct_keys.get(qs, "")).strip().upper().replace(",", ".")
+            s_val = str(student_ans.get(qs, "")).strip().upper().replace(",", ".")
+            if not k_val:
+                continue
+
+            if s_val == k_val:
+                correct_count += 1
+                if 1 <= q <= 32:
+                    p1_correct += 1
+                    weighted_points += 1.5
+                elif 33 <= q <= 35:
+                    p2_correct += 1
+                    weighted_points += 2.0
+                else:
+                    p3_correct += 1
+                    weighted_points += 2.65
+            else:
+                mistakes.append(f"{q}-savol (Siz: {s_val or '—'} | Kalit: {k_val})")
+
+        # Rasch shkalasi bo'yicha hisoblash
+        if correct_count == 0:
+            rasch_score = 0.0
+        elif correct_count == 43:
+            rasch_score = 75.0
+        else:
+            rasch_score = round(min(75.0, 25.0 + weighted_points * 0.68), 1)
+
+        if rasch_score >= 70.0:
+            grade = "A+ Daraja (100% Maksimal Imtiyoz) 🏆"
+        elif rasch_score >= 65.0:
+            grade = "A Daraja (A'lo) 🥇"
+        elif rasch_score >= 60.0:
+            grade = "B+ Daraja (Juda yaxshi) 🥈"
+        elif rasch_score >= 55.0:
+            grade = "B Daraja (Yaxshi) 🥉"
+        elif rasch_score >= 46.0:
+            grade = "C Daraja (Minimal sertifikat) 🎗"
+        else:
+            grade = "Sertifikat darajasiga yetmadi (<46) ❌"
+
+        summary = (
+            f"🎯 <b>43 TALIK MILLIY SERTIFIKAT NATIJASI:</b>\n"
+            f"────────────────────────\n"
+            f"🔹 <b>1–32 Yopiq test (A-D):</b> {p1_correct} / 32 ta\n"
+            f"🔸 <b>33–35 Moslashtirish (A-F):</b> {p2_correct} / 3 ta\n"
+            f"🧪 <b>36–43 Ochiq masalalar:</b> {p3_correct} / 8 ta\n"
+            f"────────────────────────\n"
+            f"✅ Jami to'g'ri: <b>{correct_count} / 43 ta</b>\n"
+            f"📈 <b>Rasch Bali: {rasch_score} ball</b>\n"
+            f"🏅 <b>Daraja: {grade}</b>"
+        )
+        return {
+            "correct_count": correct_count,
+            "total_score": rasch_score,
+            "grade": grade,
+            "summary": summary,
+            "mistakes": mistakes
+        }
+
+# -------------------------------------------------------------
+# MAJBURIY OBUNA TEKSHIRUVI
+# -------------------------------------------------------------
+async def check_channel_subscription(user_id: int) -> bool:
+    if user_id == ADMIN_ID:
+        return True
+    req_ch = db_get_setting("required_channel", "").strip()
+    if not req_ch:
+        return True
+    if not req_ch.startswith("@") and not req_ch.startswith("-100"):
+        req_ch = f"@{req_ch}"
+    try:
+        member = await bot.get_chat_member(chat_id=req_ch, user_id=user_id)
+        return member.status in ["creator", "administrator", "member", "restricted"]
+    except Exception as err:
+        logging.warning(f"Obunani tekshirishda xato: {err}")
+        return True
+
+async def prompt_subscription(message: types.Message):
+    req_ch = db_get_setting("required_channel", "").strip()
+    clean_name = req_ch.replace("@", "")
+    ch_url = f"https://t.me/{clean_name}"
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📢 Kanalga a'zo bo'lish", url=ch_url)],
+            [InlineKeyboardButton(text="✅ Obunani tekshirish", callback_data="btn_check_sub")]
+        ]
+    )
+    await message.answer(
+        "⚠️ <b>Botdan to'liq foydalanish uchun rasmiy kanalimizga a'zo bo'ling!</b>\n\n"
+        "Kanalga a'zo bo'lib, pastdagi <b>«✅ Obunani tekshirish»</b> tugmasini bosing:",
+        parse_mode="HTML",
+        reply_markup=kb
+    )
+
+# -------------------------------------------------------------
+# FSM STATE HOLATLARI
+# -------------------------------------------------------------
+class StudentTestSolve(StatesGroup):
+    waiting_test_code = State()
+    waiting_answers = State()
+
+class AISolveProblem(StatesGroup):
+    waiting_problem_photo = State()
+
+class AdminAITestCreate(StatesGroup):
+    waiting_test_type = State()
+    waiting_file_or_keys = State()
+    waiting_manual_edit = State()
+
+class AdminPanel(StatesGroup):
+    waiting_channel = State()
+    waiting_gemini_key = State()
+    waiting_delete_code = State()
+    waiting_broadcast = State()
+
+# -------------------------------------------------------------
+# ASOSIY MENYU TUGMALARI (FAQAT TEST VA AI YECHIM)
+# -------------------------------------------------------------
+def main_menu(user_id: int = 0):
+    kb = [
+        [KeyboardButton(text="📝 Test Tekshirish (30 / 43 / 90)")],
+        [KeyboardButton(text="📋 Faol Testlar Ro'yxati"), KeyboardButton(text="🏆 Reyting (Natijalar)")],
+        [KeyboardButton(text="🤖 AI Masala Yechish (Rasm)"), KeyboardButton(text="👨‍🏫 Ustoz & Bog'lanish")]
+    ]
+    if user_id == ADMIN_ID:
+        kb.insert(0, [KeyboardButton(text="🤖 AI Test Yaratish (PDF/Rasm - Admin)")])
+    return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
+
+# -------------------------------------------------------------
+# START VA OBUNA HANDLERLARI
+# -------------------------------------------------------------
+@dp.message(CommandStart())
+async def cmd_start(message: types.Message, state: FSMContext):
+    await state.clear()
+    uid = message.from_user.id
+    name = message.from_user.full_name or "O'quvchi"
+    username = f"@{message.from_user.username}" if message.from_user.username else ""
+    db_add_user(uid, name, username)
+
+    if not await check_channel_subscription(uid):
+        await prompt_subscription(message)
+        return
+
+    text = (
+        f"Assalomu alaykum, <b>{name}</b>! 👋\n\n"
+        f"🧪 <b>A+ Kimyo | AI Test Tekshirgich</b> botiga xush kelibsiz!\n\n"
+        f"🤖 <b>Bot imkoniyatlari:</b>\n"
+        f"• 📋 <b>30 talik Test:</b> Avtomatik tekshirish va ball hisoblash;\n"
+        f"• 🎯 <b>43 talik Milliy Sertifikat:</b> Rasch modeli va darajalar ($A+, A, B+, B, C$);\n"
+        f"• 🏛 <b>90 talik DTM Blok Test:</b> 3 ta blok ($1.1 / 3.1 / 2.1$) bo'yicha hisoblash;\n"
+        f"• 📸 <b>AI Masala Yechish:</b> Kimyo masalasi rasmini yuborsangiz, sun'iy intellekt yechib tushuntirib beradi!\n\n"
         f"Kerakli bo'limni tanlang 👇"
     )
-    await message.answer(welcome, parse_mode="HTML", reply_markup=get_main_keyboard())
+    await message.answer(text, parse_mode="HTML", reply_markup=main_menu(uid))
 
-# Darslar katalogi
-@dp.message(F.text == "📚 Video Darslar Katalogi")
-async def catalog_categories_handler(message: types.Message):
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="🧪 1. Dastlabki kimyo & Atom (15 000)", callback_data="show_cat:cat_1")],
-            [InlineKeyboardButton(text="⚗️ 2. Gazlar, Eritmalar & Reaksiyalar (15 000)", callback_data="show_cat:cat_2")],
-            [InlineKeyboardButton(text="🧬 3. Organik kimyo (15 000)", callback_data="show_cat:cat_3")],
-            [InlineKeyboardButton(text="🎯 4. Milliy Sertifikat Maxsus Masalalar", callback_data="show_cat:cat_4")]
-        ]
-    )
-    await message.answer(
-        "📚 <b>Kimyo video darslari (Nazariya + Masala darsi):</b>\n\n"
-        "O'zingizga kerakli bo'limni tanlang 👇",
-        parse_mode="HTML",
-        reply_markup=kb
-    )
-
-@dp.message(F.text == "🎯 Maxsus Masalalar (41, 42, 43)")
-async def special_tasks_handler(message: types.Message):
-    await show_category_lessons(message, "cat_4")
-
-@dp.callback_query(F.data.startswith("show_cat:"))
-async def category_callback_handler(callback: types.CallbackQuery):
-    cat_key = callback.data.split(":")[1]
-    await show_category_lessons(callback.message, cat_key, edit=True)
-    await callback.answer()
-
-async def show_category_lessons(message: types.Message, cat_key: str, edit: bool = False):
-    lessons = get_lessons_by_category(cat_key)
-    cat_title = CATEGORIES.get(cat_key, "Mavzular")
-
-    kb_buttons = []
-    for lid, title, price, th, pr in lessons:
-        status_icon = "🎬" if (th or pr) else "⏳"
-        btn_text = f"{status_icon} {title} — {price:,} so'm"
-        kb_buttons.append([InlineKeyboardButton(text=btn_text, callback_data=f"view_lesson:{lid}")])
-
-    kb_buttons.append([InlineKeyboardButton(text="🔙 Boshqa bo'limlar", callback_data="back_to_cats")])
-    kb = InlineKeyboardMarkup(inline_keyboard=kb_buttons)
-
-    text = (
-        f"📂 <b>{cat_title}</b>\n\n"
-        f"Har bir mavzu <b>Nazariya va Masala</b> darslarini o'z ichiga oladi.\n"
-        f"Mavzuni tanlang va xarid qiling 👇"
-    )
-    if edit:
-        await message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+@dp.callback_query(F.data == "btn_check_sub")
+async def cb_check_sub(callback: types.CallbackQuery):
+    uid = callback.from_user.id
+    if await check_channel_subscription(uid):
+        await callback.message.delete()
+        await callback.message.answer(
+            "🎉 <b>Obunangiz tasdiqlandi!</b> Barcha bo'limlar ochildi:",
+            parse_mode="HTML",
+            reply_markup=main_menu(uid)
+        )
     else:
-        await message.answer(text, parse_mode="HTML", reply_markup=kb)
-
-@dp.callback_query(F.data == "back_to_cats")
-async def back_to_cats_handler(callback: types.CallbackQuery):
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="🧪 1. Dastlabki kimyo & Atom (15 000)", callback_data="show_cat:cat_1")],
-            [InlineKeyboardButton(text="⚗️ 2. Gazlar, Eritmalar & Reaksiyalar (15 000)", callback_data="show_cat:cat_2")],
-            [InlineKeyboardButton(text="🧬 3. Organik kimyo (15 000)", callback_data="show_cat:cat_3")],
-            [InlineKeyboardButton(text="🎯 4. Milliy Sertifikat Maxsus Masalalar", callback_data="show_cat:cat_4")]
-        ]
-    )
-    await callback.message.edit_text(
-        "📚 <b>Kimyo video darslari (Nazariya + Masala darsi):</b>\n\nBo'limni tanlang 👇",
-        parse_mode="HTML",
-        reply_markup=kb
-    )
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("view_lesson:"))
-async def view_lesson_handler(callback: types.CallbackQuery):
-    lid = callback.data.split(":")[1]
-    lesson = get_lesson_by_id(lid)
-    if not lesson:
-        await callback.answer("Dars topilmadi!", show_alert=True)
-        return
-
-    _, title, price, theory_id, problem_id = lesson
-    user_id = callback.from_user.id
-    is_purchased = user_has_lesson(user_id, lid)
-
-    text = (
-        f"📖 <b>Mavzu:</b> {title}\n"
-        f"💰 <b>Narxi:</b> {price:,} so'm\n"
-        f"📦 <b>Tarkibi:</b> To'liq Nazariya darsi + Masala yechish darsi\n\n"
-    )
-
-    btns = []
-    if is_purchased:
-        text += "✅ <i>Siz ushbu darsni xarid qilgansiz! Videolarni quyidagi tugma orqali ko'rishingiz mumkin:</i>"
-        btns.append([InlineKeyboardButton(text="▶️ Videolarni ko'rish", callback_data=f"play_lesson:{lid}")])
-    else:
-        text += "Videolarni bot ichida ko'rish uchun to'lov qiling 👇"
-        btns.append([InlineKeyboardButton(text=f"💳 Xarid qilish ({price:,} so'm)", callback_data=f"buy_lesson:{lid}")])
-
-    btns.append([InlineKeyboardButton(text="🔙 Orqaga", callback_data="back_to_cats")])
-    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=btns))
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("buy_lesson:"))
-async def buy_lesson_callback(callback: types.CallbackQuery, state: FSMContext):
-    lid = callback.data.split(":")[1]
-    lesson = get_lesson_by_id(lid)
-    if not lesson:
-        return
-
-    _, title, price, _, _ = lesson
-    await state.update_data(item_id=lid, item_name=title, item_price=price)
-    await state.set_state(PaymentState.waiting_for_receipt)
-
-    text = (
-        f"💳 <b>To'lov ma'lumotlari:</b>\n"
-        f"📚 <b>Mavzu:</b> {title}\n"
-        f"💰 <b>Summa:</b> {price:,} so'm\n\n"
-        f"💳 <b>Karta raqam:</b> <code>{CARD_NUMBER}</code> (ustiga bosib nusxalang)\n"
-        f"👤 <b>Karta egasi:</b> {CARD_OWNER}\n\n"
-        f"❗️ <b>To'lovni amalga oshirib, chek rasmini (skrinshot) shu yerga yuboring:</b>"
-    )
-    cancel_kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="❌ Bekor qilish")]], resize_keyboard=True)
-    await callback.message.answer(text, parse_mode="HTML", reply_markup=cancel_kb)
-    await callback.answer()
-
-@dp.message(F.text == "🔴 Jonli dars (30 000)")
-async def live_lesson_handler(message: types.Message, state: FSMContext):
-    await state.update_data(item_id="live_lesson", item_name="🔴 Jonli Dars & Savol-Javob", item_price=30000)
-    await state.set_state(PaymentState.waiting_for_receipt)
-
-    text = (
-        f"🔴 <b>Jonli Darsga yozilish (Zoom / Telegram):</b>\n\n"
-        f"Ustoz bilan jonli savol-javob, murakkab masalalar tahlili.\n"
-        f"💰 <b>Narxi:</b> 30 000 so'm\n\n"
-        f"💳 <b>Karta:</b> <code>{CARD_NUMBER}</code>\n"
-        f"👤 <b>Egasi:</b> {CARD_OWNER}\n\n"
-        f"To'lov qilib, chekni yuboring 👇"
-    )
-    cancel_kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="❌ Bekor qilish")]], resize_keyboard=True)
-    await message.answer(text, parse_mode="HTML", reply_markup=cancel_kb)
+        await callback.answer("❌ Kanalga a'zo bo'lmadingiz! Avval a'zo bo'ling.", show_alert=True)
 
 @dp.message(F.text == "❌ Bekor qilish")
-async def cancel_handler(message: types.Message, state: FSMContext):
+async def cancel_any_state(message: types.Message, state: FSMContext):
     await state.clear()
-    await message.answer("Jarayon bekor qilindi.", reply_markup=get_main_keyboard())
+    await message.answer("Jarayon bekor qilindi. Bosh menyudasiz:", reply_markup=main_menu(message.from_user.id))
 
-@dp.message(PaymentState.waiting_for_receipt, F.photo)
-async def receive_receipt_handler(message: types.Message, state: FSMContext):
-    data = await state.get_data()
-    item_id = data.get("item_id", "lesson")
-    item_name = data.get("item_name", "Dars")
-    price = data.get("item_price", 15000)
-
-    user_id = message.from_user.id
-    user_name = message.from_user.full_name or "O'quvchi"
-    username = f"@{message.from_user.username}" if message.from_user.username else "Mavjud emas"
-    photo_id = message.photo[-1].file_id
-
-    pay_id = record_payment(user_id, item_id, item_name, price)
-    await state.clear()
-
-    await message.answer(
-        "✅ <b>To'lov chekingiz qabul qilindi!</b>\n\n"
-        "Administrator tekshirishi bilan video darslar botingizga avtomatik yuboriladi. ⏳",
-        parse_mode="HTML",
-        reply_markup=get_main_keyboard()
-    )
-
-    admin_kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="✅ Tasdiqlash", callback_data=f"pay_ok:{pay_id}"),
-                InlineKeyboardButton(text="❌ Rad etish", callback_data=f"pay_no:{pay_id}")
-            ]
-        ]
-    )
-
-    admin_caption = (
-        f"🧾 <b>YANGI TO'LOV CHEKI #{pay_id}</b>\n"
-        f"────────────────────────\n"
-        f"📚 <b>Mavzu:</b> {item_name}\n"
-        f"💰 <b>Summa:</b> {price:,} so'm\n"
-        f"👤 <b>O'quvchi:</b> {user_name}\n"
-        f"💬 <b>Telegram:</b> {username}\n"
-        f"🆔 <b>ID:</b> <code>{user_id}</code>\n"
-        f"────────────────────────\n"
-        f"Tasdiqlaysizmi?"
-    )
-
-    await bot.send_photo(
-        chat_id=ADMIN_ID,
-        photo=photo_id,
-        caption=admin_caption,
-        parse_mode="HTML",
-        reply_markup=admin_kb
-    )
-
-@dp.callback_query(F.data.startswith("pay_ok:"))
-async def approve_payment_handler(callback: types.CallbackQuery):
-    pay_id = int(callback.data.split(":")[1])
-    pay = get_payment(pay_id)
-    if not pay:
-        await callback.answer("To'lov topilmadi!")
-        return
-
-    _, user_id, item_id, item_name, price, status = pay
-    if status == "approved":
-        await callback.answer("Allaqachon tasdiqlangan!")
-        return
-
-    update_payment_status(pay_id, "approved")
-
-    if item_id != "live_lesson":
-        record_purchase(user_id, item_id)
-        lesson = get_lesson_by_id(item_id)
-        theory_id = lesson[3] if lesson else None
-        problem_id = lesson[4] if lesson else None
-
-        student_text = (
-            f"🎉 <b>To'lovingiz tasdiqlandi!</b>\n\n"
-            f"📚 <b>Mavzu:</b> {item_name}\n\n"
-            f"Videolar quyida siz uchun shaxsiy tarzda taqdim etilmoqda 👇"
-        )
-        await bot.send_message(chat_id=user_id, text=student_text, parse_mode="HTML")
-
-        if theory_id:
-            await bot.send_video(
-                chat_id=user_id,
-                video=theory_id,
-                caption=f"📘 <b>Nazariya darsi:</b> {item_name}\n<i>Faqat siz uchun! Nusxa olish va uzatishdan himoyalangan.</i>",
-                parse_mode="HTML",
-                protect_content=True
-            )
-        if problem_id:
-            await bot.send_video(
-                chat_id=user_id,
-                video=problem_id,
-                caption=f"📝 <b>Masala yechish darsi:</b> {item_name}\n<i>Faqat siz uchun! Nusxa olish va uzatishdan himoyalangan.</i>",
-                parse_mode="HTML",
-                protect_content=True
-            )
-
-        if not theory_id and not problem_id:
-            await bot.send_message(
-                chat_id=user_id,
-                text="⏳ <i>Dars videosi ustoz tomonidan yuklanishi bilan bot sizga darhol yetkazib beradi!</i>",
-                parse_mode="HTML"
-            )
-    else:
-        channel_link = get_setting("channel_link", "https://t.me/onlyibrohimov")
-        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🚀 Jonli Dars Guruhiga Kirish", url=channel_link)]])
-        await bot.send_message(
-            chat_id=user_id,
-            text="🎉 <b>Jonli dars to'lovi tasdiqlandi!</b>\n\nQuyidagi havola orqali efir guruhiga kiring 👇",
-            parse_mode="HTML",
-            reply_markup=kb
-        )
-
-    await callback.message.edit_caption(
-        caption=callback.message.caption + "\n\n🟢 <b>TASDIQLANDI VA YUBORILDI</b>",
-        parse_mode="HTML"
-    )
-    await callback.answer("Tasdiqlandi!")
-
-@dp.callback_query(F.data.startswith("pay_no:"))
-async def reject_payment_handler(callback: types.CallbackQuery):
-    pay_id = int(callback.data.split(":")[1])
-    pay = get_payment(pay_id)
-    if pay:
-        update_payment_status(pay_id, "rejected")
-        try:
-            await bot.send_message(
-                chat_id=pay[1],
-                text=f"❌ To'lovingiz tasdiqlanmadi. Iltimos, administrator bilan bog'laning: {ADMIN_USERNAME}"
-            )
-        except Exception:
-            pass
-
-    await callback.message.edit_caption(
-        caption=callback.message.caption + "\n\n🔴 <b>RAD ETILDI</b>",
-        parse_mode="HTML"
-    )
-    await callback.answer("Rad etildi!")
-
-@dp.message(F.text == "📁 Xarid qilingan darslarim")
-async def my_purchased_lessons_handler(message: types.Message):
-    purchases = get_user_purchases(message.from_user.id)
-    if not purchases:
-        await message.answer("Sizda hali xarid qilingan darslar mavjud emas. Katalogdan dars tanlashingiz mumkin!")
-        return
-
-    text = "📁 <b>Siz xarid qilgan darslar:</b>\n\nQayta ko'rmoqchi bo'lgan mavzuni tanlang 👇"
-    btns = []
-    for lid, title, th, pr in purchases:
-        btns.append([InlineKeyboardButton(text=f"▶️ {title}", callback_data=f"play_lesson:{lid}")])
-
-    await message.answer(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=btns))
-
-@dp.callback_query(F.data.startswith("play_lesson:"))
-async def play_lesson_handler(callback: types.CallbackQuery):
-    lid = callback.data.split(":")[1]
-    lesson = get_lesson_by_id(lid)
-    if not lesson:
-        return
-
-    _, title, _, th_id, pr_id = lesson
-    user_id = callback.from_user.id
-
-    if not th_id and not pr_id:
-        await callback.answer("Ushbu dars videosi tez orada yuklanadi!", show_alert=True)
-        return
-
-    await callback.message.answer(f"🎬 <b>{title}</b> darsi videolari yuborilmoqda...")
-
-    if th_id:
-        await bot.send_video(
-            chat_id=user_id,
-            video=th_id,
-            caption=f"📘 <b>Nazariya darsi:</b> {title}",
-            parse_mode="HTML",
-            protect_content=True
-        )
-    if pr_id:
-        await bot.send_video(
-            chat_id=user_id,
-            video=pr_id,
-            caption=f"📝 <b>Masala yechish darsi:</b> {title}",
-            parse_mode="HTML",
-            protect_content=True
-        )
-    await callback.answer()
-
-# Admin panel
-@dp.message(Command("admin"))
-async def admin_main_panel(message: types.Message):
+# -------------------------------------------------------------
+# ADMIN: SUN'IY INTELLEKT ORQALI PDF/RASMDAN TEST VA KALIT YARATISH
+# -------------------------------------------------------------
+@dp.message(F.text == "🤖 AI Test Yaratish (PDF/Rasm - Admin)")
+async def admin_start_ai_test(message: types.Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
         return
 
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="📹 Dars videosini yuklash (Nazariya/Masala)", callback_data="admin_upload_video")],
-            [InlineKeyboardButton(text="📊 Statistika", callback_data="admin_stats")],
-            [InlineKeyboardButton(text="🔑 30 talik kalitni o'zgartirish", callback_data="admin_change_keys")],
-            [InlineKeyboardButton(text="🔗 Jonli dars havolasini yangilash", callback_data="admin_change_link")],
-            [InlineKeyboardButton(text="📢 Barchaga xabar yuborish", callback_data="admin_broadcast")]
+            [InlineKeyboardButton(text="📋 1. 30 talik Test yaratish", callback_data="ai_new:30_talik")],
+            [InlineKeyboardButton(text="🎯 2. 43 talik Milliy Sertifikat (Rasch)", callback_data="ai_new:43_ms")],
+            [InlineKeyboardButton(text="🏛 3. 90 talik DTM Blok Test", callback_data="ai_new:90_dtm")]
         ]
     )
-    await message.answer("👑 <b>Ustoz & Admin Boshqaruv Paneli:</b>", parse_mode="HTML", reply_markup=kb)
+    await message.answer(
+        "🤖 <b>Sun'iy Intellekt (AI) yordamida Test va Kalit yaratish:</b>\n\n"
+        "Qaysi formatdagi testni yaratmoqchisiz? Tanlang 👇",
+        parse_mode="HTML",
+        reply_markup=kb
+    )
 
-@dp.callback_query(F.data == "admin_upload_video")
-async def admin_start_upload(callback: types.CallbackQuery):
+@dp.callback_query(F.data.startswith("ai_new:"))
+async def cb_select_ai_test_type(callback: types.CallbackQuery, state: FSMContext):
     if callback.from_user.id != ADMIN_ID:
         return
+    test_type = callback.data.split(":")[1]
+    await state.update_data(test_type=test_type)
+    await state.set_state(AdminAITestCreate.waiting_file_or_keys)
 
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="1. Dastlabki kimyo & Atom", callback_data="adm_cat:cat_1")],
-            [InlineKeyboardButton(text="2. Gazlar & Eritmalar", callback_data="adm_cat:cat_2")],
-            [InlineKeyboardButton(text="3. Organik kimyo", callback_data="adm_cat:cat_3")],
-            [InlineKeyboardButton(text="4. Maxsus masalalar (41, 42, 43)", callback_data="adm_cat:cat_4")]
-        ]
+    type_names = {
+        "30_talik": "📋 30 talik Test (1–30 A-D)",
+        "43_ms": "🎯 43 talik Milliy Sertifikat (1–32 A-D, 33–35 A-F, 36–43 Ochiq)",
+        "90_dtm": "🏛 90 talik DTM Test (1–30 [1.1], 31–60 [3.1], 61–90 [2.1])"
+    }
+
+    cancel_kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="❌ Bekor qilish")]], resize_keyboard=True)
+    await callback.message.answer(
+        f"✅ Tanlandi: <b>{type_names.get(test_type)}</b>\n\n"
+        f"📤 <b>Endi quyidagilardan birini yuboring:</b>\n"
+        f"1️⃣ <b>Test PDF fayli</b> yoki <b>Test savollari rasmi</b> — <i>Sun'iy intellekt savollarni o'zi yechib, kalitni avtomatik tuzadi!</i>\n"
+        f"2️⃣ <b>Tayyor kalitlar rasmi</b> — <i>AI jadvaldagi kalitlarni o'qib bazaga kiritadi.</i>\n"
+        f"3️⃣ Yoki kalitlarni matn ko'rinishida yozib yuboring (masalan: <code>1a 2b 3c...</code>).",
+        parse_mode="HTML",
+        reply_markup=cancel_kb
     )
-    await callback.message.edit_text("Qaysi bo'limdagi darsga video yuklamoqchisiz?", reply_markup=kb)
     await callback.answer()
 
-@dp.callback_query(F.data.startswith("adm_cat:"))
-async def admin_select_cat(callback: types.CallbackQuery):
-    cat_key = callback.data.split(":")[1]
-    lessons = get_lessons_by_category(cat_key)
-
-    btns = []
-    for lid, title, price, th, pr in lessons:
-        th_icon = "✅" if th else "❌"
-        pr_icon = "✅" if pr else "❌"
-        btns.append([InlineKeyboardButton(text=f"{title} (N:{th_icon} M:{pr_icon})", callback_data=f"adm_les:{lid}")])
-
-    btns.append([InlineKeyboardButton(text="🔙 Orqaga", callback_data="admin_upload_video")])
-    await callback.message.edit_text("Videoni biriktirmoqchi bo'lgan mavzuni tanlang:", reply_markup=InlineKeyboardMarkup(inline_keyboard=btns))
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("adm_les:"))
-async def admin_select_lesson_type(callback: types.CallbackQuery, state: FSMContext):
-    lid = callback.data.split(":")[1]
-    lesson = get_lesson_by_id(lid)
-    if not lesson:
+@dp.message(AdminAITestCreate.waiting_file_or_keys)
+async def handle_admin_test_upload(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
         return
 
-    await state.update_data(target_lesson_id=lid, target_title=lesson[1])
-    await state.set_state(AdminVideoUploadState.choosing_type)
+    data = await state.get_data()
+    test_type = data.get("test_type", "30_talik")
+    prefix = "TEST" if test_type == "30_talik" else ("MS" if test_type == "43_ms" else "DTM")
+    test_code = f"{prefix}-{datetime.now().strftime('%m%d%H%M')}"
+
+    # Agar matn ko'rinishida kalit yuborgan bo'lsa
+    if message.text and not message.text.startswith("/"):
+        parsed_keys = parse_input_answers(message.text, test_type)
+        if not parsed_keys:
+            await message.answer("⚠️ Kalitlarni o'qib bo'lmadi. Masalan: <code>1a 2b 3c...</code> ko'rinishida yuboring yoki PDF/Rasm tashlang.", parse_mode="HTML")
+            return
+
+        title = f"{prefix} Maxsus Test ({len(parsed_keys)} ta savol)"
+        db_save_test(test_code, test_type, title, parsed_keys, "Ustoz tomonidan kiritilgan kalitlar")
+        await state.clear()
+        await message.answer(
+            f"✅ <b>Test muvaffaqiyatli saqlandi!</b>\n\n"
+            f"🔑 Test kodi: <code>{test_code}</code>\n"
+            f"📊 Savollar soni: <b>{len(parsed_keys)} ta</b>\n\n"
+            f"O'quvchilar <b>«📝 Test Tekshirish»</b> bo'limiga kirib, <code>{test_code}</code> kodini kiritishlari mumkin!",
+            parse_mode="HTML",
+            reply_markup=main_menu(ADMIN_ID)
+        )
+        return
+
+    # Agar PDF yoki Rasm yuborgan bo'lsa -> AI ishga tushadi
+    file_id = ""
+    file_type = ""
+    mime_type = ""
+
+    if message.document:
+        file_id = message.document.file_id
+        file_type = "document"
+        mime_type = message.document.mime_type or "application/pdf"
+    elif message.photo:
+        file_id = message.photo[-1].file_id
+        file_type = "photo"
+        mime_type = "image/jpeg"
+    else:
+        await message.answer("❗️ Iltimos, PDF fayl, Rasm yoki matnli kalit yuboring.")
+        return
+
+    wait_msg = await message.answer("🤖 <b>Sun'iy intellekt faylni o'qimoqda va savollarni yechib kalit tuzmoqda...</b>\n⏳ Iltimos, 15–40 soniya kuting...", parse_mode="HTML")
+
+    try:
+        tg_file = await bot.get_file(file_id)
+        file_buffer = io.BytesIO()
+        await bot.download_file(tg_file.file_path, destination=file_buffer)
+        file_bytes = file_buffer.getvalue()
+    except Exception as e:
+        await wait_msg.edit_text(f"❌ Faylni yuklab olishda xato: {e}")
+        return
+
+    ai_result = await ai_analyze_test_document(file_bytes, mime_type, test_type)
+
+    if "error" in ai_result:
+        if ai_result["error"] == "API_KEY_MISSING":
+            await wait_msg.edit_text(
+                "⚠️ <b>Gemini AI API kaliti kiritilmagan!</b>\n\n"
+                "1. /admin buyrug'ini bosing.\n"
+                "2. <b>«🔑 Gemini AI API Kalitni kiritish»</b> tugmasini bosib, Google AI Studio kalitingizni yuboring.\n\n"
+                "<i>Yoki hozirning o'zida kalitlarni oddiy matn ko'rinishida (1a 2b 3c...) yozib yuborishingiz ham mumkin!</i>",
+                parse_mode="HTML"
+            )
+        else:
+            await wait_msg.edit_text(
+                f"⚠️ <b>AI tahlilda xatolik:</b> {ai_result['error']}\n\n"
+                f"Kalitlarni matn ko'rinishida (<code>1a 2b 3c...</code>) yuborishingiz yoki qaytadan rasm tashlashingiz mumkin.",
+                parse_mode="HTML"
+            )
+        return
+
+    keys_dict = ai_result.get("keys", {})
+    title = ai_result.get("title", f"{prefix} AI Testi")
+    explanation = ai_result.get("explanation", "")
+
+    sorted_items = sorted(keys_dict.items(), key=lambda x: int(x[0]) if str(x[0]).isdigit() else 999)
+    keys_preview = ", ".join([f"<b>{k}</b>:{v}" for k, v in sorted_items])
+
+    db_save_test(test_code, test_type, title, keys_dict, explanation, file_id, file_type)
+    await state.clear()
 
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="📘 1. Nazariya videosi", callback_data="vid_type:theory")],
-            [InlineKeyboardButton(text="📝 2. Masala yechish videosi", callback_data="vid_type:problem")]
+            [InlineKeyboardButton(text="✏️ Kalitlarni tahrirlash", callback_data=f"edit_keys:{test_code}")]
         ]
     )
-    await callback.message.edit_text(f"<b>{lesson[1]}</b>\n\nQaysi dars videosini yuklamoqchisiz?", parse_mode="HTML", reply_markup=kb)
-    await callback.answer()
 
-@dp.callback_query(AdminVideoUploadState.choosing_type, F.data.startswith("vid_type:"))
-async def admin_wait_video(callback: types.CallbackQuery, state: FSMContext):
-    v_type = callback.data.split(":")[1]
-    await state.update_data(video_type=v_type)
-    await state.set_state(AdminVideoUploadState.waiting_for_video)
+    result_text = (
+        f"🎉 <b>SUN'IY INTELLEKT TESTNI YECHDI VA BAZAGA SAQLADI!</b>\n"
+        f"────────────────────────\n"
+        f"🔑 <b>Test kodi:</b> <code>{test_code}</code>\n"
+        f"📚 <b>Nomi:</b> {title}\n"
+        f"🔢 <b>Aniqlangan kalitlar ({len(keys_dict)} ta):</b>\n"
+        f"{keys_preview}\n"
+        f"────────────────────────\n"
+        f"💡 <b>AI izohi:</b> {explanation[:400]}\n\n"
+        f"✅ O'quvchilar endi <code>{test_code}</code> kodi orqali javoblarini tekshirishlari mumkin!"
+    )
+    await wait_msg.delete()
+    await message.answer(result_text, parse_mode="HTML", reply_markup=kb)
+    await message.answer("Asosiy menyu:", reply_markup=main_menu(ADMIN_ID))
 
-    type_name = "Nazariya" if v_type == "theory" else "Masala yechish"
-    cancel_kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="❌ Bekor qilish")]], resize_keyboard=True)
+@dp.callback_query(F.data.startswith("edit_keys:"))
+async def cb_edit_test_keys(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        return
+    test_code = callback.data.split(":")[1]
+    await state.update_data(edit_test_code=test_code)
+    await state.set_state(AdminAITestCreate.waiting_manual_edit)
 
     await callback.message.answer(
-        f"📹 <b>{type_name} darsi videosini shu yerga yuboring:</b>\n\n"
-        f"Videoni Telegram orqali yuboring, bot uni avtomatik saqlaydi.",
+        f"✏️ <b>{test_code}</b> testining o'zgartirmoqchi bo'lgan kalitlarini yozing:\n\n"
+        f"Masalan, faqat 5 va 36-savolni o'zgartirish uchun: <code>5B 36=18</code> deb yozing (yoki to'liq kalitni yuboring):",
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+@dp.message(AdminAITestCreate.waiting_manual_edit)
+async def save_edited_keys(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    data = await state.get_data()
+    test_code = data.get("edit_test_code")
+    row = db_get_test(test_code)
+    if not row:
+        await state.clear()
+        await message.answer("Test topilmadi.", reply_markup=main_menu(ADMIN_ID))
+        return
+
+    _, test_type, title, keys_json, ai_exp, f_id, f_type = row
+    current_keys = json.loads(keys_json)
+    new_updates = parse_input_answers(message.text, test_type)
+
+    current_keys.update(new_updates)
+    db_save_test(test_code, test_type, title, current_keys, ai_exp, f_id, f_type)
+    await state.clear()
+
+    await message.answer(
+        f"✅ <b>{test_code}</b> kalitlari yangilandi! ({len(new_updates)} ta savol o'zgartirildi).",
+        parse_mode="HTML",
+        reply_markup=main_menu(ADMIN_ID)
+    )
+
+# -------------------------------------------------------------
+# O'QUVCHILAR UCHUN: TEST TEKSHIRISH VA FAOL TESTLAR RO'YXATI
+# -------------------------------------------------------------
+@dp.message(F.text == "📋 Faol Testlar Ro'yxati")
+async def show_active_tests_list(message: types.Message):
+    if not await check_channel_subscription(message.from_user.id):
+        await prompt_subscription(message)
+        return
+
+    recent = db_get_recent_tests(10)
+    if not recent:
+        await message.answer("📭 Hozircha bazada faol testlar yo'q.")
+        return
+
+    kb_rows = []
+    text_lines = ["📋 <b>FAOL TESTLAR RO'YXATI:</b>\n"]
+    for r_code, r_type, r_title, r_date in recent:
+        badge = "30 talik" if r_type == "30_talik" else ("43 MS" if r_type == "43_ms" else "90 DTM")
+        text_lines.append(f"🔹 <code>{r_code}</code> — <b>{r_title}</b> ({badge})")
+        kb_rows.append([InlineKeyboardButton(text=f"✍️ Yechish: {r_code} ({badge})", callback_data=f"solve_now:{r_code}")])
+
+    text_lines.append("\n👇 Testni tekshirish uchun pastdagi tugmani bosing:")
+    await message.answer(
+        "\n".join(text_lines),
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows)
+    )
+
+@dp.callback_query(F.data.startswith("solve_now:"))
+async def cb_solve_test_now(callback: types.CallbackQuery, state: FSMContext):
+    code = callback.data.split(":")[1]
+    row = db_get_test(code)
+    if not row:
+        await callback.answer("Test topilmadi!", show_alert=True)
+        return
+
+    await callback.answer()
+    await send_test_prompt_to_student(callback.message, state, row)
+
+@dp.message(F.text == "📝 Test Tekshirish (30 / 43 / 90)")
+async def start_student_test_check(message: types.Message, state: FSMContext):
+    if not await check_channel_subscription(message.from_user.id):
+        await prompt_subscription(message)
+        return
+
+    recent = db_get_recent_tests(5)
+    recent_info = ""
+    if recent:
+        lines = []
+        for r_code, r_type, r_title, _ in recent:
+            badge = "30 talik" if r_type == "30_talik" else ("43 MS" if r_type == "43_ms" else "90 DTM")
+            lines.append(f"• <code>{r_code}</code> — {r_title} ({badge})")
+        recent_info = "\n\n📌 <b>So'nggi faol testlar:</b>\n" + "\n".join(lines)
+
+    await state.set_state(StudentTestSolve.waiting_test_code)
+    cancel_kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="❌ Bekor qilish")]], resize_keyboard=True)
+
+    await message.answer(
+        f"📝 <b>TEST JAVOBLARINI TEKSHIRISH BO'LIMI</b>\n\n"
+        f"Ustoz bergan <b>Test kodini</b> yozib yuboring (masalan: <code>MS-1014</code> yoki <code>DTM-1014</code>):"
+        f"{recent_info}",
+        parse_mode="HTML",
+        reply_markup=cancel_kb
+    )
+
+async def send_test_prompt_to_student(message: types.Message, state: FSMContext, row: tuple):
+    test_code, test_type, title, keys_json, ai_exp, file_id, file_type = row
+    await state.update_data(active_test_code=test_code)
+    await state.set_state(StudentTestSolve.waiting_answers)
+
+    if file_id:
+        try:
+            if file_type == "document":
+                await bot.send_document(message.chat.id, file_id, caption=f"📄 <b>{title}</b> ({test_code})", parse_mode="HTML")
+            elif file_type == "photo":
+                await bot.send_photo(message.chat.id, file_id, caption=f"🖼 <b>{title}</b> ({test_code})", parse_mode="HTML")
+        except Exception:
+            pass
+
+    if test_type == "30_talik":
+        example_str = "<code>1A 2B 3C 4D ... 30A</code>\nyoki ketma-ket: <code>ABCDABCD...</code>"
+    elif test_type == "90_dtm":
+        example_str = "<code>1A 2B 3C ... 90D</code>\nyoki ketma-ket 90 ta harf: <code>ABCD...</code>"
+    else:
+        example_str = (
+            "1–35 savollar harflar va 36–43 ochiq savollar javobi:\n"
+            "<code>1A 2B 3C ... 33E 34A 35F 36=9 37=18 38=22.4 ...</code>"
+        )
+
+    cancel_kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="❌ Bekor qilish")]], resize_keyboard=True)
+    await message.answer(
+        f"✅ <b>Test topildi:</b> {title}\n"
+        f"🔑 <b>Kodi:</b> <code>{test_code}</code>\n\n"
+        f"✍️ <b>Javoblaringizni bitta xabarda yuboring:</b>\n"
+        f"Namuna:\n{example_str}",
+        parse_mode="HTML",
+        reply_markup=cancel_kb
+    )
+
+@dp.message(StudentTestSolve.waiting_test_code)
+async def process_test_code_input(message: types.Message, state: FSMContext):
+    code = message.text.strip().upper()
+    row = db_get_test(code)
+    if not row:
+        await message.answer(
+            f"❌ <b>{code}</b> kodli test topilmadi!\n"
+            f"Kod to'g'ri yozilganini tekshirib, qaytadan yuboring (yoki «❌ Bekor qilish» tugmasini bosing):",
+            parse_mode="HTML"
+        )
+        return
+
+    await send_test_prompt_to_student(message, state, row)
+
+@dp.message(StudentTestSolve.waiting_answers)
+async def process_student_answers(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    test_code = data.get("active_test_code")
+    row = db_get_test(test_code)
+    if not row:
+        await state.clear()
+        await message.answer("Test topilmadi.", reply_markup=main_menu(message.from_user.id))
+        return
+
+    _, test_type, title, keys_json, ai_exp, _, _ = row
+    correct_keys = json.loads(keys_json)
+
+    student_ans = parse_input_answers(message.text or "", test_type)
+    if not student_ans:
+        await message.answer(
+            "⚠️ Javoblaringiz formati tushunarsiz bo'ldi.\n"
+            "Iltimos, <code>1A 2B 3C 4D...</code> ko'rinishida yozib yuboring:",
+            parse_mode="HTML"
+        )
+        return
+
+    res = evaluate_student_submission(test_type, correct_keys, student_ans)
+    uid = message.from_user.id
+    full_name = message.from_user.full_name or "O'quvchi"
+
+    db_save_result(test_code, uid, full_name, res["correct_count"], res["total_score"], res["grade"])
+    await state.clear()
+
+    mistakes_list = res["mistakes"]
+    if not mistakes_list:
+        mistakes_text = "\n\n🎉 <b>Barakalla! Birorta ham xato yo'q (100% natija)!</b>"
+    else:
+        shown_mistakes = "\n".join(mistakes_list[:25])
+        more_cnt = f"\n<i>...va yana {len(mistakes_list) - 25} ta xato</i>" if len(mistakes_list) > 25 else ""
+        mistakes_text = f"\n\n❌ <b>Xato qilingan savollar ({len(mistakes_list)} ta):</b>\n{shown_mistakes}{more_cnt}"
+
+    exp_text = f"\n\n💡 <b>AI Tahlil va Yechim izohi:</b>\n{ai_exp[:600]}" if ai_exp else ""
+
+    final_report = (
+        f"👤 <b>O'quvchi:</b> {full_name}\n"
+        f"🔑 <b>Test kodi:</b> <code>{test_code}</code> ({title})\n\n"
+        f"{res['summary']}"
+        f"{mistakes_text}"
+        f"{exp_text}"
+    )
+
+    await message.answer(final_report, parse_mode="HTML", reply_markup=main_menu(uid))
+
+# -------------------------------------------------------------
+# REYTING VA NATIJALAR JADVALI
+# -------------------------------------------------------------
+@dp.message(F.text == "🏆 Reyting (Natijalar)")
+async def show_ratings_menu(message: types.Message):
+    if not await check_channel_subscription(message.from_user.id):
+        await prompt_subscription(message)
+        return
+
+    recent = db_get_recent_tests(8)
+    if not recent:
+        await message.answer("📭 Hozircha test natijalari mavjud emas.")
+        return
+
+    kb_rows = []
+    for r_code, r_type, r_title, _ in recent:
+        kb_rows.append([InlineKeyboardButton(text=f"🏆 {r_code} — {r_title}", callback_data=f"rating:{r_code}")])
+
+    await message.answer(
+        "🏆 <b>Qaysi test bo'yicha reyting jadvalini ko'rmoqchisiz?</b>\nTanlang 👇",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows)
+    )
+
+@dp.callback_query(F.data.startswith("rating:"))
+async def cb_show_test_rating(callback: types.CallbackQuery):
+    test_code = callback.data.split(":")[1]
+    top_rows = db_get_top_results(test_code, 15)
+    if not top_rows:
+        await callback.answer("Bu testni hali hech kim yechmagan!", show_alert=True)
+        return
+
+    medals = ["🥇", "🥈", "🥉"]
+    lines = [f"🏆 <b>{test_code} TESTI BO'YICHA TOP NATIJALAR:</b>\n────────────────────────"]
+    for idx, (f_name, corr, score, grade) in enumerate(top_rows, start=1):
+        prefix = medals[idx - 1] if idx <= 3 else f"{idx}."
+        lines.append(f"{prefix} <b>{f_name}</b> — <b>{score} ball</b> ({corr} ta)")
+
+    await callback.message.answer("\n".join(lines), parse_mode="HTML")
+    await callback.answer()
+
+# -------------------------------------------------------------
+# AI MASALA YECHISH (RASM ORQALI HAR QANDAY KIMYO MASALASI)
+# -------------------------------------------------------------
+@dp.message(F.text == "🤖 AI Masala Yechish (Rasm)")
+async def start_ai_problem_solver(message: types.Message, state: FSMContext):
+    if not await check_channel_subscription(message.from_user.id):
+        await prompt_subscription(message)
+        return
+
+    await state.set_state(AISolveProblem.waiting_problem_photo)
+    cancel_kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="❌ Bekor qilish")]], resize_keyboard=True)
+    await message.answer(
+        "📸 <b>AI Kimyo Masala Yechish Bo'limi</b>\n\n"
+        "Tushunmagan kimyo masalangiz yoki test savolingizni <b>rasmga olib</b> shu yerga yuboring.\n"
+        "Sun'iy intellekt uni mantiqiy usulda qadamma-qadam yechib beradi! 👇",
+        parse_mode="HTML",
+        reply_markup=cancel_kb
+    )
+
+@dp.message(AISolveProblem.waiting_problem_photo, F.photo)
+async def handle_problem_photo_solve(message: types.Message, state: FSMContext):
+    wait_msg = await message.answer("🤖 <b>Sun'iy intellekt masalani yechmoqda...</b> ⏳", parse_mode="HTML")
+    try:
+        photo_id = message.photo[-1].file_id
+        tg_file = await bot.get_file(photo_id)
+        buf = io.BytesIO()
+        await bot.download_file(tg_file.file_path, destination=buf)
+        solution = await ai_solve_photo_problem(buf.getvalue(), "image/jpeg")
+        await state.clear()
+        await wait_msg.delete()
+        await message.answer(
+            f"🧪 <b>AI Masala Yechimi:</b>\n\n{solution}",
+            reply_markup=main_menu(message.from_user.id)
+        )
+    except Exception as e:
+        await state.clear()
+        await wait_msg.edit_text(f"❌ Xatolik yuz berdi: {e}")
+
+@dp.message(F.text == "👨‍🏫 Ustoz & Bog'lanish")
+async def teacher_and_contact_info(message: types.Message):
+    await message.answer(
+        f"👨‍🏫 <b>Ustoz haqida:</b>\n"
+        f"• <b>Azizbek Ibrohimov</b> — Kimyo fani bo'yicha maxsus uslubiyot muallifi;\n"
+        f"• DTM va Milliy Sertifikat imtihonlariga tayyorlovchi murabbiy;\n"
+        f"• Kimyo masalalarini quruq formulalarsiz, mantiqiy va tezkor yechish uslubi muallifi.\n\n"
+        f"📞 <b>Bog'lanish uchun:</b> {ADMIN_USERNAME}",
+        parse_mode="HTML"
+    )
+
+# -------------------------------------------------------------
+# ADMIN BOSHQARUV PANELI (/admin)
+# -------------------------------------------------------------
+@dp.message(Command("admin"))
+async def admin_main(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    cur_ch = db_get_setting("required_channel", "Belgilanmagan")
+    has_ai_key = "✅ Ulangan" if get_gemini_api_key() else "❌ Kiritilmagan"
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🤖 AI orqali Test Yaratish (PDF/Rasm)", callback_data="adm_btn_ai_test")],
+            [InlineKeyboardButton(text="🔑 Gemini AI API Kalitni kiritish", callback_data="adm_btn_gemini")],
+            [InlineKeyboardButton(text="📢 Majburiy kanalni sozlash", callback_data="adm_btn_ch")],
+            [InlineKeyboardButton(text="🗑 Testni o'chirish", callback_data="adm_btn_del_test")],
+            [InlineKeyboardButton(text="📊 Statistika", callback_data="adm_btn_stats")],
+            [InlineKeyboardButton(text="📨 Barchaga xabar yuborish", callback_data="adm_btn_sendall")]
+        ]
+    )
+    text = (
+        f"👑 <b>Ustoz & Admin Boshqaruv Paneli:</b>\n\n"
+        f"🤖 Sun'iy Intellekt (Gemini API): <b>{has_ai_key}</b>\n"
+        f"📢 Majburiy kanal: <b>{cur_ch}</b>\n\n"
+        f"Kerakli amalni tanlang 👇"
+    )
+    await message.answer(text, parse_mode="HTML", reply_markup=kb)
+
+@dp.callback_query(F.data == "adm_btn_ai_test")
+async def cb_adm_ai_test_shortcut(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        return
+    await admin_start_ai_test(callback.message, state)
+    await callback.answer()
+
+@dp.callback_query(F.data == "adm_btn_gemini")
+async def adm_change_gemini_key(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        return
+    await state.set_state(AdminPanel.waiting_gemini_key)
+    cancel_kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="❌ Bekor qilish")]], resize_keyboard=True)
+    await callback.message.answer(
+        "🔑 <b>Google Gemini API kalitini yuboring:</b>\n\n"
+        "<i>Bepul kalitni 30 soniyada <a href='https://aistudio.google.com/app/apikey'>aistudio.google.com/app/apikey</a> saytidan olib, shu yerga tashlang (AIzaSy... bilan boshlanadi):</i>",
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+        reply_markup=cancel_kb
+    )
+    await callback.answer()
+
+@dp.message(AdminPanel.waiting_gemini_key)
+async def adm_save_gemini_key(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    key_val = message.text.strip()
+    db_set_setting("gemini_api_key", key_val)
+    await state.clear()
+    await message.answer(
+        "✅ <b>Gemini AI API kaliti saqlandi!</b>\n"
+        "Endi botga PDF yoki rasm tashlab 30, 43 va 90 talik test kalitlarini avtomatik tuzdirishingiz mumkin!",
+        parse_mode="HTML",
+        reply_markup=main_menu(ADMIN_ID)
+    )
+
+@dp.callback_query(F.data == "adm_btn_del_test")
+async def adm_ask_delete_test(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        return
+    await state.set_state(AdminPanel.waiting_delete_code)
+    cancel_kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="❌ Bekor qilish")]], resize_keyboard=True)
+    await callback.message.answer(
+        "🗑 O'chirmoqchi bo'lgan <b>Test kodini</b> yozib yuboring (masalan: <code>MS-1014</code>):",
         parse_mode="HTML",
         reply_markup=cancel_kb
     )
     await callback.answer()
 
-@dp.message(AdminVideoUploadState.waiting_for_video, F.video)
-async def admin_save_video(message: types.Message, state: FSMContext):
-    data = await state.get_data()
-    lid = data.get("target_lesson_id")
-    v_type = data.get("video_type")
-    title = data.get("target_title")
-    file_id = message.video.file_id
-
-    update_lesson_video(lid, v_type, file_id)
+@dp.message(AdminPanel.waiting_delete_code)
+async def adm_perform_delete_test(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    code = message.text.strip().upper()
+    ok = db_delete_test(code)
     await state.clear()
+    if ok:
+        await message.answer(f"✅ <b>{code}</b> kodli test bazadan o'chirildi!", parse_mode="HTML", reply_markup=main_menu(ADMIN_ID))
+    else:
+        await message.answer(f"❌ <b>{code}</b> kodli test topilmadi.", parse_mode="HTML", reply_markup=main_menu(ADMIN_ID))
 
-    type_str = "Nazariya videosi" if v_type == "theory" else "Masala yechish videosi"
-    await message.answer(
-        f"✅ <b>Muvaffaqiyatli saqlandi!</b>\n\n"
-        f"Mavzu: <b>{title}</b>\n"
-        f"Turi: <b>{type_str}</b>\n\n"
-        f"Endi ushbu darsni xarid qilgan o'quvchilarga video avtomatik yetkazib beriladi!",
-        parse_mode="HTML",
-        reply_markup=get_main_keyboard()
-    )
-
-# 30 talik test
-@dp.message(F.text == "📝 30 talik test tekshirish (PDF)")
-async def test_30_start(message: types.Message, state: FSMContext):
-    await state.set_state(Test30State.waiting_for_answers)
+@dp.callback_query(F.data == "adm_btn_ch")
+async def adm_change_channel(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        return
+    await state.set_state(AdminPanel.waiting_channel)
     cancel_kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="❌ Bekor qilish")]], resize_keyboard=True)
-    await message.answer(
-        "📝 <b>30 talik test javoblaringizni yuboring!</b>\n\n"
-        "Javoblarni ketma-ket 30 ta harf ko'rinishida yozing (A, B, C, D):\n"
-        "Masalan: <code>abcdabcdabcdabcdabcdabcdabcdab</code>\n\n"
-        "Bot sizga darhol rasmiy PDF hisobot tayyorlab beradi! 📄",
+    await callback.message.answer(
+        "📢 <b>Majburiy obuna kanal userini yuboring:</b>\n"
+        "(Masalan: <code>@kimyo_kurslar</code>, o'chirish uchun <code>none</code>)",
         parse_mode="HTML",
         reply_markup=cancel_kb
     )
+    await callback.answer()
 
-@dp.message(Test30State.waiting_for_answers)
-async def test_30_process(message: types.Message, state: FSMContext):
-    user_keys = message.text.strip().lower().replace(" ", "").replace("\n", "")
-    if len(user_keys) != 30:
-        await message.answer(f"❗️ Siz kiritgan javoblar soni: <b>{len(user_keys)} ta</b>. Testda qat'iy 30 ta bo'lishi kerak!")
+@dp.message(AdminPanel.waiting_channel)
+async def adm_save_channel(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
         return
-
-    official_keys = get_setting("test_keys_30", "abcdabcdabcdabcdabcdabcdabcdab")
-    await message.answer("⏳ PDF hisobot tayyorlanmoqda...")
-
-    pdf_bytes, correct, percentage, total_ball = generate_test_pdf(
-        full_name=message.from_user.full_name or "O'quvchi",
-        user_id=message.from_user.id,
-        user_answers=user_keys,
-        correct_keys=official_keys
-    )
+    val = message.text.strip()
+    if val.lower() in ["none", "0"]:
+        db_set_setting("required_channel", "")
+        await state.clear()
+        await message.answer("✅ Majburiy obuna o'chirildi!", reply_markup=main_menu(ADMIN_ID))
+        return
+    if not val.startswith("@") and not val.startswith("-100"):
+        val = f"@{val}"
+    db_set_setting("required_channel", val)
     await state.clear()
+    await message.answer(f"✅ Majburiy obuna kanali saqlandi: {val}", reply_markup=main_menu(ADMIN_ID))
 
-    caption = (
-        f"🎉 <b>TEST NATIJANGIZ TAYYOR!</b>\n"
-        f"────────────────────────\n"
-        f"👤 O'quvchi: <b>{message.from_user.full_name}</b>\n"
-        f"✅ To'g'ri: <b>{correct} / 30 ta</b> ({percentage}%)\n"
-        f"🎯 Ball: <b>{total_ball} ball</b>\n"
-        f"────────────────────────"
-    )
-    pdf_file = BufferedInputFile(pdf_bytes, filename=f"Natija_{message.from_user.id}.pdf")
-    await message.answer_document(document=pdf_file, caption=caption, parse_mode="HTML", reply_markup=get_main_keyboard())
-
-# Admin qo'shimcha amallari
-@dp.callback_query(F.data == "admin_stats")
-async def admin_stats(callback: types.CallbackQuery):
+@dp.callback_query(F.data == "adm_btn_stats")
+async def adm_show_stats(callback: types.CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
         return
-    s = get_stats()
+    s = db_get_stats()
     text = (
         "📊 <b>BOT STATISTIKASI:</b>\n"
         "────────────────────────\n"
-        f"👥 O'quvchilar: <b>{s['users']} ta</b>\n"
-        f"✅ Tasdiqlangan to'lovlar: <b>{s['approved']} ta</b>\n"
-        f"⏳ Kutilayotgan cheklar: <b>{s['pending']} ta</b>\n"
+        f"👥 Jami o'quvchilar: <b>{s['users']} ta</b>\n"
+        f"🧪 Yaratilgan testlar: <b>{s['tests']} ta</b>\n"
+        f"📝 Tekshirilgan natijalar: <b>{s['results']} ta</b>\n"
         "────────────────────────"
     )
     await callback.message.answer(text, parse_mode="HTML")
     await callback.answer()
 
-@dp.callback_query(F.data == "admin_change_keys")
-async def admin_change_keys(callback: types.CallbackQuery, state: FSMContext):
+@dp.callback_query(F.data == "adm_btn_sendall")
+async def adm_ask_broadcast(callback: types.CallbackQuery, state: FSMContext):
     if callback.from_user.id != ADMIN_ID:
         return
-    await state.set_state(AdminState.waiting_for_new_keys)
+    await state.set_state(AdminPanel.waiting_broadcast)
     cancel_kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="❌ Bekor qilish")]], resize_keyboard=True)
-    await callback.message.answer("Yangi 30 talik test kalitini yozing (30 ta harf):", reply_markup=cancel_kb)
+    await callback.message.answer("Barchaga jo'natiladigan xabarni yozing:", reply_markup=cancel_kb)
     await callback.answer()
 
-@dp.message(AdminState.waiting_for_new_keys)
-async def process_new_keys(message: types.Message, state: FSMContext):
+@dp.message(AdminPanel.waiting_broadcast)
+async def adm_run_broadcast(message: types.Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
         return
-    k = message.text.strip().lower().replace(" ", "")
-    if len(k) != 30:
-        await message.answer("Kalit 30 ta harf bo'lishi shart!")
-        return
-    set_setting("test_keys_30", k)
-    await state.clear()
-    await message.answer("✅ Yangi kalit saqlandi!", reply_markup=get_main_keyboard())
-
-@dp.callback_query(F.data == "admin_change_link")
-async def admin_change_link(callback: types.CallbackQuery, state: FSMContext):
-    if callback.from_user.id != ADMIN_ID:
-        return
-    cur = get_setting("channel_link", "https://t.me/onlyibrohimov")
-    await callback.message.answer(f"Hozirgi havola: {cur}\n\nYangi havolani yuboring:")
-    await callback.answer()
-
-@dp.callback_query(F.data == "admin_broadcast")
-async def admin_broadcast(callback: types.CallbackQuery, state: FSMContext):
-    if callback.from_user.id != ADMIN_ID:
-        return
-    await state.set_state(AdminState.waiting_for_broadcast)
-    cancel_kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="❌ Bekor qilish")]], resize_keyboard=True)
-    await callback.message.answer("Barchaga yuboriladigan xabarni yozing:", reply_markup=cancel_kb)
-    await callback.answer()
-
-@dp.message(AdminState.waiting_for_broadcast)
-async def process_broadcast(message: types.Message, state: FSMContext):
-    if message.from_user.id != ADMIN_ID:
-        return
-    users = get_all_users()
+    users = db_get_all_users()
     count = 0
     await message.answer(f"⏳ {len(users)} ta o'quvchiga yuborilmoqda...")
     for uid in users:
         try:
             await message.send_copy(chat_id=uid)
             count += 1
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(0.04)
         except Exception:
             pass
     await state.clear()
-    await message.answer(f"✅ Xabar {count} ta foydalanuvchiga yetkazildi!", reply_markup=get_main_keyboard())
+    await message.answer(f"✅ Xabar {count} ta o'quvchiga yetkazildi!", reply_markup=main_menu(ADMIN_ID))
 
-@dp.message(F.text == "👨‍🏫 Ustoz haqida")
-async def teacher_info(message: types.Message):
-    await message.answer(
-        "👨‍🏫 <b>Ustoz haqida:</b>\n\n"
-        "• Azizbek Ibrohimov — Kimyo fani bo'yicha maxsus uslubiyot muallifi;\n"
-        "• DTM va Milliy Sertifikat imtihonlariga tayyorlovchi murabbiy;\n"
-        "• Masalalarni formulalarsiz va mantiqiy usullarda oson yechish tizimi muallifi.",
-        parse_mode="HTML"
-    )
-
-@dp.message(F.text == "📞 Bog'lanish")
-async def contact_info(message: types.Message):
-    await message.answer(f"📞 Savollar bo'yicha administrator: {ADMIN_USERNAME}", parse_mode="HTML")
-
-# Render Web Service uchun port ochish funksiyasi (Timed out bo'lmasligi uchun)
+# -------------------------------------------------------------
+# 24/7 UPTIMEROBOT UCHUN WEB SERVER
+# -------------------------------------------------------------
 async def handle_ping(request):
-    return web.Response(text="A+ Kimyo Bot is active 24/7!")
+    return web.Response(text="A+ Kimyo AI Test Bot is active 24/7!")
 
 async def start_web_server():
     app = web.Application()
@@ -975,17 +1262,18 @@ async def start_web_server():
     port = int(os.getenv("PORT", 8080))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    print(f">>> Render Web Port {port} faollashdi!")
+    print(f">>> Render Web Port {port} faol!")
 
+# -------------------------------------------------------------
+# ASOSIY ISHGA TUSHIRISH
+# -------------------------------------------------------------
 async def main():
     init_db()
     print("=" * 60)
-    print(">>> A+ Kimyo Boti (Yangi Darslar Katalogi & Video Baza) ishga tushdi!")
+    print(">>> A+ Kimyo AI Test Tekshirgich Boti (30, 43 MS, 90 DTM) ishga tushdi!")
     print(f">>> Admin ID: {ADMIN_ID} | Admin: {ADMIN_USERNAME}")
     print("=" * 60)
-    # 1. Render tekshiruvi uchun veb-server ishga tushadi
     await start_web_server()
-    # 2. Telegram bot ishga tushadi
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
