@@ -31,6 +31,10 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", "6734050237"))
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "@onlyibrohimov")
 DEFAULT_GEMINI_KEY = os.getenv("GEMINI_API_KEY", "")
 
+# Standart majburiy obuna kanali
+DEFAULT_REQUIRED_CHANNEL = "@Kimyo_Sertifkat_uchun"
+DEFAULT_CHANNEL_URL = "https://t.me/Kimyo_Sertifkat_uchun"
+
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
@@ -78,6 +82,11 @@ def init_db():
             submitted_at TEXT
         )
     """)
+    # Majburiy obuna kanalini standart holatda bazaga yozib qo'yamiz
+    c.execute(
+        "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
+        ("required_channel", DEFAULT_REQUIRED_CHANNEL)
+    )
     conn.commit()
     conn.close()
 
@@ -200,6 +209,64 @@ def db_get_all_users():
     users = [row[0] for row in c.fetchall()]
     conn.close()
     return users
+
+# -------------------------------------------------------------
+# MAJBURIY OBUNA TEKSHIRUVI (https://t.me/Kimyo_Sertifkat_uchun)
+# -------------------------------------------------------------
+def get_required_channel_data():
+    """
+    Bazadagi kanal nomini (@Kimyo_Sertifkat_uchun yoki https://t.me/...)
+    toza chat_id va url ko'rinishiga keltiradi.
+    """
+    raw = db_get_setting("required_channel", DEFAULT_REQUIRED_CHANNEL).strip()
+    if not raw or raw.lower() in ["none", "0", "off"]:
+        return None, None
+
+    if "t.me/" in raw:
+        uname = raw.split("t.me/")[-1].split("/")[0].split("?")[0].strip()
+        return f"@{uname}", f"https://t.me/{uname}"
+    if raw.startswith("@"):
+        uname = raw[1:]
+        return f"@{uname}", f"https://t.me/{uname}"
+    if raw.startswith("-100"):
+        return raw, DEFAULT_CHANNEL_URL
+    return f"@{raw}", f"https://t.me/{raw}"
+
+async def check_channel_subscription(user_id: int) -> bool:
+    chat_id, _ = get_required_channel_data()
+    if not chat_id:
+        return True
+    try:
+        member = await bot.get_chat_member(chat_id=chat_id, user_id=user_id)
+        if member.status in ["creator", "administrator", "member"]:
+            return True
+        if member.status == "restricted" and getattr(member, "is_member", False):
+            return True
+        return False
+    except Exception as err:
+        logging.warning(f"Majburiy obunani tekshirishda xato ({chat_id}): {err}")
+        # Agar bot kanalda admin bo'lmasa, faqat Adminning o'zini o'tkazib yuboradi
+        return user_id == ADMIN_ID
+
+async def prompt_subscription(message: types.Message):
+    chat_id, ch_url = get_required_channel_data()
+    if not ch_url:
+        ch_url = DEFAULT_CHANNEL_URL
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📢 Kanalga a'zo bo'lish", url=ch_url)],
+            [InlineKeyboardButton(text="✅ Obunani tekshirish", callback_data="btn_check_sub")]
+        ]
+    )
+    await message.answer(
+        "🛑 <b>Diqqat! Botdan foydalanish uchun rasmiy kanalimizga obuna bo'lishingiz shart!</b>\n\n"
+        f"👉 Kanal: <a href='{ch_url}'>{chat_id or '@Kimyo_Sertifkat_uchun'}</a>\n\n"
+        "Pastdagi <b>«📢 Kanalga a'zo bo'lish»</b> tugmasini bosib kanalga qo'shiling, so'ng <b>«✅ Obunani tekshirish»</b> tugmasini bosing 👇",
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+        reply_markup=kb
+    )
 
 # -------------------------------------------------------------
 # SUN'IY INTELLEKT (GEMINI AI) MOTORI
@@ -343,12 +410,6 @@ async def ai_solve_photo_problem(file_bytes: bytes, mime_type: str) -> str:
 # JAVOBLARNI O'QISH VA BALL HISOBLASH (30, 43, 90 TALIK)
 # -------------------------------------------------------------
 def parse_input_answers(raw_text: str, test_type: str) -> dict:
-    """
-    Foydalanuvchi kiritgan javoblarni har qanday formatdan o'qib oladi:
-    1) '1a 2b 3c ... 36=9 37=18'
-    2) 'ABCDABCD...' (ketma-ket harflar)
-    3) '1-A, 2-B, 3-C...'
-    """
     text = raw_text.strip()
     answers = {}
 
@@ -370,9 +431,6 @@ def parse_input_answers(raw_text: str, test_type: str) -> dict:
     return answers
 
 def evaluate_student_submission(test_type: str, correct_keys: dict, student_ans: dict) -> dict:
-    """
-    30 talik, 43 talik Milliy Sertifikat va 90 talik DTM testlarini rasmiy mezon asosida hisoblaydi.
-    """
     mistakes = []
     correct_count = 0
 
@@ -482,7 +540,6 @@ def evaluate_student_submission(test_type: str, correct_keys: dict, student_ans:
             else:
                 mistakes.append(f"{q}-savol (Siz: {s_val or '—'} | Kalit: {k_val})")
 
-        # Rasch shkalasi bo'yicha hisoblash
         if correct_count == 0:
             rasch_score = 0.0
         elif correct_count == 43:
@@ -523,42 +580,6 @@ def evaluate_student_submission(test_type: str, correct_keys: dict, student_ans:
         }
 
 # -------------------------------------------------------------
-# MAJBURIY OBUNA TEKSHIRUVI
-# -------------------------------------------------------------
-async def check_channel_subscription(user_id: int) -> bool:
-    if user_id == ADMIN_ID:
-        return True
-    req_ch = db_get_setting("required_channel", "").strip()
-    if not req_ch:
-        return True
-    if not req_ch.startswith("@") and not req_ch.startswith("-100"):
-        req_ch = f"@{req_ch}"
-    try:
-        member = await bot.get_chat_member(chat_id=req_ch, user_id=user_id)
-        return member.status in ["creator", "administrator", "member", "restricted"]
-    except Exception as err:
-        logging.warning(f"Obunani tekshirishda xato: {err}")
-        return True
-
-async def prompt_subscription(message: types.Message):
-    req_ch = db_get_setting("required_channel", "").strip()
-    clean_name = req_ch.replace("@", "")
-    ch_url = f"https://t.me/{clean_name}"
-
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="📢 Kanalga a'zo bo'lish", url=ch_url)],
-            [InlineKeyboardButton(text="✅ Obunani tekshirish", callback_data="btn_check_sub")]
-        ]
-    )
-    await message.answer(
-        "⚠️ <b>Botdan to'liq foydalanish uchun rasmiy kanalimizga a'zo bo'ling!</b>\n\n"
-        "Kanalga a'zo bo'lib, pastdagi <b>«✅ Obunani tekshirish»</b> tugmasini bosing:",
-        parse_mode="HTML",
-        reply_markup=kb
-    )
-
-# -------------------------------------------------------------
 # FSM STATE HOLATLARI
 # -------------------------------------------------------------
 class StudentTestSolve(StatesGroup):
@@ -580,7 +601,7 @@ class AdminPanel(StatesGroup):
     waiting_broadcast = State()
 
 # -------------------------------------------------------------
-# ASOSIY MENYU TUGMALARI (FAQAT TEST VA AI YECHIM)
+# ASOSIY MENYU TUGMALARI
 # -------------------------------------------------------------
 def main_menu(user_id: int = 0):
     kb = [
@@ -593,7 +614,7 @@ def main_menu(user_id: int = 0):
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
 # -------------------------------------------------------------
-# START VA OBUNA HANDLERLARI
+# START VA MAJBURIY OBUNA HANDLERLARI
 # -------------------------------------------------------------
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message, state: FSMContext):
@@ -603,6 +624,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
     username = f"@{message.from_user.username}" if message.from_user.username else ""
     db_add_user(uid, name, username)
 
+    # Majburiy obunani tekshirish (@Kimyo_Sertifkat_uchun)
     if not await check_channel_subscription(uid):
         await prompt_subscription(message)
         return
@@ -612,8 +634,8 @@ async def cmd_start(message: types.Message, state: FSMContext):
         f"🧪 <b>A+ Kimyo | AI Test Tekshirgich</b> botiga xush kelibsiz!\n\n"
         f"🤖 <b>Bot imkoniyatlari:</b>\n"
         f"• 📋 <b>30 talik Test:</b> Avtomatik tekshirish va ball hisoblash;\n"
-        f"• 🎯 <b>43 talik Milliy Sertifikat:</b> Rasch modeli va darajalar ($A+, A, B+, B, C$);\n"
-        f"• 🏛 <b>90 talik DTM Blok Test:</b> 3 ta blok ($1.1 / 3.1 / 2.1$) bo'yicha hisoblash;\n"
+        f"• 🎯 <b>43 talik Milliy Sertifikat:</b> Rasch modeli va darajalar (A+, A, B+, B, C);\n"
+        f"• 🏛 <b>90 talik DTM Blok Test:</b> 3 ta blok (1.1 / 3.1 / 2.1) bo'yicha hisoblash;\n"
         f"• 📸 <b>AI Masala Yechish:</b> Kimyo masalasi rasmini yuborsangiz, sun'iy intellekt yechib tushuntirib beradi!\n\n"
         f"Kerakli bo'limni tanlang 👇"
     )
@@ -623,14 +645,20 @@ async def cmd_start(message: types.Message, state: FSMContext):
 async def cb_check_sub(callback: types.CallbackQuery):
     uid = callback.from_user.id
     if await check_channel_subscription(uid):
-        await callback.message.delete()
+        try:
+            await callback.message.delete()
+        except Exception:
+            pass
         await callback.message.answer(
-            "🎉 <b>Obunangiz tasdiqlandi!</b> Barcha bo'limlar ochildi:",
+            "🎉 <b>Obunangiz tasdiqlandi!</b>\nMarhamat, botning barcha imkoniyatlaridan foydalanishingiz mumkin:",
             parse_mode="HTML",
             reply_markup=main_menu(uid)
         )
     else:
-        await callback.answer("❌ Kanalga a'zo bo'lmadingiz! Avval a'zo bo'ling.", show_alert=True)
+        await callback.answer(
+            "❌ Siz hali kanalga a'zo bo'lmadingiz! Avval «📢 Kanalga a'zo bo'lish» tugmasini bosib qo'shiling.",
+            show_alert=True
+        )
 
 @dp.message(F.text == "❌ Bekor qilish")
 async def cancel_any_state(message: types.Message, state: FSMContext):
@@ -695,7 +723,6 @@ async def handle_admin_test_upload(message: types.Message, state: FSMContext):
     prefix = "TEST" if test_type == "30_talik" else ("MS" if test_type == "43_ms" else "DTM")
     test_code = f"{prefix}-{datetime.now().strftime('%m%d%H%M')}"
 
-    # Agar matn ko'rinishida kalit yuborgan bo'lsa
     if message.text and not message.text.startswith("/"):
         parsed_keys = parse_input_answers(message.text, test_type)
         if not parsed_keys:
@@ -715,7 +742,6 @@ async def handle_admin_test_upload(message: types.Message, state: FSMContext):
         )
         return
 
-    # Agar PDF yoki Rasm yuborgan bo'lsa -> AI ishga tushadi
     file_id = ""
     file_type = ""
     mime_type = ""
@@ -864,6 +890,11 @@ async def show_active_tests_list(message: types.Message):
 
 @dp.callback_query(F.data.startswith("solve_now:"))
 async def cb_solve_test_now(callback: types.CallbackQuery, state: FSMContext):
+    if not await check_channel_subscription(callback.from_user.id):
+        await callback.answer("❌ Avval kanalga obuna bo'ling!", show_alert=True)
+        await prompt_subscription(callback.message)
+        return
+
     code = callback.data.split(":")[1]
     row = db_get_test(code)
     if not row:
@@ -1077,13 +1108,19 @@ async def handle_problem_photo_solve(message: types.Message, state: FSMContext):
 
 @dp.message(F.text == "👨‍🏫 Ustoz & Bog'lanish")
 async def teacher_and_contact_info(message: types.Message):
+    if not await check_channel_subscription(message.from_user.id):
+        await prompt_subscription(message)
+        return
+
     await message.answer(
         f"👨‍🏫 <b>Ustoz haqida:</b>\n"
         f"• <b>Azizbek Ibrohimov</b> — Kimyo fani bo'yicha maxsus uslubiyot muallifi;\n"
         f"• DTM va Milliy Sertifikat imtihonlariga tayyorlovchi murabbiy;\n"
         f"• Kimyo masalalarini quruq formulalarsiz, mantiqiy va tezkor yechish uslubi muallifi.\n\n"
+        f"📢 <b>Rasmiy kanal:</b> {DEFAULT_CHANNEL_URL}\n"
         f"📞 <b>Bog'lanish uchun:</b> {ADMIN_USERNAME}",
-        parse_mode="HTML"
+        parse_mode="HTML",
+        disable_web_page_preview=True
     )
 
 # -------------------------------------------------------------
@@ -1093,14 +1130,14 @@ async def teacher_and_contact_info(message: types.Message):
 async def admin_main(message: types.Message):
     if message.from_user.id != ADMIN_ID:
         return
-    cur_ch = db_get_setting("required_channel", "Belgilanmagan")
+    cur_ch, _ = get_required_channel_data()
     has_ai_key = "✅ Ulangan" if get_gemini_api_key() else "❌ Kiritilmagan"
 
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="🤖 AI orqali Test Yaratish (PDF/Rasm)", callback_data="adm_btn_ai_test")],
             [InlineKeyboardButton(text="🔑 Gemini AI API Kalitni kiritish", callback_data="adm_btn_gemini")],
-            [InlineKeyboardButton(text="📢 Majburiy kanalni sozlash", callback_data="adm_btn_ch")],
+            [InlineKeyboardButton(text="📢 Majburiy kanalni o'zgartirish", callback_data="adm_btn_ch")],
             [InlineKeyboardButton(text="🗑 Testni o'chirish", callback_data="adm_btn_del_test")],
             [InlineKeyboardButton(text="📊 Statistika", callback_data="adm_btn_stats")],
             [InlineKeyboardButton(text="📨 Barchaga xabar yuborish", callback_data="adm_btn_sendall")]
@@ -1109,7 +1146,8 @@ async def admin_main(message: types.Message):
     text = (
         f"👑 <b>Ustoz & Admin Boshqaruv Paneli:</b>\n\n"
         f"🤖 Sun'iy Intellekt (Gemini API): <b>{has_ai_key}</b>\n"
-        f"📢 Majburiy kanal: <b>{cur_ch}</b>\n\n"
+        f"📢 Majburiy kanal: <b>{cur_ch or 'O`chirilgan'}</b>\n\n"
+        f"<i>⚠️ Eslatma: Majburiy obuna ishlashi uchun botingiz {cur_ch or DEFAULT_REQUIRED_CHANNEL} kanalida Admin bo'lishi kerak!</i>\n\n"
         f"Kerakli amalni tanlang 👇"
     )
     await message.answer(text, parse_mode="HTML", reply_markup=kb)
@@ -1182,8 +1220,8 @@ async def adm_change_channel(callback: types.CallbackQuery, state: FSMContext):
     await state.set_state(AdminPanel.waiting_channel)
     cancel_kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="❌ Bekor qilish")]], resize_keyboard=True)
     await callback.message.answer(
-        "📢 <b>Majburiy obuna kanal userini yuboring:</b>\n"
-        "(Masalan: <code>@kimyo_kurslar</code>, o'chirish uchun <code>none</code>)",
+        "📢 <b>Majburiy obuna kanal havolasini yoki userini yuboring:</b>\n"
+        "(Masalan: <code>https://t.me/Kimyo_Sertifkat_uchun</code> yoki <code>@Kimyo_Sertifkat_uchun</code>, o'chirish uchun <code>none</code>)",
         parse_mode="HTML",
         reply_markup=cancel_kb
     )
@@ -1194,16 +1232,20 @@ async def adm_save_channel(message: types.Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
         return
     val = message.text.strip()
-    if val.lower() in ["none", "0"]:
-        db_set_setting("required_channel", "")
+    if val.lower() in ["none", "0", "off"]:
+        db_set_setting("required_channel", "none")
         await state.clear()
         await message.answer("✅ Majburiy obuna o'chirildi!", reply_markup=main_menu(ADMIN_ID))
         return
-    if not val.startswith("@") and not val.startswith("-100"):
-        val = f"@{val}"
     db_set_setting("required_channel", val)
+    chat_id, ch_url = get_required_channel_data()
     await state.clear()
-    await message.answer(f"✅ Majburiy obuna kanali saqlandi: {val}", reply_markup=main_menu(ADMIN_ID))
+    await message.answer(
+        f"✅ Majburiy obuna kanali saqlandi: <b>{chat_id}</b> ({ch_url})\n"
+        f"⚠️ Botni ushbu kanalga <b>Admin</b> qilib qo'shishni unutmang!",
+        parse_mode="HTML",
+        reply_markup=main_menu(ADMIN_ID)
+    )
 
 @dp.callback_query(F.data == "adm_btn_stats")
 async def adm_show_stats(callback: types.CallbackQuery):
@@ -1271,7 +1313,7 @@ async def main():
     init_db()
     print("=" * 60)
     print(">>> A+ Kimyo AI Test Tekshirgich Boti (30, 43 MS, 90 DTM) ishga tushdi!")
-    print(f">>> Admin ID: {ADMIN_ID} | Admin: {ADMIN_USERNAME}")
+    print(f">>> Majburiy obuna kanali: {DEFAULT_REQUIRED_CHANNEL} ({DEFAULT_CHANNEL_URL})")
     print("=" * 60)
     await start_web_server()
     await dp.start_polling(bot)
