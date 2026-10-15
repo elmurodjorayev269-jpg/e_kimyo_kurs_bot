@@ -91,7 +91,6 @@ def init_db():
         "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
         ("required_channel", DEFAULT_REQUIRED_CHANNEL)
     )
-    # Har safar yangi kalitni bazada ham yangilab qo'yamiz
     c.execute(
         "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
         ("gemini_api_key", DEFAULT_GEMINI_KEY)
@@ -287,6 +286,71 @@ async def prompt_subscription(message: types.Message):
     )
 
 # -------------------------------------------------------------
+# MATNNI CHIROYLI TELEGRAM FORMATIGA O'TKAZISH (FORMATTER)
+# -------------------------------------------------------------
+SUB_MAP = str.maketrans("0123456789+-", "₀₁₂₃₄₅₆₇₈₉₊₋")
+SUP_MAP = str.maketrans("0123456789+-", "⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻")
+
+def clean_ai_text_for_telegram(text: str) -> str:
+    if not text:
+        return ""
+
+    # 1. LaTeX buyruqlarini chiroyli belgilarga almashtiramiz
+    replacements = {
+        r"\rightarrow": " → ",
+        r"\longrightarrow": " ⟶ ",
+        r"\leftarrow": " ← ",
+        r"\leftrightarrow": " ↔ ",
+        r"\rightleftharpoons": " ⇌ ",
+        r"\downarrow": "↓",
+        r"\uparrow": "↑",
+        r"\cdot": "·",
+        r"\times": "×",
+        r"\div": "÷",
+        r"\pm": "±",
+        r"\approx": "≈",
+        r"\neq": "≠",
+        r"\leq": "≤",
+        r"\geq": "≥",
+        r"\implies": " ⇒ ",
+        r"\Rightarrow": " ⇒ ",
+        r"\%": "%",
+        r"\circ": "°",
+        r"^\circ": "°",
+    }
+    for k, v in replacements.items():
+        text = text.replace(k, v)
+
+    # \text{...} va \mathrm{...} ichidagi yozuvlarni tozalash
+    text = re.sub(r"\\(?:text|mathrm|textbf|mathbf)\{([^}]*)\}", r"\1", text)
+    # \frac{a}{b} -> (a / b)
+    text = re.sub(r"\\frac\{([^}]*)\}\{([^}]*)\}", r"(\1 / \2)", text)
+
+    # 2. Indekslar: H_2SO_4 yoki _{12} -> H₂SO₄
+    text = re.sub(r"_\{([0-9+-]+)\}", lambda m: m.group(1).translate(SUB_MAP), text)
+    text = re.sub(r"_([0-9])", lambda m: m.group(1).translate(SUB_MAP), text)
+
+    # 3. Darajalar: ^{2+} yoki ^2 -> ²⁺
+    text = re.sub(r"\^\{([0-9+-]+)\}", lambda m: m.group(1).translate(SUP_MAP), text)
+    text = re.sub(r"\^([0-9+-])", lambda m: m.group(1).translate(SUP_MAP), text)
+
+    # 4. Dollar ($) belgilarini olib tashlaymiz
+    text = text.replace("$$", "").replace("$", "")
+
+    # Qolgan teskari chiziqlarni (\) tozalash
+    text = re.sub(r"\\([a-zA-Z]+)", r"\1", text)
+
+    # 5. HTML xavfsizligi uchun escape qilamiz
+    text = html.escape(text)
+
+    # 6. Markdown **qalin** va ### sarlavhalarni Telegram <b> tegiga o'giramiz
+    text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
+    text = re.sub(r"^#{1,4}\s*(.+)$", r"📌 <b>\1</b>", text, flags=re.MULTILINE)
+    text = re.sub(r"^\s*\*\s+", "• ", text, flags=re.MULTILINE)
+
+    return text.strip()
+
+# -------------------------------------------------------------
 # SUN'IY INTELLEKT (GEMINI + ZAXIRA VISION TIZIMI)
 # -------------------------------------------------------------
 def get_gemini_api_key() -> str:
@@ -405,7 +469,7 @@ async def call_gemini_api(prompt: str, b64_data: str, mime_type: str, json_mode:
                 except Exception as e:
                     last_error = str(e)
 
-                # 2-usul: OAuth Bearer header (AQ. kalitlar uchun)
+                # 2-usul: OAuth Bearer header
                 try:
                     async with session.post(
                         base_url,
@@ -502,12 +566,14 @@ async def ai_solve_photo_problem(file_bytes: bytes, mime_type: str) -> str:
     prompt = (
         "Sen A+ Kimyo maktabining tajribali ustozi Azizbek Ibrohimovning yordamchisan. "
         "Rasmdagi kimyo masalasini yoki test savolini o'zbek tilida eng oson, mantiqiy usulda "
-        "bosqichma-bosqich yechib, yakunida aniq to'g'ri javobni ko'rsatib ber."
+        "bosqichma-bosqich yechib, yakunida aniq to'g'ri javobni ko'rsatib ber.\n"
+        "MUHIM QOIDA: Hech qachon LaTeX ($...$, $$...$$, \\rightarrow, \\cdot) ishlatma! "
+        "Kimyoviy formulalarni oddiy chiroyli Unicode belgilar bilan yoz (masalan: H₂SO₄, SO₃, H₂O, →, ·)."
     )
 
     ok, res_text = await call_gemini_api(prompt, b64_data, mime_type, json_mode=False, timeout_sec=90)
     if ok:
-        return html.escape(res_text)
+        return clean_ai_text_for_telegram(res_text)
     return f"❌ Rasmni tahlil qilishda xatolik: {html.escape(res_text)}"
 
 # -------------------------------------------------------------
