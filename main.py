@@ -4,6 +4,7 @@ import html
 import io
 import json
 import logging
+import math
 import os
 import re
 import sqlite3
@@ -88,9 +89,18 @@ def init_db():
             total_score REAL,
             grade TEXT,
             written_score REAL DEFAULT 0,
+            answers_json TEXT DEFAULT '{}',
             submitted_at TEXT
         )
     """)
+    try:
+        c.execute("ALTER TABLE test_results ADD COLUMN answers_json TEXT DEFAULT '{}'")
+    except Exception:
+        pass
+    try:
+        c.execute("ALTER TABLE test_results ADD COLUMN written_score REAL DEFAULT 0")
+    except Exception:
+        pass
     c.execute(
         "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
         ("required_channel", DEFAULT_REQUIRED_CHANNEL)
@@ -181,20 +191,33 @@ def db_get_recent_tests(limit: int = 12):
     conn.close()
     return rows
 
-def db_save_result(test_code: str, user_id: int, full_name: str, correct_count: int, total_score: float, grade: str, written_score: float = 0.0):
+def db_save_result(test_code: str, user_id: int, full_name: str, correct_count: int, total_score: float, grade: str, written_score: float = 0.0, answers_dict: dict = None):
     conn = sqlite3.connect("database.db")
     c = conn.cursor()
-    try:
-        c.execute("ALTER TABLE test_results ADD COLUMN written_score REAL DEFAULT 0")
-    except Exception:
-        pass
+    ans_json = json.dumps(answers_dict or {}, ensure_ascii=False)
     c.execute(
-        """INSERT INTO test_results (test_code, user_id, full_name, correct_count, total_score, grade, written_score, submitted_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-        (test_code.upper(), user_id, full_name, correct_count, total_score, grade, written_score, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        """INSERT INTO test_results (test_code, user_id, full_name, correct_count, total_score, grade, written_score, answers_json, submitted_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (test_code.upper(), user_id, full_name, correct_count, total_score, grade, written_score, ans_json, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
     )
     conn.commit()
     conn.close()
+
+def db_get_all_submissions_for_test(test_code: str) -> list[dict]:
+    """Shu testni ishlagan barcha o'quvchilarning javoblarini olish (Dinamik Rasch hisoblash uchun)."""
+    conn = sqlite3.connect("database.db")
+    c = conn.cursor()
+    c.execute("SELECT answers_json FROM test_results WHERE test_code = ?", (test_code.upper().strip(),))
+    rows = c.fetchall()
+    conn.close()
+    result = []
+    for (a_json,) in rows:
+        if a_json:
+            try:
+                result.append(json.loads(a_json))
+            except Exception:
+                pass
+    return result
 
 def db_get_top_results(test_code: str, limit: int = 15):
     conn = sqlite3.connect("database.db")
@@ -416,7 +439,6 @@ async def call_gemini_api(prompt: str, b64_data: str, mime_type: str, json_mode:
                             if text_out:
                                 return True, text_out
                         else:
-                            err_body = await resp.text()
                             last_error = f"HTTP {resp.status}"
                 except Exception as e:
                     last_error = str(e)
@@ -503,8 +525,122 @@ async def ai_solve_photo_problem(file_bytes: bytes, mime_type: str) -> str:
     return f"❌ Rasmni tahlil qilishda xatolik: {html.escape(res_text)}"
 
 # -------------------------------------------------------------
-# JAVOBLARNI TEKSHIRISH VA BALL HISOBLASH
+# RASCH MODELI (1PL IRT LOGISTIK ALGORITMI) VA BALL HISOBLASH
 # -------------------------------------------------------------
+def compute_rasch_1pl_score(
+    test_code: str,
+    correct_keys: dict,
+    student_ans: dict,
+    written_scores: dict
+) -> dict:
+    """
+    Haqiqiy Rasch Modeli (1-Parameter Logistic IRT):
+    1) Har bir savolning qiyinlik indeksini (beta_i) bazadagi oldingi topshirishlar
+       va savol blokining ahamiyatiga ko'ra logit shkalada (-2.5 dan +2.5 gacha) aniqlaydi.
+    2) Newton-Raphson iteratsiyasi yordamida o'quvchining qobiliyat darajasi (theta) ni
+       P_i(theta) = 1 / (1 + exp(-(theta - beta_i))) tenglamasidan topadi.
+    3) Milliy Sertifikat T-shkalasiga o'tkazadi: Score = 50 + 10 * theta (0..75 ball).
+    """
+    past_submissions = db_get_all_submissions_for_test(test_code)
+    n_past = len(past_submissions)
+
+    # 1..40 savollar uchun a-priori qiyinlik (beta_prior) va og'irlik (weight)
+    beta_dict = {}
+    weight_dict = {}
+
+    for q in range(1, 41):
+        qs = str(q)
+        if 1 <= q <= 15:
+            b_prior, w = -1.0, 1.0   # Bazaviy yopiq testlar
+        elif 16 <= q <= 32:
+            b_prior, w = -0.2, 1.25  # O'rta-qiyin yopiq testlar
+        elif 33 <= q <= 35:
+            b_prior, w = 0.5, 1.5    # Moslashtirish (A-F)
+        else:
+            b_prior, w = 1.1, 1.8    # 36-40 Ochiq savollar
+
+        # Agar bazada shu testni ishlagan o'quvchilar bo'lsa, haqiqiy statistik qiyinlikni qo'shamiz
+        if n_past >= 3 and qs in correct_keys:
+            k_val = str(correct_keys.get(qs, "")).strip().upper().replace(",", ".")
+            corr_cnt = 0
+            for sub in past_submissions:
+                s_v = str(sub.get(qs, "")).strip().upper().replace(",", ".")
+                if k_val and s_v == k_val:
+                    corr_cnt += 1
+            # Laplace tekislash bilan to'g'ri yechish ehtimoli p_i
+            p_i = (corr_cnt + 1.0) / (n_past + 2.0)
+            beta_emp = math.log((1.0 - p_i) / p_i)
+            # Empirik va nazariy qiyinlik kombinatsiyasi
+            beta_dict[qs] = 0.6 * beta_emp + 0.4 * b_prior
+        else:
+            beta_dict[qs] = b_prior
+
+        weight_dict[qs] = w
+
+    # 41, 42, 43 yozma masalalar (Eng yuqori qiyinlik va ball)
+    for q in [41, 42, 43]:
+        qs = str(q)
+        beta_dict[qs] = 1.65
+        weight_dict[qs] = 2.2
+
+    # O'quvchining har bir savoldan olgan ulushi u_i in [0, 1]
+    u_scores = {}
+    for q in range(1, 41):
+        qs = str(q)
+        k_val = str(correct_keys.get(qs, "")).strip().upper().replace(",", ".")
+        if not k_val:
+            continue
+        s_val = str(student_ans.get(qs, "")).strip().upper().replace(",", ".")
+        u_scores[qs] = 1.0 if s_val == k_val else 0.0
+
+    for q in [41, 42, 43]:
+        qs = str(q)
+        w_val = float(written_scores.get(qs, 0.0))
+        u_scores[qs] = max(0.0, min(1.0, w_val / 2.5))
+
+    if not u_scores:
+        return {"theta": -3.0, "rasch_score": 0.0, "hard_solved": 0}
+
+    total_possible_w = sum(weight_dict[q] for q in u_scores)
+    earned_w = sum(weight_dict[q] * u_scores[q] for q in u_scores)
+
+    if earned_w <= 0.01:
+        return {"theta": -3.0, "rasch_score": 0.0, "hard_solved": 0}
+    if earned_w >= total_possible_w - 0.01:
+        return {"theta": 2.5, "rasch_score": 75.0, "hard_solved": len(u_scores)}
+
+    # Newton-Raphson (JMLE) iteratsiyasi orqali o'quvchi qobiliyati Theta ni topish:
+    # sum( w_i * (u_i - P_i(theta)) ) = 0
+    theta = 0.0
+    for _ in range(30):
+        f_val = 0.0
+        f_prime = 0.0
+        for qs, u_i in u_scores.items():
+            b_i = beta_dict[qs]
+            w_i = weight_dict[qs]
+            exp_term = math.exp(max(-20.0, min(20.0, -(theta - b_i))))
+            p_i = 1.0 / (1.0 + exp_term)
+            f_val += w_i * (u_i - p_i)
+            f_prime -= w_i * p_i * (1.0 - p_i)
+        if abs(f_prime) < 1e-6:
+            break
+        step = f_val / f_prime
+        theta -= step
+        theta = max(-3.5, min(3.5, theta))
+        if abs(step) < 1e-4:
+            break
+
+    # Standart Milliy Sertifikat Rasch shkalasi: O'rtacha 50, Standart og'ish ~ 11.5
+    raw_rasch = 50.0 + 11.2 * theta
+    rasch_score = round(max(15.0, min(75.0, raw_rasch)), 1)
+
+    hard_solved = sum(1 for qs, u_i in u_scores.items() if beta_dict[qs] >= 0.5 and u_i >= 0.6)
+    return {
+        "theta": round(theta, 2),
+        "rasch_score": rasch_score,
+        "hard_solved": hard_solved
+    }
+
 def parse_input_answers(raw_text: str, test_type: str) -> dict:
     text = raw_text.strip()
     answers = {}
@@ -523,7 +659,7 @@ def parse_input_answers(raw_text: str, test_type: str) -> dict:
 
     return answers
 
-def evaluate_student_submission(test_type: str, correct_keys: dict, student_ans: dict, written_scores: dict = None) -> dict:
+def evaluate_student_submission(test_type: str, correct_keys: dict, student_ans: dict, written_scores: dict = None, test_code: str = "") -> dict:
     mistakes = []
     correct_count = 0
     written_scores = written_scores or {}
@@ -590,8 +726,8 @@ def evaluate_student_submission(test_type: str, correct_keys: dict, student_ans:
         return {"correct_count": correct_count, "total_score": total_score, "grade": grade, "summary": summary, "mistakes": mistakes}
 
     else:
+        # 43 TALIK MILLIY SERTIFIKAT — HAQIQIY RASCH MODELI (1PL IRT)
         p1, p2, p3 = 0, 0, 0
-        weighted = 0.0
         for q in range(1, 41):
             qs = str(q)
             k_val = str(correct_keys.get(qs, "")).strip().upper().replace(",", ".")
@@ -600,34 +736,35 @@ def evaluate_student_submission(test_type: str, correct_keys: dict, student_ans:
                 continue
             if s_val == k_val:
                 correct_count += 1
-                if 1 <= q <= 32: p1 += 1; weighted += 1.5
-                elif 33 <= q <= 35: p2 += 1; weighted += 2.0
-                elif 36 <= q <= 40: p3 += 1; weighted += 2.4
+                if 1 <= q <= 32: p1 += 1
+                elif 33 <= q <= 35: p2 += 1
+                elif 36 <= q <= 40: p3 += 1
             else:
                 mistakes.append(f"{q}-savol (Siz: {s_val or '—'} | Kalit: {k_val})")
 
-        # 41, 42, 43 yozma ish ballari (rasm orqali)
         w41 = float(written_scores.get("41", 0.0))
         w42 = float(written_scores.get("42", 0.0))
         w43 = float(written_scores.get("43", 0.0))
         written_total = round(w41 + w42 + w43, 1)
-        for q_w, val_w in [("41", w41), ("42", w42), ("43", w43)]:
+        for _, val_w in [("41", w41), ("42", w42), ("43", w43)]:
             if val_w >= 1.5:
                 correct_count += 1
 
-        weighted += written_total * 1.4
-        rasch = 0.0 if (correct_count == 0 and written_total == 0) else round(min(75.0, 24.0 + weighted * 0.68), 1)
+        rasch_info = compute_rasch_1pl_score(test_code, correct_keys, student_ans, written_scores)
+        rasch = rasch_info["rasch_score"]
+        theta_val = rasch_info["theta"]
+
         grade = (
-            "A+ Daraja 🏆" if rasch >= 70 else
-            "A Daraja 🥇" if rasch >= 65 else
-            "B+ Daraja 🥈" if rasch >= 60 else
-            "B Daraja 🥈" if rasch >= 55 else
-            "C+ Daraja 🥉" if rasch >= 50 else
-            "C Daraja 🎗" if rasch >= 46 else "Sertifikatsiz ❌"
+            "A+ Daraja (100% Imtiyoz) 🏆" if rasch >= 70 else
+            "A Daraja (100% Imtiyoz) 🥇" if rasch >= 65 else
+            "B+ Daraja (Proporsional) 🥈" if rasch >= 60 else
+            "B Daraja (Proporsional) 🥈" if rasch >= 55 else
+            "C+ Daraja (Proporsional) 🥉" if rasch >= 50 else
+            "C Daraja (Minimal) 🎗" if rasch >= 46 else "Sertifikatsiz ❌"
         )
 
         summary = (
-            f"🎯 <b>43 TALIK MILLIY SERTIFIKAT (MOCK):</b>\n"
+            f"🎯 <b>43 TALIK MILLIY SERTIFIKAT (RASCH MODELI):</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"🔹 1–32 (Yopiq A-D): <b>{p1} / 32 ta</b>\n"
             f"🔸 33–35 (Moslashtirish A-F): <b>{p2} / 3 ta</b>\n"
@@ -637,7 +774,8 @@ def evaluate_student_submission(test_type: str, correct_keys: dict, student_ans:
             f"   ├ 42-masala: <b>{w42} ball</b>\n"
             f"   └ 43-masala: <b>{w43} ball</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"📈 <b>Yakuniy Rasch Bali: {rasch} ball</b>\n"
+            f"📐 <b>Qobiliyat indeksi (θ Logit): {theta_val:+.2f}</b>\n"
+            f"📈 <b>Yakuniy Rasch T-Bali: {rasch} ball</b>\n"
             f"🏅 <b>Sertifikat Darajasi: {grade}</b>"
         )
         return {"correct_count": correct_count, "total_score": rasch, "grade": grade, "summary": summary, "mistakes": mistakes}
@@ -694,11 +832,6 @@ def build_electronic_sheet_kb(test_type: str, answers: dict, page: int = 1, writ
         rows.append(nav)
 
     else:
-        # 43_ms:
-        # Page 1: 1-10 (A-D)
-        # Page 2: 11-20 (A-D)
-        # Page 3: 21-32 (A-D)
-        # Page 4: 33-35 (A-F) + 36-40 (Yozma son) + 41-43 (Rasm yuklash)
         if page in [1, 2, 3]:
             ranges = {1: (1, 10), 2: (11, 20), 3: (21, 32)}
             start_q, end_q = ranges[page]
@@ -711,7 +844,6 @@ def build_electronic_sheet_kb(test_type: str, answers: dict, page: int = 1, writ
                     btn_row.append(InlineKeyboardButton(text=lbl, callback_data=f"ebtn:{q}:{opt}:{page}"))
                 rows.append(btn_row)
         else:
-            # 33-35 (A-F)
             for q in range(33, 36):
                 qs = str(q)
                 cur = answers.get(qs, "")
@@ -722,7 +854,6 @@ def build_electronic_sheet_kb(test_type: str, answers: dict, page: int = 1, writ
                     btn_row.append(InlineKeyboardButton(text=lbl, callback_data=f"ebtn:{q}:{opt}:4"))
                 rows.append(btn_row)
 
-            # 36-40 Ochiq savollar
             rows.append([InlineKeyboardButton(text="🔢 36–40 Ochiq savollar (Qiymat kiritish):", callback_data="noop")])
             open_row = []
             for q in range(36, 41):
@@ -736,7 +867,6 @@ def build_electronic_sheet_kb(test_type: str, answers: dict, page: int = 1, writ
             if open_row:
                 rows.append(open_row)
 
-            # 41, 42, 43 Rasm yuklash
             rows.append([InlineKeyboardButton(text="📸 41–43 Yozma masalalar rasmini yuklash:", callback_data="noop")])
             for q in [41, 42, 43]:
                 qs = str(q)
@@ -827,9 +957,9 @@ async def cmd_start(message: types.Message, state: FSMContext):
 
     text = (
         f"✨ Assalomu alaykum, <b>{html.escape(name)}</b>!\n\n"
-        f"🧪 <b>A+ KIMYO | ELEKTRON MOCK VA AI PLATFORMASI</b>\n"
+        f"🧪 <b>A+ KIMYO | ELEKTRON MOCK VA RASCH PLATFORMASI</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🔹 <b>📲 Elektron Test Ishlash</b> — interaktiv tugmalar orqali titul belgilash va 41, 42, 43-masalalar rasmini yuklash;\n"
+        f"🔹 <b>📲 Elektron Test Ishlash</b> — Rasch modeli asosida interaktiv titul belgilash va 41, 42, 43-masalalar rasmini yuklash;\n"
         f"🔹 <b>➕ Test Yaratish</b> — har bir o'quvchi va ustoz o'z testini (30 / 43 / 90) yarata oladi;\n"
         f"🔹 <b>🤖 AI Masala Yechish</b> — tushunmagan masalalarni rasm orqali yechish <i>(Mock test paytida avtomatik bloklanadi!)</i>.\n\n"
         f"Kerakli bo'limni tanlang 👇"
@@ -880,7 +1010,7 @@ async def user_start_test_create(message: types.Message, state: FSMContext):
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="📋 1. 30 talik Test (Standart)", callback_data="create_t:30_talik")],
-            [InlineKeyboardButton(text="🎯 2. 43 talik Milliy Sertifikat (Mock + 41-43 Rasm)", callback_data="create_t:43_ms")],
+            [InlineKeyboardButton(text="🎯 2. 43 talik Milliy Sertifikat (Rasch Modeli + 41-43 Rasm)", callback_data="create_t:43_ms")],
             [InlineKeyboardButton(text="🏛 3. 90 talik DTM Blok Testi", callback_data="create_t:90_dtm")]
         ]
     )
@@ -1022,7 +1152,7 @@ async def show_active_tests_list(message: types.Message):
     kb_rows = []
     lines = ["📋 <b>FAOL TESTLAR RO'YXATI:</b>\n━━━━━━━━━━━━━━━━━━━━━━━━"]
     for r_code, r_type, r_title, _ in recent:
-        badge = "30 talik" if r_type == "30_talik" else ("43 MS Mock" if r_type == "43_ms" else "90 DTM")
+        badge = "30 talik" if r_type == "30_talik" else ("43 MS Rasch" if r_type == "43_ms" else "90 DTM")
         lines.append(f"🔹 <code>{r_code}</code> — <b>{html.escape(r_title)}</b> <i>({badge})</i>")
         kb_rows.append([InlineKeyboardButton(text=f"📲 Elektron Yechish: {r_code} ({r_title[:18]})", callback_data=f"solve_now:{r_code}")])
 
@@ -1076,7 +1206,6 @@ async def process_code_for_exam(message: types.Message, state: FSMContext):
 async def launch_electronic_exam(message: types.Message, user_id: int, state: FSMContext, row: tuple):
     test_code, test_type, title, _, _, file_id, file_type = row
 
-    # Mock test boshlandi -> AI yordamchini ushbu foydalanuvchi uchun bloklaymiz!
     ACTIVE_EXAM_SESSIONS[user_id] = test_code
 
     await state.update_data(
@@ -1140,7 +1269,6 @@ async def reopen_electronic_sheet(message: types.Message, state: FSMContext):
         reply_markup=kb
     )
 
-# Tugma bosilganda (A, B, C, D, E, F)
 @dp.callback_query(F.data.startswith("ebtn:"))
 async def cb_electronic_mark(callback: types.CallbackQuery, state: FSMContext):
     parts = callback.data.split(":")
@@ -1152,7 +1280,6 @@ async def cb_electronic_mark(callback: types.CallbackQuery, state: FSMContext):
         return
 
     ans = data.get("e_answers", {})
-    # Agar yana o'sha harfni bossa o'chiradi, bo'lmasa belgilaydi
     if ans.get(q_num) == opt:
         ans.pop(q_num, None)
     else:
@@ -1166,7 +1293,6 @@ async def cb_electronic_mark(callback: types.CallbackQuery, state: FSMContext):
         pass
     await callback.answer(f"{q_num}-savol: {opt}")
 
-# Sahifani almashtirish
 @dp.callback_query(F.data.startswith("epage:"))
 async def cb_electronic_page(callback: types.CallbackQuery, state: FSMContext):
     page = int(callback.data.split(":")[1])
@@ -1188,7 +1314,6 @@ async def cb_electronic_page(callback: types.CallbackQuery, state: FSMContext):
         pass
     await callback.answer(f"{page}-sahifa")
 
-# 36-40 Ochiq savolga yozma javob kiritish
 @dp.callback_query(F.data.startswith("eopen:"))
 async def cb_open_question_input(callback: types.CallbackQuery, state: FSMContext):
     q_num = callback.data.split(":")[1]
@@ -1223,7 +1348,6 @@ async def receive_open_question_answer(message: types.Message, state: FSMContext
         reply_markup=kb
     )
 
-# 41, 42, 43-savollar uchun rasm yuklash
 @dp.callback_query(F.data.startswith("ephoto:"))
 async def cb_upload_written_photo(callback: types.CallbackQuery, state: FSMContext):
     q_num = callback.data.split(":")[1]
@@ -1263,7 +1387,6 @@ async def receive_written_solution_photo(message: types.Message, state: FSMConte
     await state.set_state(StudentTestSolve.in_electronic_exam)
     await wait.delete()
 
-    # Ustozga (Adminga) ham o'quvchining 41-43 yechim rasmini yuborib qo'yamiz
     test_code = data.get("active_test_code", "MS")
     try:
         await bot.send_photo(
@@ -1299,7 +1422,6 @@ async def receive_written_solution_photo(message: types.Message, state: FSMConte
 async def receive_written_photo_invalid(message: types.Message):
     await message.answer("⚠️ Iltimos, yechimingizni **rasm (foto)** ko'rinishida yuboring!")
 
-# Testni yakunlash
 @dp.callback_query(F.data == "efinish")
 async def cb_finish_electronic_exam(callback: types.CallbackQuery, state: FSMContext):
     uid = callback.from_user.id
@@ -1312,7 +1434,6 @@ async def cb_finish_electronic_exam(callback: types.CallbackQuery, state: FSMCon
     test_type = data.get("active_test_type", "30_talik")
     w_photos = data.get("written_photos", {})
 
-    # Agar 43 talik MS bo'lsa va 41, 42, 43 rasmlari yuklanmagan bo'lsa ogohlantiramiz (lekin 2-marta bossa yakunlaydi)
     if test_type == "43_ms" and len(w_photos) < 3 and not data.get("warned_missing_photos"):
         missing = [str(q) for q in [41, 42, 43] if str(q) not in w_photos]
         await state.update_data(warned_missing_photos=True)
@@ -1336,7 +1457,7 @@ async def cb_finish_electronic_exam(callback: types.CallbackQuery, state: FSMCon
     student_ans = data.get("e_answers", {})
     w_scores = data.get("written_scores", {})
 
-    res = evaluate_student_submission(test_type, correct_keys, student_ans, written_scores=w_scores)
+    res = evaluate_student_submission(test_type, correct_keys, student_ans, written_scores=w_scores, test_code=code)
     w_total = sum(float(v) for v in w_scores.values())
     db_save_result(
         code,
@@ -1345,7 +1466,8 @@ async def cb_finish_electronic_exam(callback: types.CallbackQuery, state: FSMCon
         res["correct_count"],
         res["total_score"],
         res["grade"],
-        written_score=w_total
+        written_score=w_total,
+        answers_dict=student_ans
     )
 
     mistakes_str = "\n".join(res["mistakes"][:25]) if res["mistakes"] else "🎉 Barcha belgilangan test javoblari 100% to'g'ri!"
@@ -1356,9 +1478,8 @@ async def cb_finish_electronic_exam(callback: types.CallbackQuery, state: FSMCon
         f"🔓 <i>Mock imtihon yakunlandi! Endi «🤖 AI Masala Yechish» bo'limidan yana foydalanishingiz mumkin.</i>"
     )
     await callback.message.answer(report, parse_mode="HTML", reply_markup=main_menu(uid))
-    await callback.answer("🎉 Natijangiz hisoblandi!")
+    await callback.answer("🎉 Natijangiz Rasch modelida hisoblandi!")
 
-# Agar o'quvchi titul ichida turib matn orqali ham javob yozib yuborsa (1A 2B...)
 @dp.message(StudentTestSolve.in_electronic_exam, F.text)
 async def quick_text_fill_in_exam(message: types.Message, state: FSMContext):
     data = await state.get_data()
@@ -1419,7 +1540,6 @@ async def cb_rating(callback: types.CallbackQuery):
 async def start_ai_solver(message: types.Message, state: FSMContext):
     uid = message.from_user.id
 
-    # QAT'IY CHEKLOV: Agar o'quvchi Mock test ishlayotgan bo'lsa, AI masalani ishlamaydi!
     if uid in ACTIVE_EXAM_SESSIONS:
         active_code = ACTIVE_EXAM_SESSIONS[uid]
         await message.answer(
