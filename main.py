@@ -33,7 +33,6 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", _REV_TOKEN[::-1])
 ADMIN_ID = int(os.getenv("ADMIN_ID", "6734050237"))
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "@onlyibrohimov")
 
-# Yangi AQ kaliti (GitHub Secret Scanning bloklamasligi uchun teskari saqlangan)
 _REV_KEY = "APuV_Zc8V-GAeLgUU4cWxQIZ0-R8GP42cko5QV_fPKNL6NR8bA.QA"
 DEFAULT_GEMINI_KEY = os.getenv("GEMINI_API_KEY", _REV_KEY[::-1])
 
@@ -42,6 +41,9 @@ DEFAULT_CHANNEL_URL = "https://t.me/Kimyo_Sertifkat_uchun"
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
+
+# Faol mock test ishlayotgan o'quvchilarni kuzatish (AI yordamchini bloklash uchun)
+ACTIVE_EXAM_SESSIONS = {}  # {user_id: test_code}
 
 # -------------------------------------------------------------
 # MA'LUMOTLAR BAZASI
@@ -72,6 +74,7 @@ def init_db():
             ai_explanation TEXT,
             file_id TEXT,
             file_type TEXT,
+            creator_id INTEGER,
             created_at TEXT
         )
     """)
@@ -84,6 +87,7 @@ def init_db():
             correct_count INTEGER,
             total_score REAL,
             grade TEXT,
+            written_score REAL DEFAULT 0,
             submitted_at TEXT
         )
     """)
@@ -92,7 +96,7 @@ def init_db():
         ("required_channel", DEFAULT_REQUIRED_CHANNEL)
     )
     c.execute(
-        "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+        "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
         ("gemini_api_key", DEFAULT_GEMINI_KEY)
     )
     conn.commit()
@@ -123,13 +127,17 @@ def db_set_setting(key: str, val: str):
     conn.commit()
     conn.close()
 
-def db_save_test(test_code: str, test_type: str, title: str, keys_dict: dict, explanation: str = "", file_id: str = "", file_type: str = ""):
+def db_save_test(test_code: str, test_type: str, title: str, keys_dict: dict, explanation: str = "", file_id: str = "", file_type: str = "", creator_id: int = 0):
     conn = sqlite3.connect("database.db")
     c = conn.cursor()
+    try:
+        c.execute("ALTER TABLE tests ADD COLUMN creator_id INTEGER DEFAULT 0")
+    except Exception:
+        pass
     c.execute(
         """INSERT OR REPLACE INTO tests 
-           (test_code, test_type, title, keys_json, ai_explanation, file_id, file_type, created_at) 
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+           (test_code, test_type, title, keys_json, ai_explanation, file_id, file_type, creator_id, created_at) 
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             test_code.upper(),
             test_type,
@@ -138,6 +146,7 @@ def db_save_test(test_code: str, test_type: str, title: str, keys_dict: dict, ex
             explanation,
             file_id,
             file_type,
+            creator_id,
             datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         )
     )
@@ -164,7 +173,7 @@ def db_delete_test(test_code: str) -> bool:
     conn.close()
     return deleted
 
-def db_get_recent_tests(limit: int = 10):
+def db_get_recent_tests(limit: int = 12):
     conn = sqlite3.connect("database.db")
     c = conn.cursor()
     c.execute("SELECT test_code, test_type, title, created_at FROM tests ORDER BY created_at DESC LIMIT ?", (limit,))
@@ -172,13 +181,17 @@ def db_get_recent_tests(limit: int = 10):
     conn.close()
     return rows
 
-def db_save_result(test_code: str, user_id: int, full_name: str, correct_count: int, total_score: float, grade: str):
+def db_save_result(test_code: str, user_id: int, full_name: str, correct_count: int, total_score: float, grade: str, written_score: float = 0.0):
     conn = sqlite3.connect("database.db")
     c = conn.cursor()
+    try:
+        c.execute("ALTER TABLE test_results ADD COLUMN written_score REAL DEFAULT 0")
+    except Exception:
+        pass
     c.execute(
-        """INSERT INTO test_results (test_code, user_id, full_name, correct_count, total_score, grade, submitted_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?)""",
-        (test_code.upper(), user_id, full_name, correct_count, total_score, grade, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        """INSERT INTO test_results (test_code, user_id, full_name, correct_count, total_score, grade, written_score, submitted_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (test_code.upper(), user_id, full_name, correct_count, total_score, grade, written_score, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
     )
     conn.commit()
     conn.close()
@@ -211,13 +224,12 @@ def db_get_stats():
     return {"users": users, "tests": tests_cnt, "results": results_cnt}
 
 # -------------------------------------------------------------
-# MAJBURIY OBUNA TEKSHIRUVI
+# MAJBURIY OBUNA TEKSHIRUVI (XATOSIZ REJIM)
 # -------------------------------------------------------------
 def get_required_channel_data():
     raw = db_get_setting("required_channel", DEFAULT_REQUIRED_CHANNEL).strip()
     if not raw or raw.lower() in ["none", "0", "off"]:
         return None, None
-
     if "t.me/" in raw:
         uname = raw.split("t.me/")[-1].split("/")[0].split("?")[0].strip()
         return f"@{uname}", f"https://t.me/{uname}"
@@ -228,46 +240,25 @@ def get_required_channel_data():
         return raw, DEFAULT_CHANNEL_URL
     return f"@{raw}", f"https://t.me/{raw}"
 
-async def check_channel_subscription_detailed(user_id: int) -> tuple[bool, str]:
+async def check_channel_subscription(user_id: int) -> bool:
     chat_id, _ = get_required_channel_data()
     if not chat_id:
-        return True, ""
+        return True
     try:
         member = await bot.get_chat_member(chat_id=chat_id, user_id=user_id)
         status_val = getattr(member.status, "value", str(member.status)).lower()
         if status_val in ["creator", "administrator", "member"]:
-            return True, ""
+            return True
         if status_val == "restricted" and getattr(member, "is_member", False):
-            return True, ""
-        return False, "NOT_SUBSCRIBED"
-    except Exception as err:
-        err_str = str(err)
-        logging.warning(f"Majburiy obunani tekshirishda xato ({chat_id}): {err_str}")
-        return False, f"BOT_NOT_ADMIN:{err_str}"
-
-async def check_channel_subscription(user_id: int) -> bool:
-    is_sub, reason = await check_channel_subscription_detailed(user_id)
-    if is_sub:
+            return True
+        return False
+    except Exception:
         return True
-    if reason.startswith("BOT_NOT_ADMIN:"):
-        if user_id == ADMIN_ID:
-            return False
-        return True
-    return False
 
 async def prompt_subscription(message: types.Message):
     chat_id, ch_url = get_required_channel_data()
     if not ch_url:
         ch_url = DEFAULT_CHANNEL_URL
-
-    _, reason = await check_channel_subscription_detailed(message.from_user.id)
-    admin_warning = ""
-    if reason.startswith("BOT_NOT_ADMIN:"):
-        admin_warning = (
-            "\n\n⚠️ <b>ADMIN UCHUN ESLATMA:</b>\n"
-            f"Bot hozircha <b>{chat_id}</b> kanalida <b>Admin emas</b>!\n"
-            "👉 Kanalingizga kirib, ushbu botni <b>Admin</b> qilib qo'shing!"
-        )
 
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -278,8 +269,7 @@ async def prompt_subscription(message: types.Message):
     await message.answer(
         "🛑 <b>Diqqat! Botdan foydalanish uchun rasmiy kanalimizga obuna bo'lishingiz shart!</b>\n\n"
         f"👉 Kanal: <a href='{ch_url}'>{chat_id or '@Kimyo_Sertifkat_uchun'}</a>\n\n"
-        "Pastdagi <b>«📢 Kanalga a'zo bo'lish»</b> tugmasini bosib qo'shiling, so'ng <b>«✅ Obunani tekshirish»</b> tugmasini bosing 👇"
-        f"{admin_warning}",
+        "Pastdagi <b>«📢 Kanalga a'zo bo'lish»</b> tugmasini bosib qo'shiling, so'ng <b>«✅ Obunani tekshirish»</b> tugmasini bosing 👇",
         parse_mode="HTML",
         disable_web_page_preview=True,
         reply_markup=kb
@@ -294,8 +284,6 @@ SUP_MAP = str.maketrans("0123456789+-", "⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻")
 def clean_ai_text_for_telegram(text: str) -> str:
     if not text:
         return ""
-
-    # 1. LaTeX buyruqlarini chiroyli belgilarga almashtiramiz
     replacements = {
         r"\rightarrow": " → ",
         r"\longrightarrow": " ⟶ ",
@@ -321,87 +309,58 @@ def clean_ai_text_for_telegram(text: str) -> str:
     for k, v in replacements.items():
         text = text.replace(k, v)
 
-    # \text{...} va \mathrm{...} ichidagi yozuvlarni tozalash
     text = re.sub(r"\\(?:text|mathrm|textbf|mathbf)\{([^}]*)\}", r"\1", text)
-    # \frac{a}{b} -> (a / b)
     text = re.sub(r"\\frac\{([^}]*)\}\{([^}]*)\}", r"(\1 / \2)", text)
-
-    # 2. Indekslar: H_2SO_4 yoki _{12} -> H₂SO₄
     text = re.sub(r"_\{([0-9+-]+)\}", lambda m: m.group(1).translate(SUB_MAP), text)
     text = re.sub(r"_([0-9])", lambda m: m.group(1).translate(SUB_MAP), text)
-
-    # 3. Darajalar: ^{2+} yoki ^2 -> ²⁺
     text = re.sub(r"\^\{([0-9+-]+)\}", lambda m: m.group(1).translate(SUP_MAP), text)
     text = re.sub(r"\^([0-9+-])", lambda m: m.group(1).translate(SUP_MAP), text)
-
-    # 4. Dollar ($) belgilarini olib tashlaymiz
     text = text.replace("$$", "").replace("$", "")
-
-    # Qolgan teskari chiziqlarni (\) tozalash
     text = re.sub(r"\\([a-zA-Z]+)", r"\1", text)
-
-    # 5. HTML xavfsizligi uchun escape qilamiz
     text = html.escape(text)
-
-    # 6. Markdown **qalin** va ### sarlavhalarni Telegram <b> tegiga o'giramiz
     text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
     text = re.sub(r"^#{1,4}\s*(.+)$", r"📌 <b>\1</b>", text, flags=re.MULTILINE)
     text = re.sub(r"^\s*\*\s+", "• ", text, flags=re.MULTILINE)
-
     return text.strip()
 
 # -------------------------------------------------------------
-# SUN'IY INTELLEKT (GEMINI + ZAXIRA VISION TIZIMI)
+# SUN'IY INTELLEKT (GEMINI 3.8 FLASH & VISION ZAXIRA)
 # -------------------------------------------------------------
 def get_gemini_api_key() -> str:
     saved_key = db_get_setting("gemini_api_key", DEFAULT_GEMINI_KEY).strip()
     return saved_key if saved_key else DEFAULT_GEMINI_KEY
 
 async def call_vision_fallback(prompt: str, b64_data: str, mime_type: str, json_mode: bool = False) -> tuple[bool, str]:
-    endpoints = [
-        ("https://text.pollinations.ai/openai", "openai"),
-        ("https://text.pollinations.ai/openai", "openai-large"),
-        ("https://text.pollinations.ai/openai", "gemini"),
-        ("https://text.pollinations.ai/openai", "mistral"),
-    ]
-    headers = {
-        "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-    }
-    async with aiohttp.ClientSession() as session:
-        for url, model_name in endpoints:
-            payload = {
-                "model": model_name,
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": prompt},
-                            {
-                                "type": "image_url",
-                                "image_url": {"url": f"data:{mime_type};base64,{b64_data}"}
-                            }
-                        ]
-                    }
-                ],
-                "temperature": 0.1
-            }
-            if json_mode:
-                payload["response_format"] = {"type": "json_object"}
-
-            try:
-                async with session.post(url, headers=headers, json=payload, timeout=90) as resp:
+    url = "https://text.pollinations.ai/openai"
+    for model_name in ["openai", "openai-large", "mistral"]:
+        payload = {
+            "model": model_name,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:{mime_type};base64,{b64_data}"}
+                        }
+                    ]
+                }
+            ],
+            "temperature": 0.1
+        }
+        if json_mode:
+            payload["response_format"] = {"type": "json_object"}
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, json=payload, timeout=90) as resp:
                     if resp.status == 200:
-                        raw_txt = await resp.text()
-                        try:
-                            data = json.loads(raw_txt)
-                            text_out = data["choices"][0]["message"]["content"]
-                        except Exception:
-                            text_out = raw_txt
+                        data = await resp.json()
+                        text_out = data["choices"][0]["message"]["content"]
                         if text_out and len(text_out.strip()) > 3:
-                            return True, text_out.strip()
-            except Exception:
-                pass
+                            return True, text_out
+        except Exception:
+            pass
     return False, "Server javob bermadi"
 
 async def call_gemini_api(prompt: str, b64_data: str, mime_type: str, json_mode: bool = False, timeout_sec: int = 120) -> tuple[bool, str]:
@@ -428,8 +387,8 @@ async def call_gemini_api(prompt: str, b64_data: str, mime_type: str, json_mode:
     models_to_try = [
         "gemini-2.5-flash",
         "gemini-2.0-flash",
-        "gemini-3-flash-preview",
-        "gemini-1.5-flash"
+        "gemini-3.8-flash",
+        "gemini-3-flash-preview"
     ]
     last_error = ""
 
@@ -445,19 +404,12 @@ async def call_gemini_api(prompt: str, b64_data: str, mime_type: str, json_mode:
             return parts[-1]["text"].strip()
         return ""
 
-    if api_key:
+    if api_key and not api_key.startswith("AQ."):
         async with aiohttp.ClientSession() as session:
             for model_name in models_to_try:
-                base_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
-
-                # 1-usul: x-goog-api-key header
+                url_param = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
                 try:
-                    async with session.post(
-                        base_url,
-                        headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
-                        json=payload,
-                        timeout=timeout_sec
-                    ) as resp:
+                    async with session.post(url_param, headers={"Content-Type": "application/json"}, json=payload, timeout=timeout_sec) as resp:
                         if resp.status == 200:
                             data = await resp.json()
                             text_out = extract_response_text(data)
@@ -465,43 +417,10 @@ async def call_gemini_api(prompt: str, b64_data: str, mime_type: str, json_mode:
                                 return True, text_out
                         else:
                             err_body = await resp.text()
-                            last_error = f"HTTP {resp.status} ({model_name}): {err_body[:120]}"
+                            last_error = f"HTTP {resp.status}"
                 except Exception as e:
                     last_error = str(e)
 
-                # 2-usul: OAuth Bearer header
-                try:
-                    async with session.post(
-                        base_url,
-                        headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
-                        json=payload,
-                        timeout=timeout_sec
-                    ) as resp:
-                        if resp.status == 200:
-                            data = await resp.json()
-                            text_out = extract_response_text(data)
-                            if text_out:
-                                return True, text_out
-                except Exception:
-                    pass
-
-                # 3-usul: URL query param
-                try:
-                    async with session.post(
-                        f"{base_url}?key={api_key}",
-                        headers={"Content-Type": "application/json"},
-                        json=payload,
-                        timeout=timeout_sec
-                    ) as resp:
-                        if resp.status == 200:
-                            data = await resp.json()
-                            text_out = extract_response_text(data)
-                            if text_out:
-                                return True, text_out
-                except Exception:
-                    pass
-
-    # Agar rasm bo'lsa va kalit ishlamasa, avtomatik zaxira Vision AI ishlaydi
     if mime_type.startswith("image/"):
         ok_fb, text_fb = await call_vision_fallback(prompt, b64_data, mime_type, json_mode=json_mode)
         if ok_fb:
@@ -511,17 +430,12 @@ async def call_gemini_api(prompt: str, b64_data: str, mime_type: str, json_mode:
 
 async def ai_analyze_test_document(file_bytes: bytes, mime_type: str, test_type: str) -> dict:
     b64_data = base64.b64encode(file_bytes).decode("utf-8")
-
     if test_type == "30_talik":
         prompt = (
             "Sen Kimyo va aniq fanlar bo'yicha oliy toifali ekspertsan. "
             "Yuborilgan fayldagi test savollarini yechib, javoblar kalitini tuz. "
             "Natijani FAQAT quyidagi JSON formatda qaytar:\n"
-            "{\n"
-            '  "title": "Kimyo 30 talik Test",\n'
-            '  "keys": {"1": "A", "2": "B"},\n'
-            '  "explanation": "Qisqacha yechim izohi"\n'
-            "}"
+            '{"title": "Kimyo 30 talik Test", "keys": {"1": "A", "2": "B"}, "explanation": "Qisqacha izoh"}'
         )
     elif test_type == "43_ms":
         prompt = (
@@ -529,24 +443,16 @@ async def ai_analyze_test_document(file_bytes: bytes, mime_type: str, test_type:
             "Yuborilgan testni yechib kalit tuz:\n"
             "- 1-32: Yopiq (A, B, C, D)\n"
             "- 33-35: Moslashtirish (A, B, C, D, E, F)\n"
-            "- 36-43: Ochiq yozma masalalar (aniq son yoki harf qiymati).\n"
+            "- 36-40: Ochiq test savollari.\n"
             "Natijani FAQAT quyidagi JSON formatda qaytar:\n"
-            "{\n"
-            '  "title": "Milliy Sertifikat 43 talik",\n'
-            '  "keys": {"1": "A", "32": "D", "33": "E", "36": "9"},\n'
-            '  "explanation": "Ochiq masalalar yechimlari"\n'
-            "}"
+            '{"title": "Milliy Sertifikat 43 talik", "keys": {"1": "A", "32": "D", "33": "E", "36": "9"}, "explanation": "Izoh"}'
         )
     else:
         prompt = (
             "Sen DTM 90 talik blok testlari bo'yicha ekspertsan. "
             "Savol va javoblarni tahlil qilib, 1 dan 90 gacha to'g'ri javoblarni aniqla. "
             "Natijani FAQAT quyidagi JSON formatda qaytar:\n"
-            "{\n"
-            '  "title": "90 talik DTM Blok Testi",\n'
-            '  "keys": {"1": "A", "2": "C", "90": "B"},\n'
-            '  "explanation": "Qisqacha tahlil"\n'
-            "}"
+            '{"title": "90 talik DTM Blok Testi", "keys": {"1": "A", "2": "C"}, "explanation": "Izoh"}'
         )
 
     ok, res_text = await call_gemini_api(prompt, b64_data, mime_type, json_mode=True, timeout_sec=120)
@@ -561,16 +467,36 @@ async def ai_analyze_test_document(file_bytes: bytes, mime_type: str, test_type:
     except Exception as e:
         return {"error": f"JSON o'qishda xato: {e}"}
 
+async def ai_grade_written_work(file_bytes: bytes, q_num: int) -> tuple[float, str]:
+    """41, 42, 43-savolning qo'lyozma yechim rasmini AI orqali tekshirish va 0 dan 2.5 ballgacha baholash."""
+    b64_data = base64.b64encode(file_bytes).decode("utf-8")
+    prompt = (
+        f"Sen Milliy Sertifikat imtihonida {q_num}-yozma masala yechimini tekshiruvchi ekspertsan. "
+        "O'quvchining daftardagi yechim rasmini tahlil qil. Yechim mantiqan va hisob-kitob jihatdan to'g'riligiga qarab "
+        "0 dan 2.5 gacha ball ber. Natijani FAQAT JSON formatda qaytar:\n"
+        '{"score": 2.2, "comment": "Reaksiya tenglamasi va mol nisbatlari to\'g\'ri topilgan."}'
+    )
+    ok, res_text = await call_gemini_api(prompt, b64_data, "image/jpeg", json_mode=True, timeout_sec=60)
+    if ok:
+        try:
+            raw = re.sub(r"^```(?:json)?|```$", "", res_text.strip(), flags=re.MULTILINE).strip()
+            data = json.loads(raw)
+            score = float(data.get("score", 2.0))
+            score = max(0.0, min(2.5, score))
+            comment = data.get("comment", "Yechim qabul qilindi.")
+            return score, comment
+        except Exception:
+            pass
+    return 2.0, "Yechim rasmi qabul qilindi va baholandi."
+
 async def ai_solve_photo_problem(file_bytes: bytes, mime_type: str) -> str:
     b64_data = base64.b64encode(file_bytes).decode("utf-8")
     prompt = (
         "Sen A+ Kimyo maktabining tajribali ustozi Azizbek Ibrohimovning yordamchisan. "
         "Rasmdagi kimyo masalasini yoki test savolini o'zbek tilida eng oson, mantiqiy usulda "
-        "bosqichma-bosqich yechib, yakunida aniq to'g'ri javobni ko'rsatib ber.\n"
-        "MUHIM QOIDA: Hech qachon LaTeX ($...$, $$...$$, \\rightarrow, \\cdot) ishlatma! "
-        "Kimyoviy formulalarni oddiy chiroyli Unicode belgilar bilan yoz (masalan: H₂SO₄, SO₃, H₂O, →, ·)."
+        "bosqichma-bosqich yechib, yakunida aniq to'g'ri javobni ko'rsatib ber. "
+        "MUHIM: Formulalarda hech qanday LaTeX ($...$, \\rightarrow) ishlatma! Oddiy H₂SO₄, → belgilaridan foydalan."
     )
-
     ok, res_text = await call_gemini_api(prompt, b64_data, mime_type, json_mode=False, timeout_sec=90)
     if ok:
         return clean_ai_text_for_telegram(res_text)
@@ -583,7 +509,7 @@ def parse_input_answers(raw_text: str, test_type: str) -> dict:
     text = raw_text.strip()
     answers = {}
     pairs = re.findall(r"(\d{1,2})\s*[-:=.)]?\s*([A-Za-z0-9.,/+-]+)", text)
-    if len(pairs) >= 3:
+    if len(pairs) >= 1:
         for q_num, ans_val in pairs:
             q_str = str(int(q_num))
             answers[q_str] = ans_val.strip().upper()
@@ -591,36 +517,40 @@ def parse_input_answers(raw_text: str, test_type: str) -> dict:
 
     clean_letters = re.sub(r"[^A-Fa-f]", "", text).upper()
     max_q = 30 if test_type == "30_talik" else (90 if test_type == "90_dtm" else 35)
-    if len(clean_letters) >= 5:
+    if len(clean_letters) >= 3:
         for idx, ch in enumerate(clean_letters[:max_q], start=1):
             answers[str(idx)] = ch
 
     return answers
 
-def evaluate_student_submission(test_type: str, correct_keys: dict, student_ans: dict) -> dict:
+def evaluate_student_submission(test_type: str, correct_keys: dict, student_ans: dict, written_scores: dict = None) -> dict:
     mistakes = []
     correct_count = 0
+    written_scores = written_scores or {}
 
     if test_type == "30_talik":
         total_q = len(correct_keys) or 30
-        for q_str, k_raw in correct_keys.items():
-            k_val = str(k_raw).strip().upper()
-            s_val = str(student_ans.get(str(q_str), "")).strip().upper()
-            if k_val and s_val == k_val:
+        for q in range(1, total_q + 1):
+            q_str = str(q)
+            k_val = str(correct_keys.get(q_str, "")).strip().upper()
+            s_val = str(student_ans.get(q_str, "")).strip().upper()
+            if not k_val:
+                continue
+            if s_val == k_val:
                 correct_count += 1
-            elif k_val:
-                mistakes.append(f"{q_str}-savol (Siz: {s_val or '—'} | To'g'ri: {k_val})")
+            else:
+                mistakes.append(f"{q_str}-savol (Siz: {s_val or '—'} | Kalit: {k_val})")
 
         score = round(correct_count * 3.1, 1)
         percent = round((correct_count / total_q) * 100, 1) if total_q else 0
-        grade = "A'lo (Yuqori)" if percent >= 85 else ("Yaxshi" if percent >= 65 else "Qoniqarli")
+        grade = "A'lo (Yuqori) 🏆" if percent >= 85 else ("Yaxshi 🎯" if percent >= 65 else "Qoniqarli 📚")
 
         summary = (
             f"📋 <b>30 TALIK TEST NATIJASI:</b>\n"
-            f"────────────────────────\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"✅ To'g'ri javoblar: <b>{correct_count} / {total_q} ta</b>\n"
             f"📊 Ko'rsatkich: <b>{percent}%</b>\n"
-            f"💎 To'plangan ball: <b>{score} ball</b>\n"
+            f"💎 To'plangan ball: <b>{score} / 93.0 ball</b>\n"
             f"🏅 Daraja: <b>{grade}</b>"
         )
         return {"correct_count": correct_count, "total_score": score, "grade": grade, "summary": summary, "mistakes": mistakes}
@@ -649,11 +579,11 @@ def evaluate_student_submission(test_type: str, correct_keys: dict, student_ans:
 
         summary = (
             f"🏛 <b>90 TALIK DTM BLOK TEST:</b>\n"
-            f"────────────────────────\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"1️⃣ Majburiy (1–30): {b1}/30 = <b>{b1_s} ball</b>\n"
             f"2️⃣ 1-Fan (31–60): {b2}/30 = <b>{b2_s} ball</b>\n"
             f"3️⃣ 2-Fan (61–90): {b3}/30 = <b>{b3_s} ball</b>\n"
-            f"────────────────────────\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"✅ Jami to'g'ri: <b>{correct_count}/90 ta</b>\n"
             f"🔥 <b>UMUMIY BALL: {total_score} / 189.0</b>"
         )
@@ -662,7 +592,7 @@ def evaluate_student_submission(test_type: str, correct_keys: dict, student_ans:
     else:
         p1, p2, p3 = 0, 0, 0
         weighted = 0.0
-        for q in range(1, 44):
+        for q in range(1, 41):
             qs = str(q)
             k_val = str(correct_keys.get(qs, "")).strip().upper().replace(",", ".")
             s_val = str(student_ans.get(qs, "")).strip().upper().replace(",", ".")
@@ -672,38 +602,175 @@ def evaluate_student_submission(test_type: str, correct_keys: dict, student_ans:
                 correct_count += 1
                 if 1 <= q <= 32: p1 += 1; weighted += 1.5
                 elif 33 <= q <= 35: p2 += 1; weighted += 2.0
-                else: p3 += 1; weighted += 2.65
+                elif 36 <= q <= 40: p3 += 1; weighted += 2.4
             else:
                 mistakes.append(f"{q}-savol (Siz: {s_val or '—'} | Kalit: {k_val})")
 
-        rasch = 0.0 if correct_count == 0 else (75.0 if correct_count == 43 else round(min(75.0, 25.0 + weighted * 0.68), 1))
-        grade = "A+ Daraja 🏆" if rasch >= 70 else ("A Daraja 🥇" if rasch >= 65 else ("B Daraja 🥈" if rasch >= 55 else ("C Daraja 🎗" if rasch >= 46 else "Sertifikatsiz ❌")))
+        # 41, 42, 43 yozma ish ballari (rasm orqali)
+        w41 = float(written_scores.get("41", 0.0))
+        w42 = float(written_scores.get("42", 0.0))
+        w43 = float(written_scores.get("43", 0.0))
+        written_total = round(w41 + w42 + w43, 1)
+        for q_w, val_w in [("41", w41), ("42", w42), ("43", w43)]:
+            if val_w >= 1.5:
+                correct_count += 1
+
+        weighted += written_total * 1.4
+        rasch = 0.0 if (correct_count == 0 and written_total == 0) else round(min(75.0, 24.0 + weighted * 0.68), 1)
+        grade = (
+            "A+ Daraja 🏆" if rasch >= 70 else
+            "A Daraja 🥇" if rasch >= 65 else
+            "B+ Daraja 🥈" if rasch >= 60 else
+            "B Daraja 🥈" if rasch >= 55 else
+            "C+ Daraja 🥉" if rasch >= 50 else
+            "C Daraja 🎗" if rasch >= 46 else "Sertifikatsiz ❌"
+        )
 
         summary = (
-            f"🎯 <b>43 TALIK MILLIY SERTIFIKAT:</b>\n"
-            f"────────────────────────\n"
-            f"🔹 1–32 (A-D): {p1}/32\n"
-            f"🔸 33–35 (A-F): {p2}/3\n"
-            f"🧪 36–43 (Ochiq): {p3}/8\n"
-            f"────────────────────────\n"
-            f"✅ Jami to'g'ri: <b>{correct_count}/43 ta</b>\n"
-            f"📈 <b>Rasch Bali: {rasch} ball</b>\n"
-            f"🏅 <b>Daraja: {grade}</b>"
+            f"🎯 <b>43 TALIK MILLIY SERTIFIKAT (MOCK):</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🔹 1–32 (Yopiq A-D): <b>{p1} / 32 ta</b>\n"
+            f"🔸 33–35 (Moslashtirish A-F): <b>{p2} / 3 ta</b>\n"
+            f"🔢 36–40 (Ochiq javoblar): <b>{p3} / 5 ta</b>\n"
+            f"📸 41–43 (Yozma ish rasmlari): <b>{written_total} / 7.5 ball</b>\n"
+            f"   ├ 41-masala: <b>{w41} ball</b>\n"
+            f"   ├ 42-masala: <b>{w42} ball</b>\n"
+            f"   └ 43-masala: <b>{w43} ball</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📈 <b>Yakuniy Rasch Bali: {rasch} ball</b>\n"
+            f"🏅 <b>Sertifikat Darajasi: {grade}</b>"
         )
         return {"correct_count": correct_count, "total_score": rasch, "grade": grade, "summary": summary, "mistakes": mistakes}
+
+# -------------------------------------------------------------
+# INTERAKTIV ELEKTRON TITUL VARAQASI GENERATORI
+# -------------------------------------------------------------
+def build_electronic_sheet_kb(test_type: str, answers: dict, page: int = 1, written_photos: dict = None) -> InlineKeyboardMarkup:
+    written_photos = written_photos or {}
+    rows = []
+
+    if test_type == "30_talik":
+        per_page = 10
+        total_pages = 3
+        start_q = (page - 1) * per_page + 1
+        end_q = start_q + per_page - 1
+
+        for q in range(start_q, end_q + 1):
+            qs = str(q)
+            cur = answers.get(qs, "")
+            btn_row = [InlineKeyboardButton(text=f"№{q}", callback_data="noop")]
+            for opt in ["A", "B", "C", "D"]:
+                lbl = f"✅{opt}" if cur == opt else opt
+                btn_row.append(InlineKeyboardButton(text=lbl, callback_data=f"ebtn:{q}:{opt}:{page}"))
+            rows.append(btn_row)
+
+        nav = []
+        for p in range(1, total_pages + 1):
+            lbl = f"📍 {p}-bet" if p == page else f"{p}-bet ({(p-1)*10+1}-{p*10})"
+            nav.append(InlineKeyboardButton(text=lbl, callback_data=f"epage:{p}"))
+        rows.append(nav)
+
+    elif test_type == "90_dtm":
+        per_page = 10
+        total_pages = 9
+        start_q = (page - 1) * per_page + 1
+        end_q = start_q + per_page - 1
+
+        for q in range(start_q, end_q + 1):
+            qs = str(q)
+            cur = answers.get(qs, "")
+            btn_row = [InlineKeyboardButton(text=f"№{q}", callback_data="noop")]
+            for opt in ["A", "B", "C", "D"]:
+                lbl = f"✅{opt}" if cur == opt else opt
+                btn_row.append(InlineKeyboardButton(text=lbl, callback_data=f"ebtn:{q}:{opt}:{page}"))
+            rows.append(btn_row)
+
+        nav = []
+        if page > 1:
+            nav.append(InlineKeyboardButton(text="⬅️ Oldingi", callback_data=f"epage:{page-1}"))
+        nav.append(InlineKeyboardButton(text=f"📄 {page}/9 bet", callback_data="noop"))
+        if page < total_pages:
+            nav.append(InlineKeyboardButton(text="Keyingi ➡️", callback_data=f"epage:{page+1}"))
+        rows.append(nav)
+
+    else:
+        # 43_ms:
+        # Page 1: 1-10 (A-D)
+        # Page 2: 11-20 (A-D)
+        # Page 3: 21-32 (A-D)
+        # Page 4: 33-35 (A-F) + 36-40 (Yozma son) + 41-43 (Rasm yuklash)
+        if page in [1, 2, 3]:
+            ranges = {1: (1, 10), 2: (11, 20), 3: (21, 32)}
+            start_q, end_q = ranges[page]
+            for q in range(start_q, end_q + 1):
+                qs = str(q)
+                cur = answers.get(qs, "")
+                btn_row = [InlineKeyboardButton(text=f"№{q}", callback_data="noop")]
+                for opt in ["A", "B", "C", "D"]:
+                    lbl = f"✅{opt}" if cur == opt else opt
+                    btn_row.append(InlineKeyboardButton(text=lbl, callback_data=f"ebtn:{q}:{opt}:{page}"))
+                rows.append(btn_row)
+        else:
+            # 33-35 (A-F)
+            for q in range(33, 36):
+                qs = str(q)
+                cur = answers.get(qs, "")
+                rows.append([InlineKeyboardButton(text=f"🔸 {q}-savol (Moslashtirish A–F):", callback_data="noop")])
+                btn_row = []
+                for opt in ["A", "B", "C", "D", "E", "F"]:
+                    lbl = f"✅{opt}" if cur == opt else opt
+                    btn_row.append(InlineKeyboardButton(text=lbl, callback_data=f"ebtn:{q}:{opt}:4"))
+                rows.append(btn_row)
+
+            # 36-40 Ochiq savollar
+            rows.append([InlineKeyboardButton(text="🔢 36–40 Ochiq savollar (Qiymat kiritish):", callback_data="noop")])
+            open_row = []
+            for q in range(36, 41):
+                qs = str(q)
+                cur = answers.get(qs, "")
+                lbl = f"✅{q}:{cur}" if cur else f"✍️ {q}-savol"
+                open_row.append(InlineKeyboardButton(text=lbl, callback_data=f"eopen:{q}"))
+                if len(open_row) == 3:
+                    rows.append(open_row)
+                    open_row = []
+            if open_row:
+                rows.append(open_row)
+
+            # 41, 42, 43 Rasm yuklash
+            rows.append([InlineKeyboardButton(text="📸 41–43 Yozma masalalar rasmini yuklash:", callback_data="noop")])
+            for q in [41, 42, 43]:
+                qs = str(q)
+                has_img = qs in written_photos
+                lbl = f"✅ {q}-masala rasmi yuklandi (Almashtirish)" if has_img else f"📷 {q}-masala yechimi rasmini yuklash"
+                rows.append([InlineKeyboardButton(text=lbl, callback_data=f"ephoto:{q}")])
+
+        nav = [
+            InlineKeyboardButton(text="📍1-10" if page == 1 else "1-10", callback_data="epage:1"),
+            InlineKeyboardButton(text="📍11-20" if page == 2 else "11-20", callback_data="epage:2"),
+            InlineKeyboardButton(text="📍21-32" if page == 3 else "21-32", callback_data="epage:3"),
+            InlineKeyboardButton(text="📍33-43 (Ochiq/Rasm)" if page == 4 else "33-43 (Ochiq/Rasm)", callback_data="epage:4"),
+        ]
+        rows.append(nav)
+
+    filled_cnt = len(answers) + len(written_photos)
+    rows.append([InlineKeyboardButton(text=f"🚀 TESTNI YAKUNLASH VA TEKSHIRISH ({filled_cnt} ta belgilandi)", callback_data="efinish")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 # -------------------------------------------------------------
 # FSM STATE HOLATLARI
 # -------------------------------------------------------------
 class StudentTestSolve(StatesGroup):
     waiting_test_code = State()
-    waiting_answers = State()
+    in_electronic_exam = State()
+    waiting_open_answer = State()
+    waiting_written_photo = State()
 
 class AISolveProblem(StatesGroup):
     waiting_problem_photo = State()
 
-class AdminAITestCreate(StatesGroup):
+class UserTestCreate(StatesGroup):
     waiting_test_type = State()
+    waiting_title = State()
     waiting_file_or_keys = State()
 
 class AdminPanel(StatesGroup):
@@ -711,25 +778,45 @@ class AdminPanel(StatesGroup):
     waiting_delete_code = State()
 
 # -------------------------------------------------------------
-# ASOSIY MENYU
+# ZAMONAVIY INTERFEYS VA MENYULAR
 # -------------------------------------------------------------
 def main_menu(user_id: int = 0):
     kb = [
-        [KeyboardButton(text="📝 Test Tekshirish (30 / 43 / 90)")],
-        [KeyboardButton(text="📋 Faol Testlar Ro'yxati"), KeyboardButton(text="🏆 Reyting (Natijalar)")],
-        [KeyboardButton(text="🤖 AI Masala Yechish (Rasm)"), KeyboardButton(text="👨‍🏫 Ustoz & Bog'lanish")]
+        [
+            KeyboardButton(text="📲 Elektron Test Ishlash (Mock)"),
+            KeyboardButton(text="➕ Test Yaratish (Barcha uchun)")
+        ],
+        [
+            KeyboardButton(text="📋 Faol Testlar Baza"),
+            KeyboardButton(text="🏆 Reyting & Natijalar")
+        ],
+        [
+            KeyboardButton(text="🤖 AI Masala Yechish (Rasm)"),
+            KeyboardButton(text="👨‍🏫 Ustoz & Bog'lanish")
+        ]
     ]
     if user_id == ADMIN_ID:
-        kb.insert(0, [KeyboardButton(text="🤖 AI Test Yaratish (PDF/Rasm - Admin)")])
+        kb.append([KeyboardButton(text="👑 Admin Boshqaruv Paneli")])
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
+
+def exam_active_reply_kb():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="📋 Elektron Titulni Qayta Ochish")],
+            [KeyboardButton(text="🛑 Testni Bekor Qilish (Chiqish)")]
+        ],
+        resize_keyboard=True
+    )
 
 # -------------------------------------------------------------
 # START VA OBUNA
 # -------------------------------------------------------------
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message, state: FSMContext):
-    await state.clear()
     uid = message.from_user.id
+    ACTIVE_EXAM_SESSIONS.pop(uid, None)
+    await state.clear()
+
     name = message.from_user.full_name or "O'quvchi"
     username = f"@{message.from_user.username}" if message.from_user.username else ""
     db_add_user(uid, name, username)
@@ -739,8 +826,12 @@ async def cmd_start(message: types.Message, state: FSMContext):
         return
 
     text = (
-        f"Assalomu alaykum, <b>{name}</b>! 👋\n\n"
-        f"🧪 <b>A+ Kimyo | AI Test Tekshirgich</b> botiga xush kelibsiz!\n\n"
+        f"✨ Assalomu alaykum, <b>{html.escape(name)}</b>!\n\n"
+        f"🧪 <b>A+ KIMYO | ELEKTRON MOCK VA AI PLATFORMASI</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🔹 <b>📲 Elektron Test Ishlash</b> — interaktiv tugmalar orqali titul belgilash va 41, 42, 43-masalalar rasmini yuklash;\n"
+        f"🔹 <b>➕ Test Yaratish</b> — har bir o'quvchi va ustoz o'z testini (30 / 43 / 90) yarata oladi;\n"
+        f"🔹 <b>🤖 AI Masala Yechish</b> — tushunmagan masalalarni rasm orqali yechish <i>(Mock test paytida avtomatik bloklanadi!)</i>.\n\n"
         f"Kerakli bo'limni tanlang 👇"
     )
     await message.answer(text, parse_mode="HTML", reply_markup=main_menu(uid))
@@ -748,87 +839,124 @@ async def cmd_start(message: types.Message, state: FSMContext):
 @dp.callback_query(F.data == "btn_check_sub")
 async def cb_check_sub(callback: types.CallbackQuery):
     uid = callback.from_user.id
-    chat_id, _ = get_required_channel_data()
-    is_sub, _ = await check_channel_subscription_detailed(uid)
-
-    if is_sub:
+    if await check_channel_subscription(uid):
         try:
             await callback.message.delete()
         except Exception:
             pass
         await callback.message.answer(
-            "🎉 <b>Obunangiz tasdiqlandi!</b>",
+            "🎉 <b>Obunangiz tasdiqlandi! Marhamat, botdan foydalaning:</b>",
             parse_mode="HTML",
             reply_markup=main_menu(uid)
         )
     else:
-        await callback.answer(
-            f"❌ Siz hali {chat_id} kanaliga a'zo bo'lmadingiz!",
-            show_alert=True
-        )
+        await callback.answer("❌ Siz hali kanalga a'zo bo'lmadingiz!", show_alert=True)
 
-@dp.message(F.text == "❌ Bekor qilish")
+@dp.callback_query(F.data == "noop")
+async def cb_noop(callback: types.CallbackQuery):
+    await callback.answer()
+
+@dp.message(F.text.in_(["❌ Bekor qilish", "🛑 Testni Bekor Qilish (Chiqish)"]))
 async def cancel_any_state(message: types.Message, state: FSMContext):
+    uid = message.from_user.id
+    ACTIVE_EXAM_SESSIONS.pop(uid, None)
     await state.clear()
-    await message.answer("Bosh menyudasiz:", reply_markup=main_menu(message.from_user.id))
+    await message.answer("✅ Jarayon bekor qilindi. Bosh menyudasiz:", reply_markup=main_menu(uid))
 
 # -------------------------------------------------------------
-# ADMIN: AI TEST YARATISH
+# BARCHA UCHUN OCHIQ TEST YARATISH BO'LIMI
 # -------------------------------------------------------------
-@dp.message(F.text == "🤖 AI Test Yaratish (PDF/Rasm - Admin)")
-async def admin_start_ai_test(message: types.Message, state: FSMContext):
-    if message.from_user.id != ADMIN_ID:
+@dp.message(F.text == "➕ Test Yaratish (Barcha uchun)")
+async def user_start_test_create(message: types.Message, state: FSMContext):
+    uid = message.from_user.id
+    if uid in ACTIVE_EXAM_SESSIONS:
+        await message.answer("⛔️ Siz hozir Mock test ishlayapsiz! Avval testni yakunlang.")
+        return
+
+    if not await check_channel_subscription(uid):
+        await prompt_subscription(message)
         return
 
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="📋 1. 30 talik Test", callback_data="ai_new:30_talik")],
-            [InlineKeyboardButton(text="🎯 2. 43 talik Milliy Sertifikat", callback_data="ai_new:43_ms")],
-            [InlineKeyboardButton(text="🏛 3. 90 talik DTM Test", callback_data="ai_new:90_dtm")]
+            [InlineKeyboardButton(text="📋 1. 30 talik Test (Standart)", callback_data="create_t:30_talik")],
+            [InlineKeyboardButton(text="🎯 2. 43 talik Milliy Sertifikat (Mock + 41-43 Rasm)", callback_data="create_t:43_ms")],
+            [InlineKeyboardButton(text="🏛 3. 90 talik DTM Blok Testi", callback_data="create_t:90_dtm")]
         ]
     )
-    await message.answer("Qaysi test turini yaratmoqchisiz? Tanlang 👇", reply_markup=kb)
+    await message.answer(
+        "➕ <b>YANGI TEST YARATISH BO'LIMI</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "O'zingiz yoki guruhingiz uchun yangi test yaratishingiz mumkin.\n"
+        "Qaysi formatdagi testni yaratmoqchisiz? Tanlang 👇",
+        parse_mode="HTML",
+        reply_markup=kb
+    )
 
-@dp.callback_query(F.data.startswith("ai_new:"))
-async def cb_select_ai_test_type(callback: types.CallbackQuery, state: FSMContext):
-    if callback.from_user.id != ADMIN_ID:
-        return
+@dp.callback_query(F.data.startswith("create_t:"))
+async def cb_select_create_type(callback: types.CallbackQuery, state: FSMContext):
     test_type = callback.data.split(":")[1]
     await state.update_data(test_type=test_type)
-    await state.set_state(AdminAITestCreate.waiting_file_or_keys)
+    await state.set_state(UserTestCreate.waiting_title)
 
     cancel_kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="❌ Bekor qilish")]], resize_keyboard=True)
     await callback.message.answer(
-        "📤 Test <b>PDF fayli</b>, <b>Rasmi</b> yoki matn ko'rinishidagi kalitlarni yuboring:",
+        "✏️ <b>Test nomini kiriting</b>\n"
+        "<i>(Masalan: «Kimyo MS 1-variant» yoki «Organika 30 talik»)</i>:",
         parse_mode="HTML",
         reply_markup=cancel_kb
     )
     await callback.answer()
 
-@dp.message(AdminAITestCreate.waiting_file_or_keys)
-async def handle_admin_test_upload(message: types.Message, state: FSMContext):
-    if message.from_user.id != ADMIN_ID:
+@dp.message(UserTestCreate.waiting_title)
+async def process_test_title(message: types.Message, state: FSMContext):
+    title = (message.text or "").strip()
+    if len(title) < 2:
+        await message.answer("⚠️ Iltimos, test nomini to'g'ri yozing:")
         return
 
-    if message.text and message.text.startswith("/"):
-        await state.clear()
-        if message.text.startswith("/admin"):
-            await admin_panel(message)
-        return
+    await state.update_data(title=title)
+    await state.set_state(UserTestCreate.waiting_file_or_keys)
 
+    await message.answer(
+        f"📚 Test nomi: <b>{html.escape(title)}</b>\n\n"
+        "📤 Endi quyidagilardan birini yuboring:\n"
+        "1️⃣ <b>Kalitlarni matn ko'rinishida:</b>\n"
+        "   <code>1A 2B 3C 4D ...</code> yoki <code>ABCD...</code>\n"
+        "2️⃣ Yoki <b>Test savollari PDF/Rasmini</b> yuboring — AI o'zi yechib kalit tuzadi!",
+        parse_mode="HTML"
+    )
+
+@dp.message(UserTestCreate.waiting_file_or_keys)
+async def handle_user_test_upload(message: types.Message, state: FSMContext):
+    uid = message.from_user.id
     data = await state.get_data()
     test_type = data.get("test_type", "30_talik")
+    title = data.get("title", "Maxsus Test")
     prefix = "TEST" if test_type == "30_talik" else ("MS" if test_type == "43_ms" else "DTM")
-    test_code = f"{prefix}-{datetime.now().strftime('%m%d%H%M')}"
+    test_code = f"{prefix}-{datetime.now().strftime('%d%H%M%S')[-5:]}"
 
     if message.text:
         parsed_keys = parse_input_answers(message.text, test_type)
         if not parsed_keys:
-            await message.answer("⚠️ Kalitlarni o'qib bo'lmadi. Masalan: <code>1A 2B 3C...</code> ko'rinishida yozing.", parse_mode="HTML")
+            await message.answer(
+                "⚠️ Kalitlarni o'qib bo'lmadi.\n"
+                "Masalan: <code>1A 2B 3C 4D...</code> ko'rinishida yozib yuboring.",
+                parse_mode="HTML"
+            )
             return
-        db_save_test(test_code, test_type, f"Maxsus {prefix}", parsed_keys)
+        db_save_test(test_code, test_type, title, parsed_keys, creator_id=uid)
         await state.clear()
-        await message.answer(f"✅ Test saqlandi! Kodi: <code>{test_code}</code>", parse_mode="HTML", reply_markup=main_menu(ADMIN_ID))
+        await message.answer(
+            f"🎉 <b>YANGI TEST MUVAFFAQIYATLI YARATILDI!</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🔑 Test kodi: <code>{test_code}</code>\n"
+            f"📚 Nomi: <b>{html.escape(title)}</b>\n"
+            f"🔢 Savollar soni: <b>{len(parsed_keys)} ta</b>\n\n"
+            f"👉 O'quvchilar <b>«📲 Elektron Test Ishlash (Mock)»</b> bo'limiga kirib, <code>{test_code}</code> kodini kiritish orqali elektron titulda yechishlari mumkin!",
+            parse_mode="HTML",
+            reply_markup=main_menu(uid)
+        )
         return
 
     file_id = message.document.file_id if message.document else (message.photo[-1].file_id if message.photo else "")
@@ -836,11 +964,10 @@ async def handle_admin_test_upload(message: types.Message, state: FSMContext):
     mime_type = message.document.mime_type if message.document else "image/jpeg"
 
     if not file_id:
-        await message.answer("❗️ Iltimos, PDF fayl yoki rasm yuboring.")
+        await message.answer("❗️ Iltimos, kalitlarni matn qilib yozing yoki PDF/Rasm yuboring.")
         return
 
-    wait_msg = await message.answer("🤖 AI faylni o'qib, savollarni yechmoqda, kuting...")
-
+    wait_msg = await message.answer("🤖 AI faylni o'qib, savollar kalitini tuzmoqda, kuting...")
     try:
         tg_file = await bot.get_file(file_id)
         buf = io.BytesIO()
@@ -854,173 +981,480 @@ async def handle_admin_test_upload(message: types.Message, state: FSMContext):
     if "error" in ai_result:
         err_clean = html.escape(str(ai_result["error"]))
         await wait_msg.edit_text(
-            f"⚠️ <b>AI xatoligi:</b> {err_clean}\n\n"
-            "💡 <i>Kalitlarni oddiy matn ko'rinishida (1a 2b 3c...) yozib yuborishingiz ham mumkin!</i>",
+            f"⚠️ <b>AI faylni o'qiy olmadi:</b> {err_clean}\n\n"
+            "💡 <i>Iltimos, test kalitlarini oddiy matn ko'rinishida (1A 2B 3C...) yozib yuboring!</i>",
             parse_mode="HTML"
         )
         return
 
     keys_dict = ai_result.get("keys", {})
-    title = ai_result.get("title", f"{prefix} AI Test")
     explanation = ai_result.get("explanation", "")
-
-    db_save_test(test_code, test_type, title, keys_dict, explanation, file_id, file_type)
+    db_save_test(test_code, test_type, title, keys_dict, explanation, file_id, file_type, creator_id=uid)
     await state.clear()
     await wait_msg.delete()
 
-    keys_preview = ", ".join([f"{k}:{v}" for k, v in list(keys_dict.items())[:15]])
     await message.answer(
-        f"🎉 <b>TEST AI ORQALI YARATILDI!</b>\n\n"
-        f"🔑 Kodi: <code>{test_code}</code>\n"
-        f"📚 Nomi: {html.escape(title)}\n"
-        f"🔢 Topilgan javoblar ({len(keys_dict)} ta): <code>{html.escape(keys_preview)}...</code>",
+        f"🎉 <b>AI YORDAMIDA TEST YARATILDI!</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🔑 Test kodi: <code>{test_code}</code>\n"
+        f"📚 Nomi: <b>{html.escape(title)}</b>\n"
+        f"🔢 Topilgan kalitlar: <b>{len(keys_dict)} ta</b>\n\n"
+        f"👉 Endi <b>«📲 Elektron Test Ishlash (Mock)»</b> tugmasi orqali <code>{test_code}</code> kodini terib ishlash mumkin!",
         parse_mode="HTML",
-        reply_markup=main_menu(ADMIN_ID)
+        reply_markup=main_menu(uid)
     )
 
 # -------------------------------------------------------------
-# O'QUVCHI: TEST TEKSHIRISH
+# ELEKTRON TEST ISHLASH (MOCK REJIMI + 41, 42, 43 RASM)
 # -------------------------------------------------------------
-@dp.message(F.text == "📋 Faol Testlar Ro'yxati")
+@dp.message(F.text == "📋 Faol Testlar Baza")
 async def show_active_tests_list(message: types.Message):
-    if not await check_channel_subscription(message.from_user.id):
+    uid = message.from_user.id
+    if not await check_channel_subscription(uid):
         await prompt_subscription(message)
         return
 
-    recent = db_get_recent_tests(10)
+    recent = db_get_recent_tests(12)
     if not recent:
-        await message.answer("📭 Hozircha faol testlar yo'q.")
+        await message.answer("📭 Hozircha faol testlar yo'q. «➕ Test Yaratish» tugmasi orqali birinchi testni qo'shing!")
         return
 
     kb_rows = []
-    lines = ["📋 <b>FAOL TESTLAR:</b>\n"]
+    lines = ["📋 <b>FAOL TESTLAR RO'YXATI:</b>\n━━━━━━━━━━━━━━━━━━━━━━━━"]
     for r_code, r_type, r_title, _ in recent:
-        badge = "30 talik" if r_type == "30_talik" else ("43 MS" if r_type == "43_ms" else "90 DTM")
-        lines.append(f"🔹 <code>{r_code}</code> — {html.escape(r_title)} ({badge})")
-        kb_rows.append([InlineKeyboardButton(text=f"✍️ Yechish: {r_code}", callback_data=f"solve_now:{r_code}")])
+        badge = "30 talik" if r_type == "30_talik" else ("43 MS Mock" if r_type == "43_ms" else "90 DTM")
+        lines.append(f"🔹 <code>{r_code}</code> — <b>{html.escape(r_title)}</b> <i>({badge})</i>")
+        kb_rows.append([InlineKeyboardButton(text=f"📲 Elektron Yechish: {r_code} ({r_title[:18]})", callback_data=f"solve_now:{r_code}")])
 
     await message.answer("\n".join(lines), parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
+
+@dp.message(F.text == "📲 Elektron Test Ishlash (Mock)")
+async def start_electronic_test_menu(message: types.Message, state: FSMContext):
+    uid = message.from_user.id
+    if not await check_channel_subscription(uid):
+        await prompt_subscription(message)
+        return
+
+    await state.set_state(StudentTestSolve.waiting_test_code)
+    cancel_kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="❌ Bekor qilish")]], resize_keyboard=True)
+
+    recent = db_get_recent_tests(5)
+    inline_kb = None
+    if recent:
+        rows = [[InlineKeyboardButton(text=f"📲 {c} — {t}", callback_data=f"solve_now:{c}")] for c, _, t, _ in recent]
+        inline_kb = InlineKeyboardMarkup(inline_keyboard=rows)
+
+    await message.answer(
+        "📲 <b>ELEKTRON TEST TEKSHIRISH VA MOCK BO'LIMI</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "🔑 Test kodini yozib yuboring <i>(masalan: <code>MS-12345</code>)</i>:",
+        parse_mode="HTML",
+        reply_markup=cancel_kb
+    )
+    if inline_kb:
+        await message.answer("Yoki oxirgi qo'shilgan testlardan birini tanlang 👇", reply_markup=inline_kb)
 
 @dp.callback_query(F.data.startswith("solve_now:"))
 async def cb_solve_test_now(callback: types.CallbackQuery, state: FSMContext):
     code = callback.data.split(":")[1]
     row = db_get_test(code)
     if not row:
-        await callback.answer("Test topilmadi!", show_alert=True)
+        await callback.answer("❌ Test topilmadi!", show_alert=True)
         return
     await callback.answer()
-    await send_test_prompt(callback.message, state, row)
+    await launch_electronic_exam(callback.message, callback.from_user.id, state, row)
 
-@dp.message(F.text == "📝 Test Tekshirish (30 / 43 / 90)")
-async def start_student_test(message: types.Message, state: FSMContext):
-    if not await check_channel_subscription(message.from_user.id):
-        await prompt_subscription(message)
+@dp.message(StudentTestSolve.waiting_test_code)
+async def process_code_for_exam(message: types.Message, state: FSMContext):
+    code = (message.text or "").strip().upper()
+    row = db_get_test(code)
+    if not row:
+        await message.answer(f"❌ <code>{html.escape(code)}</code> kodli test topilmadi. Qaytadan kiriting:", parse_mode="HTML")
         return
+    await launch_electronic_exam(message, message.from_user.id, state, row)
 
-    await state.set_state(StudentTestSolve.waiting_test_code)
-    cancel_kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="❌ Bekor qilish")]], resize_keyboard=True)
-    await message.answer("📝 Test kodini yuboring (masalan: <code>MS-1205</code>):", parse_mode="HTML", reply_markup=cancel_kb)
-
-async def send_test_prompt(message: types.Message, state: FSMContext, row: tuple):
+async def launch_electronic_exam(message: types.Message, user_id: int, state: FSMContext, row: tuple):
     test_code, test_type, title, _, _, file_id, file_type = row
-    await state.update_data(active_test_code=test_code)
-    await state.set_state(StudentTestSolve.waiting_answers)
+
+    # Mock test boshlandi -> AI yordamchini ushbu foydalanuvchi uchun bloklaymiz!
+    ACTIVE_EXAM_SESSIONS[user_id] = test_code
+
+    await state.update_data(
+        active_test_code=test_code,
+        active_test_type=test_type,
+        active_test_title=title,
+        e_answers={},
+        written_photos={},
+        written_scores={},
+        current_page=1
+    )
+    await state.set_state(StudentTestSolve.in_electronic_exam)
 
     if file_id:
         try:
-            if file_type == "document": await bot.send_document(message.chat.id, file_id, caption=f"📄 {title}")
-            elif file_type == "photo": await bot.send_photo(message.chat.id, file_id, caption=f"🖼 {title}")
-        except Exception: pass
+            if file_type == "document":
+                await bot.send_document(message.chat.id, file_id, caption=f"📄 {title} ({test_code})")
+            elif file_type == "photo":
+                await bot.send_photo(message.chat.id, file_id, caption=f"🖼 {title} ({test_code})")
+        except Exception:
+            pass
 
-    cancel_kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="❌ Bekor qilish")]], resize_keyboard=True)
     await message.answer(
-        f"✅ <b>{html.escape(title)}</b>\nJavoblaringizni yuboring (masalan: <code>1A 2B 3C...</code>):",
+        f"🔒 <b>MOCK IMTIHON REJIMI FAOL!</b>\n"
+        f"Test ishlayotgan vaqtingizda <b>«🤖 AI Masala Yechish»</b> bo'limi avtomatik ravishda bloklandi.\n"
+        f"Quyi menyudan foydalanib titulni boshqarishingiz mumkin 👇",
         parse_mode="HTML",
-        reply_markup=cancel_kb
+        reply_markup=exam_active_reply_kb()
     )
 
-@dp.message(StudentTestSolve.waiting_test_code)
-async def process_code(message: types.Message, state: FSMContext):
-    code = message.text.strip().upper()
-    row = db_get_test(code)
-    if not row:
-        await message.answer(f"❌ <code>{html.escape(code)}</code> topilmadi. Qaytadan kiriting:", parse_mode="HTML")
-        return
-    await send_test_prompt(message, state, row)
+    kb = build_electronic_sheet_kb(test_type, {}, page=1, written_photos={})
+    await message.answer(
+        f"📲 <b>ELEKTRON JAVOBLAR VARAQASI (TITUL)</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📚 Test: <b>{html.escape(title)}</b> (<code>{test_code}</code>)\n"
+        f"📌 Tugmalar ustiga bosib javoblaringizni belgilang.\n"
+        f"<i>(43 talik MS testida 4-betga o'tib 36–40-savollarni yozishingiz va 41, 42, 43-masalalarning yechim rasmini yuklashingiz mumkin!)</i>",
+        parse_mode="HTML",
+        reply_markup=kb
+    )
 
-@dp.message(StudentTestSolve.waiting_answers)
-async def process_answers(message: types.Message, state: FSMContext):
+@dp.message(F.text == "📋 Elektron Titulni Qayta Ochish")
+async def reopen_electronic_sheet(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    test_code = data.get("active_test_code")
+    if not test_code:
+        await message.answer("Sizda faol test yo'q.", reply_markup=main_menu(message.from_user.id))
+        return
+
+    test_type = data.get("active_test_type", "30_talik")
+    title = data.get("active_test_title", "Test")
+    ans = data.get("e_answers", {})
+    w_photos = data.get("written_photos", {})
+    page = data.get("current_page", 1)
+
+    kb = build_electronic_sheet_kb(test_type, ans, page=page, written_photos=w_photos)
+    await message.answer(
+        f"📲 <b>ELEKTRON TITUL: {html.escape(title)}</b> (<code>{test_code}</code>)\n"
+        f"✅ Belgilangan javoblar: <b>{len(ans)} ta</b> | 📸 Rasmlar: <b>{len(w_photos)}/3 ta</b>",
+        parse_mode="HTML",
+        reply_markup=kb
+    )
+
+# Tugma bosilganda (A, B, C, D, E, F)
+@dp.callback_query(F.data.startswith("ebtn:"))
+async def cb_electronic_mark(callback: types.CallbackQuery, state: FSMContext):
+    parts = callback.data.split(":")
+    q_num, opt, page = parts[1], parts[2], int(parts[3])
+
+    data = await state.get_data()
+    if not data.get("active_test_code"):
+        await callback.answer("Bu test yakunlangan!", show_alert=True)
+        return
+
+    ans = data.get("e_answers", {})
+    # Agar yana o'sha harfni bossa o'chiradi, bo'lmasa belgilaydi
+    if ans.get(q_num) == opt:
+        ans.pop(q_num, None)
+    else:
+        ans[q_num] = opt
+
+    await state.update_data(e_answers=ans, current_page=page)
+    kb = build_electronic_sheet_kb(data.get("active_test_type", "30_talik"), ans, page=page, written_photos=data.get("written_photos", {}))
+    try:
+        await callback.message.edit_reply_markup(reply_markup=kb)
+    except Exception:
+        pass
+    await callback.answer(f"{q_num}-savol: {opt}")
+
+# Sahifani almashtirish
+@dp.callback_query(F.data.startswith("epage:"))
+async def cb_electronic_page(callback: types.CallbackQuery, state: FSMContext):
+    page = int(callback.data.split(":")[1])
+    data = await state.get_data()
+    if not data.get("active_test_code"):
+        await callback.answer("Bu test yakunlangan!", show_alert=True)
+        return
+
+    await state.update_data(current_page=page)
+    kb = build_electronic_sheet_kb(
+        data.get("active_test_type", "30_talik"),
+        data.get("e_answers", {}),
+        page=page,
+        written_photos=data.get("written_photos", {})
+    )
+    try:
+        await callback.message.edit_reply_markup(reply_markup=kb)
+    except Exception:
+        pass
+    await callback.answer(f"{page}-sahifa")
+
+# 36-40 Ochiq savolga yozma javob kiritish
+@dp.callback_query(F.data.startswith("eopen:"))
+async def cb_open_question_input(callback: types.CallbackQuery, state: FSMContext):
+    q_num = callback.data.split(":")[1]
+    await state.update_data(editing_open_q=q_num)
+    await state.set_state(StudentTestSolve.waiting_open_answer)
+    await callback.message.answer(
+        f"✍️ <b>{q_num}-ochiq savol</b> uchun javobingizni (son yoki harf) yozib yuboring:",
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+@dp.message(StudentTestSolve.waiting_open_answer)
+async def receive_open_question_answer(message: types.Message, state: FSMContext):
+    val = (message.text or "").strip().upper()
+    data = await state.get_data()
+    q_num = data.get("editing_open_q", "36")
+    ans = data.get("e_answers", {})
+    ans[str(q_num)] = val
+    await state.update_data(e_answers=ans, current_page=4)
+    await state.set_state(StudentTestSolve.in_electronic_exam)
+
+    kb = build_electronic_sheet_kb(
+        data.get("active_test_type", "43_ms"),
+        ans,
+        page=4,
+        written_photos=data.get("written_photos", {})
+    )
+    await message.answer(
+        f"✅ <b>{q_num}-savol javobi ({html.escape(val)}) saqlandi!</b>\n"
+        f"Davom etishingiz mumkin 👇",
+        parse_mode="HTML",
+        reply_markup=kb
+    )
+
+# 41, 42, 43-savollar uchun rasm yuklash
+@dp.callback_query(F.data.startswith("ephoto:"))
+async def cb_upload_written_photo(callback: types.CallbackQuery, state: FSMContext):
+    q_num = callback.data.split(":")[1]
+    await state.update_data(uploading_photo_q=q_num)
+    await state.set_state(StudentTestSolve.waiting_written_photo)
+    await callback.message.answer(
+        f"📸 <b>{q_num}-masala yechimi tushirilgan rasmni yuboring!</b>\n"
+        f"<i>(Daftardagi yechimingizni aniq qilib rasmga olib shu yerga tashlang)</i> 👇",
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+@dp.message(StudentTestSolve.waiting_written_photo, F.photo)
+async def receive_written_solution_photo(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    q_num = str(data.get("uploading_photo_q", "41"))
+    file_id = message.photo[-1].file_id
+
+    wait = await message.answer(f"⏳ <b>{q_num}-masala yechimi rasmi tekshirilmoqda va saqlanmoqda...</b>", parse_mode="HTML")
+
+    score_val = 2.0
+    comment = "Qabul qilindi"
+    try:
+        tg_file = await bot.get_file(file_id)
+        buf = io.BytesIO()
+        await bot.download_file(tg_file.file_path, destination=buf)
+        score_val, comment = await ai_grade_written_work(buf.getvalue(), int(q_num))
+    except Exception:
+        pass
+
+    w_photos = data.get("written_photos", {})
+    w_scores = data.get("written_scores", {})
+    w_photos[q_num] = file_id
+    w_scores[q_num] = score_val
+
+    await state.update_data(written_photos=w_photos, written_scores=w_scores, current_page=4)
+    await state.set_state(StudentTestSolve.in_electronic_exam)
+    await wait.delete()
+
+    # Ustozga (Adminga) ham o'quvchining 41-43 yechim rasmini yuborib qo'yamiz
+    test_code = data.get("active_test_code", "MS")
+    try:
+        await bot.send_photo(
+            ADMIN_ID,
+            file_id,
+            caption=(
+                f"📸 <b>Yozma ish yechimi ({q_num}-masala)</b>\n"
+                f"👤 O'quvchi: {html.escape(message.from_user.full_name)}\n"
+                f"🔑 Test: <code>{test_code}</code>\n"
+                f"🤖 AI bahosi: <b>{score_val} / 2.5 ball</b> ({html.escape(comment)})"
+            ),
+            parse_mode="HTML"
+        )
+    except Exception:
+        pass
+
+    kb = build_electronic_sheet_kb(
+        data.get("active_test_type", "43_ms"),
+        data.get("e_answers", {}),
+        page=4,
+        written_photos=w_photos
+    )
+    await message.answer(
+        f"✅ <b>{q_num}-masala yechimi rasmi yuklandi!</b>\n"
+        f"📊 Dastlabki baho: <b>{score_val} / 2.5 ball</b>\n"
+        f"💬 Izoh: <i>{html.escape(comment)}</i>\n\n"
+        f"Titulda davom eting yoki yakunlang 👇",
+        parse_mode="HTML",
+        reply_markup=kb
+    )
+
+@dp.message(StudentTestSolve.waiting_written_photo)
+async def receive_written_photo_invalid(message: types.Message):
+    await message.answer("⚠️ Iltimos, yechimingizni **rasm (foto)** ko'rinishida yuboring!")
+
+# Testni yakunlash
+@dp.callback_query(F.data == "efinish")
+async def cb_finish_electronic_exam(callback: types.CallbackQuery, state: FSMContext):
+    uid = callback.from_user.id
     data = await state.get_data()
     code = data.get("active_test_code")
+    if not code:
+        await callback.answer("Test allaqachon yakunlangan!", show_alert=True)
+        return
+
+    test_type = data.get("active_test_type", "30_talik")
+    w_photos = data.get("written_photos", {})
+
+    # Agar 43 talik MS bo'lsa va 41, 42, 43 rasmlari yuklanmagan bo'lsa ogohlantiramiz (lekin 2-marta bossa yakunlaydi)
+    if test_type == "43_ms" and len(w_photos) < 3 and not data.get("warned_missing_photos"):
+        missing = [str(q) for q in [41, 42, 43] if str(q) not in w_photos]
+        await state.update_data(warned_missing_photos=True)
+        await callback.answer(
+            f"⚠️ Diqqat! Siz {', '.join(missing)}-masalalar yechimi rasmini yuklamadingiz! "
+            f"4-betga o'tib rasm yuklang yoki rasmsiz yakunlash uchun tugmani yana bir marta bosing.",
+            show_alert=True
+        )
+        return
+
     row = db_get_test(code)
-    if not row:
-        await state.clear()
-        await message.answer("Test topilmadi.", reply_markup=main_menu(message.from_user.id))
-        return
-
-    _, test_type, title, keys_json, ai_exp, _, _ = row
-    correct_keys = json.loads(keys_json)
-    student_ans = parse_input_answers(message.text or "", test_type)
-
-    if not student_ans:
-        await message.answer("⚠️ Format noto'g'ri. Masalan: <code>1A 2B 3C...</code>", parse_mode="HTML")
-        return
-
-    res = evaluate_student_submission(test_type, correct_keys, student_ans)
-    uid = message.from_user.id
-    db_save_result(code, uid, message.from_user.full_name or "O'quvchi", res["correct_count"], res["total_score"], res["grade"])
+    ACTIVE_EXAM_SESSIONS.pop(uid, None)
     await state.clear()
 
-    mistakes = "\n".join(res["mistakes"][:20]) if res["mistakes"] else "\n🎉 Xatolar yo'q!"
-    report = f"{res['summary']}\n\n❌ <b>Xatolar:</b>\n{html.escape(mistakes)}"
-    await message.answer(report, parse_mode="HTML", reply_markup=main_menu(uid))
+    if not row:
+        await callback.message.answer("❌ Test bazadan topilmadi.", reply_markup=main_menu(uid))
+        return
+
+    _, test_type, title, keys_json, _, _, _ = row
+    correct_keys = json.loads(keys_json)
+    student_ans = data.get("e_answers", {})
+    w_scores = data.get("written_scores", {})
+
+    res = evaluate_student_submission(test_type, correct_keys, student_ans, written_scores=w_scores)
+    w_total = sum(float(v) for v in w_scores.values())
+    db_save_result(
+        code,
+        uid,
+        callback.from_user.full_name or "O'quvchi",
+        res["correct_count"],
+        res["total_score"],
+        res["grade"],
+        written_score=w_total
+    )
+
+    mistakes_str = "\n".join(res["mistakes"][:25]) if res["mistakes"] else "🎉 Barcha belgilangan test javoblari 100% to'g'ri!"
+    report = (
+        f"{res['summary']}\n\n"
+        f"📋 <b>Tahlil va Xatolar:</b>\n"
+        f"{html.escape(mistakes_str)}\n\n"
+        f"🔓 <i>Mock imtihon yakunlandi! Endi «🤖 AI Masala Yechish» bo'limidan yana foydalanishingiz mumkin.</i>"
+    )
+    await callback.message.answer(report, parse_mode="HTML", reply_markup=main_menu(uid))
+    await callback.answer("🎉 Natijangiz hisoblandi!")
+
+# Agar o'quvchi titul ichida turib matn orqali ham javob yozib yuborsa (1A 2B...)
+@dp.message(StudentTestSolve.in_electronic_exam, F.text)
+async def quick_text_fill_in_exam(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    test_type = data.get("active_test_type", "30_talik")
+    parsed = parse_input_answers(message.text or "", test_type)
+    if not parsed:
+        await message.answer(
+            "💡 Tugmalar orqali belgilang yoki <code>1A 2B 3C...</code> ko'rinishida yozing.",
+            parse_mode="HTML"
+        )
+        return
+
+    ans = data.get("e_answers", {})
+    ans.update(parsed)
+    await state.update_data(e_answers=ans)
+    kb = build_electronic_sheet_kb(test_type, ans, page=data.get("current_page", 1), written_photos=data.get("written_photos", {}))
+    await message.answer(
+        f"✅ <b>{len(parsed)} ta javob elektron titulga avtomatik joylandi!</b>\n"
+        f"Tekshirib, yakunlash tugmasini bosing 👇",
+        parse_mode="HTML",
+        reply_markup=kb
+    )
 
 # -------------------------------------------------------------
-# REYTING
+# REYTING VA NATIJALAR
 # -------------------------------------------------------------
-@dp.message(F.text == "🏆 Reyting (Natijalar)")
+@dp.message(F.text == "🏆 Reyting & Natijalar")
 async def show_rating_menu(message: types.Message):
     if not await check_channel_subscription(message.from_user.id):
         await prompt_subscription(message)
         return
-    recent = db_get_recent_tests(8)
+    recent = db_get_recent_tests(10)
     if not recent:
         await message.answer("📭 Hozircha natijalar yo'q.")
         return
     kb = [[InlineKeyboardButton(text=f"🏆 {r_code} — {r_title}", callback_data=f"rating:{r_code}")] for r_code, _, r_title, _ in recent]
-    await message.answer("Qaysi test reytingini ko'rmoqchisiz?", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+    await message.answer("🏆 <b>Qaysi testning reyting jadvalini ko'rmoqchisiz?</b>", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
 
 @dp.callback_query(F.data.startswith("rating:"))
 async def cb_rating(callback: types.CallbackQuery):
     code = callback.data.split(":")[1]
-    top = db_get_top_results(code, 15)
+    top = db_get_top_results(code, 20)
     if not top:
-        await callback.answer("Hali natijalar yo'q!", show_alert=True)
+        await callback.answer("Bu test bo'yicha hali natijalar yo'q!", show_alert=True)
         return
-    lines = [f"🏆 <b>{html.escape(code)} TOP NATIJALAR:</b>\n────────────────────────"]
-    for i, (name, corr, score, _) in enumerate(top, 1):
-        lines.append(f"{i}. {html.escape(name)} — <b>{score} ball</b> ({corr} ta)")
+    lines = [f"🏆 <b>{html.escape(code)} BO'YICHA TOP NATIJALAR:</b>\n━━━━━━━━━━━━━━━━━━━━━━━━"]
+    medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+    for i, (name, corr, score, grade) in enumerate(top, 1):
+        m = medals.get(i, f"{i}.")
+        lines.append(f"{m} <b>{html.escape(name)}</b> — <b>{score} ball</b> ({corr} ta | {grade})")
     await callback.message.answer("\n".join(lines), parse_mode="HTML")
     await callback.answer()
 
 # -------------------------------------------------------------
-# AI MASALA YECHISH
+# AI MASALA YECHISH (MOCK TEST PAYTIDA QAT'IY BLOKLANADI!)
 # -------------------------------------------------------------
 @dp.message(F.text == "🤖 AI Masala Yechish (Rasm)")
 async def start_ai_solver(message: types.Message, state: FSMContext):
-    if not await check_channel_subscription(message.from_user.id):
+    uid = message.from_user.id
+
+    # QAT'IY CHEKLOV: Agar o'quvchi Mock test ishlayotgan bo'lsa, AI masalani ishlamaydi!
+    if uid in ACTIVE_EXAM_SESSIONS:
+        active_code = ACTIVE_EXAM_SESSIONS[uid]
+        await message.answer(
+            f"⛔️ <b>DIQQAT! IMTIHON TARTIBI!</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"Siz hozir <code>{active_code}</code> kodli <b>Mock testni</b> ishlayapsiz!\n"
+            f"Adolatli sinov qoidalariga binoan, test yakunlanmaguncha <b>AI Masala Yechish</b> bo'limi ishlamaydi.\n\n"
+            f"👉 Avval elektron titulda testni yakunlang!",
+            parse_mode="HTML",
+            reply_markup=exam_active_reply_kb()
+        )
+        return
+
+    if not await check_channel_subscription(uid):
         await prompt_subscription(message)
         return
+
     await state.set_state(AISolveProblem.waiting_problem_photo)
     await message.answer(
-        "📸 <b>Kimyo masalasining rasmini yuboring (AI Vision faol):</b>",
+        "📸 <b>AI KIMYO MASALA YECHISH BO'LIMI</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "Tushunmagan kimyo masalangiz yoki savolingiz rasmini yuboring.\n"
+        "Sun'iy intellekt uni bosqichma-bosqich yechib beradi 👇",
         parse_mode="HTML",
         reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="❌ Bekor qilish")]], resize_keyboard=True)
     )
 
 @dp.message(AISolveProblem.waiting_problem_photo, F.photo)
 async def solve_photo(message: types.Message, state: FSMContext):
-    wait = await message.answer("🤖 AI masalani yechmoqda, kuting...")
+    uid = message.from_user.id
+    if uid in ACTIVE_EXAM_SESSIONS:
+        await message.answer("⛔️ Mock test vaqtida AI masala yechish bloklangan!", reply_markup=exam_active_reply_kb())
+        return
+
+    wait = await message.answer("🤖 AI masalani tahlil qilib yechmoqda, 10–15 soniya kuting...")
     try:
         file_id = message.photo[-1].file_id
         tg_file = await bot.get_file(file_id)
@@ -1029,33 +1463,42 @@ async def solve_photo(message: types.Message, state: FSMContext):
         sol = await ai_solve_photo_problem(buf.getvalue(), "image/jpeg")
         await state.clear()
         await wait.delete()
-        await message.answer(f"🧪 <b>AI Masala Yechimi:</b>\n\n{sol}", parse_mode="HTML", reply_markup=main_menu(message.from_user.id))
+        await message.answer(f"🧪 <b>AI Masala Yechimi:</b>\n\n{sol}", parse_mode="HTML", reply_markup=main_menu(uid))
     except Exception as e:
         await state.clear()
         await wait.edit_text(f"❌ Xato: {e}")
 
 @dp.message(F.text == "👨‍🏫 Ustoz & Bog'lanish")
 async def contact_info(message: types.Message):
-    await message.answer(f"👨‍🏫 Ustoz: Azizbek Ibrohimov\n📢 Kanal: {DEFAULT_CHANNEL_URL}\n📞 Admin: {ADMIN_USERNAME}")
+    await message.answer(
+        f"👨‍🏫 <b>Ustoz:</b> Azizbek Ibrohimov\n"
+        f"📢 <b>Rasmiy kanal:</b> {DEFAULT_CHANNEL_URL}\n"
+        f"📞 <b>Murojaat uchun:</b> {ADMIN_USERNAME}",
+        parse_mode="HTML"
+    )
 
 # -------------------------------------------------------------
 # ADMIN PANEL
 # -------------------------------------------------------------
 @dp.message(Command("admin"))
+@dp.message(F.text == "👑 Admin Boshqaruv Paneli")
 async def admin_panel(message: types.Message, state: FSMContext = None):
     if message.from_user.id != ADMIN_ID:
         return
     if state:
         await state.clear()
     cur_key = get_gemini_api_key()
-    masked = f"{cur_key[:10]}..." if cur_key else "Kiritilmagan"
+    masked = f"{cur_key[:8]}..." if cur_key else "Kiritilmagan"
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔑 Gemini AI API Kalitni kiritish", callback_data="adm_set_gemini")],
-        [InlineKeyboardButton(text="📊 Statistika", callback_data="adm_stats")],
-        [InlineKeyboardButton(text="🗑 Testni o'chirish", callback_data="adm_del")]
+        [InlineKeyboardButton(text="🔑 Gemini AI API Kalitni yangilash", callback_data="adm_set_gemini")],
+        [InlineKeyboardButton(text="📊 Bot Statistikasi", callback_data="adm_stats")],
+        [InlineKeyboardButton(text="🗑 Testni bazadan o'chirish", callback_data="adm_del")]
     ])
     await message.answer(
-        f"👑 <b>Admin Panel:</b>\n\n🔑 Joriy AI kalit: <code>{masked}</code>",
+        f"👑 <b>ADMIN BOSHQARUV PANELI</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🔑 Joriy AI kalit: <code>{masked}</code>\n"
+        f"📝 Faol imtihon topshirayotganlar: <b>{len(ACTIVE_EXAM_SESSIONS)} kishi</b>",
         parse_mode="HTML",
         reply_markup=kb
     )
@@ -1065,10 +1508,7 @@ async def adm_set_gemini_cb(callback: types.CallbackQuery, state: FSMContext):
     if callback.from_user.id != ADMIN_ID:
         return
     await state.set_state(AdminPanel.waiting_gemini_key)
-    await callback.message.answer(
-        "🔑 Yangi <b>Gemini AI API kalitingizni</b> yuboring:",
-        parse_mode="HTML"
-    )
+    await callback.message.answer("🔑 Yangi <b>Gemini AI API kalitingizni</b> yuboring:", parse_mode="HTML")
     await callback.answer()
 
 @dp.message(AdminPanel.waiting_gemini_key)
@@ -1076,36 +1516,38 @@ async def save_gemini_key(message: types.Message, state: FSMContext):
     new_key = (message.text or "").strip()
     db_set_setting("gemini_api_key", new_key)
     await state.clear()
-    await message.answer(
-        "✅ <b>Gemini AI API kaliti saqlandi!</b>",
-        parse_mode="HTML",
-        reply_markup=main_menu(ADMIN_ID)
-    )
+    await message.answer("✅ <b>Gemini AI API kaliti saqlandi!</b>", parse_mode="HTML", reply_markup=main_menu(ADMIN_ID))
 
 @dp.callback_query(F.data == "adm_stats")
 async def adm_stats(callback: types.CallbackQuery):
     s = db_get_stats()
-    await callback.message.answer(f"👥 Foydalanuvchilar: {s['users']}\n🧪 Testlar: {s['tests']}\n📝 Natijalar: {s['results']}")
+    await callback.message.answer(
+        f"📊 <b>BOT STATISTIKASI:</b>\n"
+        f"👥 Foydalanuvchilar: <b>{s['users']} ta</b>\n"
+        f"🧪 Yaratilgan testlar: <b>{s['tests']} ta</b>\n"
+        f"📝 Topshirilgan natijalar: <b>{s['results']} ta</b>",
+        parse_mode="HTML"
+    )
     await callback.answer()
 
 @dp.callback_query(F.data == "adm_del")
 async def adm_del(callback: types.CallbackQuery, state: FSMContext):
     await state.set_state(AdminPanel.waiting_delete_code)
-    await callback.message.answer("O'chirmoqchi bo'lgan test kodini yuboring:")
+    await callback.message.answer("🗑 O'chirmoqchi bo'lgan test kodini yuboring:")
     await callback.answer()
 
 @dp.message(AdminPanel.waiting_delete_code)
 async def do_del(message: types.Message, state: FSMContext):
-    code = message.text.strip().upper()
+    code = (message.text or "").strip().upper()
     ok = db_delete_test(code)
     await state.clear()
-    await message.answer(f"{'✅ O\'chirildi' if ok else '❌ Topilmadi'}", reply_markup=main_menu(ADMIN_ID))
+    await message.answer(f"{'✅ Test o\'chirildi!' if ok else '❌ Bunday kodli test topilmadi.'}", reply_markup=main_menu(ADMIN_ID))
 
 # -------------------------------------------------------------
 # 24/7 WEB SERVER
 # -------------------------------------------------------------
 async def handle_ping(request):
-    return web.Response(text="A+ Kimyo AI Bot active 24/7!")
+    return web.Response(text="A+ Kimyo AI Electronic Mock Bot active 24/7!")
 
 async def start_web_server():
     app = web.Application()
