@@ -23,10 +23,17 @@ from aiogram.types import (
     KeyboardButton,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
+    BufferedInputFile,
 )
 
+# PDF yaratish uchun ReportLab
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+
 # -------------------------------------------------------------
-# SOZLAMALAR
+# SOZLAMALAR (TITUL PLATFORMASI)
 # -------------------------------------------------------------
 _REV_TOKEN = "s-BpMl4q53yLNCTEWSAcmjA5Hp0lRm8UFAA:3840376368"
 BOT_TOKEN = os.getenv("BOT_TOKEN", _REV_TOKEN[::-1])
@@ -43,7 +50,7 @@ DEFAULT_CHANNEL_URL = "https://t.me/Kimyo_Sertifkat_uchun"
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
-# Faol mock test ishlayotgan o'quvchilarni kuzatish (AI yordamchini bloklash uchun)
+# Mock test ishlayotgan o'quvchilarni kuzatish (AI yordamchini bloklash uchun)
 ACTIVE_EXAM_SESSIONS = {}  # {user_id: test_code}
 
 # -------------------------------------------------------------
@@ -75,7 +82,8 @@ def init_db():
             ai_explanation TEXT,
             file_id TEXT,
             file_type TEXT,
-            creator_id INTEGER,
+            creator_id INTEGER DEFAULT 0,
+            is_finished INTEGER DEFAULT 0,
             created_at TEXT
         )
     """)
@@ -93,14 +101,17 @@ def init_db():
             submitted_at TEXT
         )
     """)
-    try:
-        c.execute("ALTER TABLE test_results ADD COLUMN answers_json TEXT DEFAULT '{}'")
-    except Exception:
-        pass
-    try:
-        c.execute("ALTER TABLE test_results ADD COLUMN written_score REAL DEFAULT 0")
-    except Exception:
-        pass
+    for col_sql in [
+        "ALTER TABLE tests ADD COLUMN creator_id INTEGER DEFAULT 0",
+        "ALTER TABLE tests ADD COLUMN is_finished INTEGER DEFAULT 0",
+        "ALTER TABLE test_results ADD COLUMN answers_json TEXT DEFAULT '{}'",
+        "ALTER TABLE test_results ADD COLUMN written_score REAL DEFAULT 0",
+    ]:
+        try:
+            c.execute(col_sql)
+        except Exception:
+            pass
+
     c.execute(
         "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
         ("required_channel", DEFAULT_REQUIRED_CHANNEL)
@@ -140,14 +151,10 @@ def db_set_setting(key: str, val: str):
 def db_save_test(test_code: str, test_type: str, title: str, keys_dict: dict, explanation: str = "", file_id: str = "", file_type: str = "", creator_id: int = 0):
     conn = sqlite3.connect("database.db")
     c = conn.cursor()
-    try:
-        c.execute("ALTER TABLE tests ADD COLUMN creator_id INTEGER DEFAULT 0")
-    except Exception:
-        pass
     c.execute(
         """INSERT OR REPLACE INTO tests 
-           (test_code, test_type, title, keys_json, ai_explanation, file_id, file_type, creator_id, created_at) 
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+           (test_code, test_type, title, keys_json, ai_explanation, file_id, file_type, creator_id, is_finished, created_at) 
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)""",
         (
             test_code.upper(),
             test_type,
@@ -167,7 +174,7 @@ def db_get_test(test_code: str):
     conn = sqlite3.connect("database.db")
     c = conn.cursor()
     c.execute(
-        "SELECT test_code, test_type, title, keys_json, ai_explanation, file_id, file_type FROM tests WHERE test_code = ?",
+        "SELECT test_code, test_type, title, keys_json, ai_explanation, file_id, file_type, creator_id, is_finished FROM tests WHERE test_code = ?",
         (test_code.upper().strip(),)
     )
     row = c.fetchone()
@@ -191,6 +198,17 @@ def db_get_recent_tests(limit: int = 12):
     conn.close()
     return rows
 
+def db_get_user_tests(user_id: int, limit: int = 10):
+    conn = sqlite3.connect("database.db")
+    c = conn.cursor()
+    if user_id == ADMIN_ID:
+        c.execute("SELECT test_code, test_type, title, created_at FROM tests ORDER BY created_at DESC LIMIT ?", (limit,))
+    else:
+        c.execute("SELECT test_code, test_type, title, created_at FROM tests WHERE creator_id = ? ORDER BY created_at DESC LIMIT ?", (user_id, limit))
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
 def db_save_result(test_code: str, user_id: int, full_name: str, correct_count: int, total_score: float, grade: str, written_score: float = 0.0, answers_dict: dict = None):
     conn = sqlite3.connect("database.db")
     c = conn.cursor()
@@ -204,7 +222,6 @@ def db_save_result(test_code: str, user_id: int, full_name: str, correct_count: 
     conn.close()
 
 def db_get_all_submissions_for_test(test_code: str) -> list[dict]:
-    """Shu testni ishlagan barcha o'quvchilarning javoblarini olish (Dinamik Rasch hisoblash uchun)."""
     conn = sqlite3.connect("database.db")
     c = conn.cursor()
     c.execute("SELECT answers_json FROM test_results WHERE test_code = ?", (test_code.upper().strip(),))
@@ -219,11 +236,11 @@ def db_get_all_submissions_for_test(test_code: str) -> list[dict]:
                 pass
     return result
 
-def db_get_top_results(test_code: str, limit: int = 15):
+def db_get_top_results(test_code: str, limit: int = 100):
     conn = sqlite3.connect("database.db")
     c = conn.cursor()
     c.execute(
-        """SELECT full_name, correct_count, total_score, grade 
+        """SELECT full_name, correct_count, total_score, grade, written_score, submitted_at 
            FROM test_results 
            WHERE test_code = ? 
            ORDER BY total_score DESC, correct_count DESC 
@@ -290,7 +307,7 @@ async def prompt_subscription(message: types.Message):
         ]
     )
     await message.answer(
-        "🛑 <b>Diqqat! Botdan foydalanish uchun rasmiy kanalimizga obuna bo'lishingiz shart!</b>\n\n"
+        "🛑 <b>Diqqat! TITUL botidan foydalanish uchun rasmiy kanalimizga obuna bo'lishingiz shart!</b>\n\n"
         f"👉 Kanal: <a href='{ch_url}'>{chat_id or '@Kimyo_Sertifkat_uchun'}</a>\n\n"
         "Pastdagi <b>«📢 Kanalga a'zo bo'lish»</b> tugmasini bosib qo'shiling, so'ng <b>«✅ Obunani tekshirish»</b> tugmasini bosing 👇",
         parse_mode="HTML",
@@ -347,18 +364,28 @@ def clean_ai_text_for_telegram(text: str) -> str:
     return text.strip()
 
 # -------------------------------------------------------------
-# SUN'IY INTELLEKT (GEMINI 3.8 FLASH & VISION ZAXIRA)
+# DOIMIY ISHLOVCHI SUN'IY INTELLEKT (GEMINI + MULTI-PROVIDER VISION)
 # -------------------------------------------------------------
 def get_gemini_api_key() -> str:
     saved_key = db_get_setting("gemini_api_key", DEFAULT_GEMINI_KEY).strip()
     return saved_key if saved_key else DEFAULT_GEMINI_KEY
 
 async def call_vision_fallback(prompt: str, b64_data: str, mime_type: str, json_mode: bool = False) -> tuple[bool, str]:
-    url = "https://text.pollinations.ai/openai"
-    for model_name in ["openai", "openai-large", "mistral"]:
+    """24/7 kalitsiz ishlovchi zaxira Vision AI provayderlari."""
+    endpoints = [
+        ("https://text.pollinations.ai/openai", "openai"),
+        ("https://text.pollinations.ai/openai", "openai-large"),
+        ("https://text.pollinations.ai/openai", "gpt-4o-mini"),
+        ("https://text.pollinations.ai/openai", "mistral"),
+    ]
+    for url, model_name in endpoints:
         payload = {
             "model": model_name,
             "messages": [
+                {
+                    "role": "system",
+                    "content": "Sen TITUL platformasining oliy toifali Kimyo va aniq fanlar ekspertisan."
+                },
                 {
                     "role": "user",
                     "content": [
@@ -379,12 +406,12 @@ async def call_vision_fallback(prompt: str, b64_data: str, mime_type: str, json_
                 async with session.post(url, json=payload, timeout=90) as resp:
                     if resp.status == 200:
                         data = await resp.json()
-                        text_out = data["choices"][0]["message"]["content"]
+                        text_out = data.get("choices", [{}])[0].get("message", {}).get("content", "")
                         if text_out and len(text_out.strip()) > 3:
-                            return True, text_out
+                            return True, text_out.strip()
         except Exception:
             pass
-    return False, "Server javob bermadi"
+    return False, "AI server javob bermadi, qaytadan urinib ko'ring."
 
 async def call_gemini_api(prompt: str, b64_data: str, mime_type: str, json_mode: bool = False, timeout_sec: int = 120) -> tuple[bool, str]:
     api_key = get_gemini_api_key()
@@ -410,8 +437,8 @@ async def call_gemini_api(prompt: str, b64_data: str, mime_type: str, json_mode:
     models_to_try = [
         "gemini-2.5-flash",
         "gemini-2.0-flash",
-        "gemini-3.8-flash",
-        "gemini-3-flash-preview"
+        "gemini-3-flash-preview",
+        "gemini-1.5-flash"
     ]
     last_error = ""
 
@@ -454,10 +481,10 @@ async def ai_analyze_test_document(file_bytes: bytes, mime_type: str, test_type:
     b64_data = base64.b64encode(file_bytes).decode("utf-8")
     if test_type == "30_talik":
         prompt = (
-            "Sen Kimyo va aniq fanlar bo'yicha oliy toifali ekspertsan. "
+            "Sen TITUL platformasining Kimyo va aniq fanlar bo'yicha oliy toifali ekspertisan. "
             "Yuborilgan fayldagi test savollarini yechib, javoblar kalitini tuz. "
             "Natijani FAQAT quyidagi JSON formatda qaytar:\n"
-            '{"title": "Kimyo 30 talik Test", "keys": {"1": "A", "2": "B"}, "explanation": "Qisqacha izoh"}'
+            '{"title": "TITUL 30 talik Test", "keys": {"1": "A", "2": "B"}, "explanation": "Qisqacha izoh"}'
         )
     elif test_type == "43_ms":
         prompt = (
@@ -467,14 +494,14 @@ async def ai_analyze_test_document(file_bytes: bytes, mime_type: str, test_type:
             "- 33-35: Moslashtirish (A, B, C, D, E, F)\n"
             "- 36-40: Ochiq test savollari.\n"
             "Natijani FAQAT quyidagi JSON formatda qaytar:\n"
-            '{"title": "Milliy Sertifikat 43 talik", "keys": {"1": "A", "32": "D", "33": "E", "36": "9"}, "explanation": "Izoh"}'
+            '{"title": "TITUL Milliy Sertifikat 43 talik", "keys": {"1": "A", "32": "D", "33": "E", "36": "9"}, "explanation": "Izoh"}'
         )
     else:
         prompt = (
             "Sen DTM 90 talik blok testlari bo'yicha ekspertsan. "
             "Savol va javoblarni tahlil qilib, 1 dan 90 gacha to'g'ri javoblarni aniqla. "
             "Natijani FAQAT quyidagi JSON formatda qaytar:\n"
-            '{"title": "90 talik DTM Blok Testi", "keys": {"1": "A", "2": "C"}, "explanation": "Izoh"}'
+            '{"title": "TITUL 90 talik DTM Blok Testi", "keys": {"1": "A", "2": "C"}, "explanation": "Izoh"}'
         )
 
     ok, res_text = await call_gemini_api(prompt, b64_data, mime_type, json_mode=True, timeout_sec=120)
@@ -514,7 +541,7 @@ async def ai_grade_written_work(file_bytes: bytes, q_num: int) -> tuple[float, s
 async def ai_solve_photo_problem(file_bytes: bytes, mime_type: str) -> str:
     b64_data = base64.b64encode(file_bytes).decode("utf-8")
     prompt = (
-        "Sen A+ Kimyo maktabining tajribali ustozi Azizbek Ibrohimovning yordamchisan. "
+        "Sen TITUL platformasining tajribali ustozi Azizbek Ibrohimovning sun'iy intellekt yordamchisisan. "
         "Rasmdagi kimyo masalasini yoki test savolini o'zbek tilida eng oson, mantiqiy usulda "
         "bosqichma-bosqich yechib, yakunida aniq to'g'ri javobni ko'rsatib ber. "
         "MUHIM: Formulalarda hech qanday LaTeX ($...$, \\rightarrow) ishlatma! Oddiy H₂SO₄, → belgilaridan foydalan."
@@ -533,33 +560,23 @@ def compute_rasch_1pl_score(
     student_ans: dict,
     written_scores: dict
 ) -> dict:
-    """
-    Haqiqiy Rasch Modeli (1-Parameter Logistic IRT):
-    1) Har bir savolning qiyinlik indeksini (beta_i) bazadagi oldingi topshirishlar
-       va savol blokining ahamiyatiga ko'ra logit shkalada (-2.5 dan +2.5 gacha) aniqlaydi.
-    2) Newton-Raphson iteratsiyasi yordamida o'quvchining qobiliyat darajasi (theta) ni
-       P_i(theta) = 1 / (1 + exp(-(theta - beta_i))) tenglamasidan topadi.
-    3) Milliy Sertifikat T-shkalasiga o'tkazadi: Score = 50 + 10 * theta (0..75 ball).
-    """
     past_submissions = db_get_all_submissions_for_test(test_code)
     n_past = len(past_submissions)
 
-    # 1..40 savollar uchun a-priori qiyinlik (beta_prior) va og'irlik (weight)
     beta_dict = {}
     weight_dict = {}
 
     for q in range(1, 41):
         qs = str(q)
         if 1 <= q <= 15:
-            b_prior, w = -1.0, 1.0   # Bazaviy yopiq testlar
+            b_prior, w = -1.0, 1.0
         elif 16 <= q <= 32:
-            b_prior, w = -0.2, 1.25  # O'rta-qiyin yopiq testlar
+            b_prior, w = -0.2, 1.25
         elif 33 <= q <= 35:
-            b_prior, w = 0.5, 1.5    # Moslashtirish (A-F)
+            b_prior, w = 0.5, 1.5
         else:
-            b_prior, w = 1.1, 1.8    # 36-40 Ochiq savollar
+            b_prior, w = 1.1, 1.8
 
-        # Agar bazada shu testni ishlagan o'quvchilar bo'lsa, haqiqiy statistik qiyinlikni qo'shamiz
         if n_past >= 3 and qs in correct_keys:
             k_val = str(correct_keys.get(qs, "")).strip().upper().replace(",", ".")
             corr_cnt = 0
@@ -567,23 +584,19 @@ def compute_rasch_1pl_score(
                 s_v = str(sub.get(qs, "")).strip().upper().replace(",", ".")
                 if k_val and s_v == k_val:
                     corr_cnt += 1
-            # Laplace tekislash bilan to'g'ri yechish ehtimoli p_i
             p_i = (corr_cnt + 1.0) / (n_past + 2.0)
             beta_emp = math.log((1.0 - p_i) / p_i)
-            # Empirik va nazariy qiyinlik kombinatsiyasi
             beta_dict[qs] = 0.6 * beta_emp + 0.4 * b_prior
         else:
             beta_dict[qs] = b_prior
 
         weight_dict[qs] = w
 
-    # 41, 42, 43 yozma masalalar (Eng yuqori qiyinlik va ball)
     for q in [41, 42, 43]:
         qs = str(q)
         beta_dict[qs] = 1.65
         weight_dict[qs] = 2.2
 
-    # O'quvchining har bir savoldan olgan ulushi u_i in [0, 1]
     u_scores = {}
     for q in range(1, 41):
         qs = str(q)
@@ -609,8 +622,6 @@ def compute_rasch_1pl_score(
     if earned_w >= total_possible_w - 0.01:
         return {"theta": 2.5, "rasch_score": 75.0, "hard_solved": len(u_scores)}
 
-    # Newton-Raphson (JMLE) iteratsiyasi orqali o'quvchi qobiliyati Theta ni topish:
-    # sum( w_i * (u_i - P_i(theta)) ) = 0
     theta = 0.0
     for _ in range(30):
         f_val = 0.0
@@ -630,7 +641,6 @@ def compute_rasch_1pl_score(
         if abs(step) < 1e-4:
             break
 
-    # Standart Milliy Sertifikat Rasch shkalasi: O'rtacha 50, Standart og'ish ~ 11.5
     raw_rasch = 50.0 + 11.2 * theta
     rasch_score = round(max(15.0, min(75.0, raw_rasch)), 1)
 
@@ -682,7 +692,7 @@ def evaluate_student_submission(test_type: str, correct_keys: dict, student_ans:
         grade = "A'lo (Yuqori) 🏆" if percent >= 85 else ("Yaxshi 🎯" if percent >= 65 else "Qoniqarli 📚")
 
         summary = (
-            f"📋 <b>30 TALIK TEST NATIJASI:</b>\n"
+            f"📋 <b>TITUL | 30 TALIK TEST NATIJASI:</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"✅ To'g'ri javoblar: <b>{correct_count} / {total_q} ta</b>\n"
             f"📊 Ko'rsatkich: <b>{percent}%</b>\n"
@@ -714,7 +724,7 @@ def evaluate_student_submission(test_type: str, correct_keys: dict, student_ans:
         grade = "Davlat Granti 🏆" if total_score >= 150 else ("Kontrakt 🎯" if total_score >= 100 else "Tayyorgarlik kerak 📚")
 
         summary = (
-            f"🏛 <b>90 TALIK DTM BLOK TEST:</b>\n"
+            f"🏛 <b>TITUL | 90 TALIK DTM BLOK TEST:</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"1️⃣ Majburiy (1–30): {b1}/30 = <b>{b1_s} ball</b>\n"
             f"2️⃣ 1-Fan (31–60): {b2}/30 = <b>{b2_s} ball</b>\n"
@@ -726,7 +736,6 @@ def evaluate_student_submission(test_type: str, correct_keys: dict, student_ans:
         return {"correct_count": correct_count, "total_score": total_score, "grade": grade, "summary": summary, "mistakes": mistakes}
 
     else:
-        # 43 TALIK MILLIY SERTIFIKAT — HAQIQIY RASCH MODELI (1PL IRT)
         p1, p2, p3 = 0, 0, 0
         for q in range(1, 41):
             qs = str(q)
@@ -764,7 +773,7 @@ def evaluate_student_submission(test_type: str, correct_keys: dict, student_ans:
         )
 
         summary = (
-            f"🎯 <b>43 TALIK MILLIY SERTIFIKAT (RASCH MODELI):</b>\n"
+            f"🎯 <b>TITUL | 43 TALIK MILLIY SERTIFIKAT (RASCH):</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"🔹 1–32 (Yopiq A-D): <b>{p1} / 32 ta</b>\n"
             f"🔸 33–35 (Moslashtirish A-F): <b>{p2} / 3 ta</b>\n"
@@ -779,6 +788,106 @@ def evaluate_student_submission(test_type: str, correct_keys: dict, student_ans:
             f"🏅 <b>Sertifikat Darajasi: {grade}</b>"
         )
         return {"correct_count": correct_count, "total_score": rasch, "grade": grade, "summary": summary, "mistakes": mistakes}
+
+# -------------------------------------------------------------
+# PDF VA POST SHAKLIDA NATIJALAR GENERATORI
+# -------------------------------------------------------------
+def clean_ascii_for_pdf(txt: str) -> str:
+    """ReportLab standart shriftida xatolik chiqmasligi uchun lotin/raqam belgilarni tozalash."""
+    if not txt:
+        return ""
+    cleaned = re.sub(r"[^\x20-\x7E]", "", str(txt)).strip()
+    return cleaned if cleaned else "O'quvchi"
+
+def generate_test_results_pdf(test_code: str, title: str, test_type: str, results: list) -> bytes:
+    """Test yakunlanganda yoki o'quvchi topshirganda rasmiy TITUL PDF jadvalini yaratish."""
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4, rightMargin=30, leftMargin=30, topMargin=35, bottomMargin=30)
+    styles = getSampleStyleSheet()
+
+    title_style = ParagraphStyle(
+        "TitulHeader",
+        parent=styles["Heading1"],
+        fontSize=16,
+        alignment=1,
+        spaceAfter=8,
+        textColor=colors.HexColor("#1A365D")
+    )
+    sub_style = ParagraphStyle(
+        "TitulSub",
+        parent=styles["Normal"],
+        fontSize=11,
+        alignment=1,
+        spaceAfter=16,
+        textColor=colors.HexColor("#2D3748")
+    )
+
+    elements = []
+    elements.append(Paragraph(f"TITUL - ELEKTRON TEST NATIJALARI JADVALI", title_style))
+    elements.append(Paragraph(
+        f"Test kodi: <b>{clean_ascii_for_pdf(test_code)}</b> | Nomi: <b>{clean_ascii_for_pdf(title)}</b> | Sana: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+        sub_style
+    ))
+
+    table_data = [["#", "F.I.SH (O'quvchi)", "To'g'ri", "Yozma (41-43)", "Yakuniy Ball", "Daraja"]]
+    for idx, row in enumerate(results, start=1):
+        full_name, corr, score, grade, w_score, _ = row
+        grade_clean = clean_ascii_for_pdf(grade)
+        table_data.append([
+            str(idx),
+            clean_ascii_for_pdf(full_name)[:28],
+            f"{corr} ta",
+            f"{round(float(w_score or 0), 1)}",
+            f"{score}",
+            grade_clean[:22]
+        ])
+
+    if len(table_data) == 1:
+        table_data.append(["1", "Hali natijalar yo'q", "-", "-", "0", "-"])
+
+    t = Table(table_data, colWidths=[30, 175, 55, 75, 75, 115])
+    t.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2B6CB0")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.whitesmoke),
+        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+        ("ALIGN", (1, 1), (1, -1), "LEFT"),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, 0), 10),
+        ("BOTTOMPADDING", (0, 0), (-1, 0), 8),
+        ("TOPPADDING", (0, 0), (-1, 0), 8),
+        ("BACKGROUND", (0, 1), (-1, -1), colors.HexColor("#F7FAFC")),
+        ("GRID", (0, 0), (-1, -1), 0.6, colors.HexColor("#CBD5E0")),
+        ("FONTSIZE", (0, 1), (-1, -1), 9),
+    ]))
+    elements.append(t)
+    elements.append(Spacer(1, 18))
+    elements.append(Paragraph("TITUL Rasch & AI Platformasi | Rasmiy kanal: @Kimyo_Sertifkat_uchun", sub_style))
+
+    doc.build(elements)
+    return buf.getvalue()
+
+def generate_announcement_post(test_code: str, title: str, test_type: str, results: list, keys_dict: dict) -> str:
+    """Kanal yoki guruhga e'lon qilish uchun tayyor chiroyli Post matni."""
+    badge = "30 talik Standart" if test_type == "30_talik" else ("43 talik Milliy Sertifikat (Rasch)" if test_type == "43_ms" else "90 talik DTM Blok")
+    lines = [
+        f"📣 <b>TITUL | RASMIY TEST NATIJALARI E'LONI</b>",
+        f"━━━━━━━━━━━━━━━━━━━━━━━━",
+        f"🔑 <b>Test kodi:</b> <code>{html.escape(test_code)}</code>",
+        f"📚 <b>Test nomi:</b> {html.escape(title)}",
+        f"🏷 <b>Format:</b> {badge}",
+        f"👥 <b>Jami qatnashchilar:</b> {len(results)} nafar\n",
+        f"🏆 <b>TOP REYTING JADVALI:</b>"
+    ]
+    medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+    for i, (name, corr, score, grade, w_score, _) in enumerate(results[:25], start=1):
+        m = medals.get(i, f"<b>{i}.</b>")
+        w_info = f" <i>(Yozma: {round(float(w_score or 0), 1)} b)</i>" if test_type == "43_ms" else ""
+        lines.append(f"{m} <b>{html.escape(name)}</b> — <b>{score} ball</b> ({corr} ta{w_info} | {grade})")
+
+    keys_preview = " ".join([f"{k}-{v}" for k, v in list(keys_dict.items())[:40]])
+    lines.append(f"\n🔑 <b>To'g'ri javoblar kaliti:</b>\n<code>{html.escape(keys_preview)}</code>")
+    lines.append(f"\n📲 <b>Rasmiy kanal:</b> {DEFAULT_CHANNEL_URL}")
+    return "\n".join(lines)
 
 # -------------------------------------------------------------
 # INTERAKTIV ELEKTRON TITUL VARAQASI GENERATORI
@@ -854,7 +963,7 @@ def build_electronic_sheet_kb(test_type: str, answers: dict, page: int = 1, writ
                     btn_row.append(InlineKeyboardButton(text=lbl, callback_data=f"ebtn:{q}:{opt}:4"))
                 rows.append(btn_row)
 
-            rows.append([InlineKeyboardButton(text="🔢 36–40 Ochiq savollar (Qiymat kiritish):", callback_data="noop")])
+            rows.append([InlineKeyboardButton(text="🔢 36–40 Ochiq savollar (Javob yozish):", callback_data="noop")])
             open_row = []
             for q in range(36, 41):
                 qs = str(q)
@@ -883,7 +992,7 @@ def build_electronic_sheet_kb(test_type: str, answers: dict, page: int = 1, writ
         rows.append(nav)
 
     filled_cnt = len(answers) + len(written_photos)
-    rows.append([InlineKeyboardButton(text=f"🚀 TESTNI YAKUNLASH VA TEKSHIRISH ({filled_cnt} ta belgilandi)", callback_data="efinish")])
+    rows.append([InlineKeyboardButton(text=f"🚀 TITULNI YAKUNLASH VA TEKSHIRISH ({filled_cnt} ta)", callback_data="efinish")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 # -------------------------------------------------------------
@@ -908,20 +1017,23 @@ class AdminPanel(StatesGroup):
     waiting_delete_code = State()
 
 # -------------------------------------------------------------
-# ZAMONAVIY INTERFEYS VA MENYULAR
+# YANGI ZAMONAVIY "TITUL" INTERFEYSI VA MENYULAR
 # -------------------------------------------------------------
 def main_menu(user_id: int = 0):
     kb = [
         [
-            KeyboardButton(text="📲 Elektron Test Ishlash (Mock)"),
+            KeyboardButton(text="📲 Elektron Titul Tekshirish"),
             KeyboardButton(text="➕ Test Yaratish (Barcha uchun)")
         ],
         [
-            KeyboardButton(text="📋 Faol Testlar Baza"),
+            KeyboardButton(text="📢 Testni Yakunlash (PDF + Post)"),
             KeyboardButton(text="🏆 Reyting & Natijalar")
         ],
         [
-            KeyboardButton(text="🤖 AI Masala Yechish (Rasm)"),
+            KeyboardButton(text="📋 Faol Testlar Baza"),
+            KeyboardButton(text="🤖 AI Masala Yechish (Rasm)")
+        ],
+        [
             KeyboardButton(text="👨‍🏫 Ustoz & Bog'lanish")
         ]
     ]
@@ -957,11 +1069,12 @@ async def cmd_start(message: types.Message, state: FSMContext):
 
     text = (
         f"✨ Assalomu alaykum, <b>{html.escape(name)}</b>!\n\n"
-        f"🧪 <b>A+ KIMYO | ELEKTRON MOCK VA RASCH PLATFORMASI</b>\n"
+        f"📋 <b>TITUL | ELEKTRON TEST VA AI TEKSHIRUV PLATFORMASI</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🔹 <b>📲 Elektron Test Ishlash</b> — Rasch modeli asosida interaktiv titul belgilash va 41, 42, 43-masalalar rasmini yuklash;\n"
-        f"🔹 <b>➕ Test Yaratish</b> — har bir o'quvchi va ustoz o'z testini (30 / 43 / 90) yarata oladi;\n"
-        f"🔹 <b>🤖 AI Masala Yechish</b> — tushunmagan masalalarni rasm orqali yechish <i>(Mock test paytida avtomatik bloklanadi!)</i>.\n\n"
+        f"🔹 <b>📲 Elektron Titul Tekshirish</b> — alohida interaktiv titul oynasida test belgilash va <b>41, 42, 43-masalalar</b> yechimi rasmini yuklash;\n"
+        f"🔹 <b>➕ Test Yaratish (Barcha uchun)</b> — har bir foydalanuvchi o'z testini yarata oladi;\n"
+        f"🔹 <b>📢 Testni Yakunlash (PDF + Post)</b> — test tugagach natijalarni tayyor PDF jadval va Post shaklida e'lon qilish;\n"
+        f"🔹 <b>🤖 AI Masala Yechish</b> — 24/7 doimiy ishlovchi sun'iy intellekt <i>(Mock test paytida avtomatik bloklanadi!)</i>.\n\n"
         f"Kerakli bo'limni tanlang 👇"
     )
     await message.answer(text, parse_mode="HTML", reply_markup=main_menu(uid))
@@ -975,7 +1088,7 @@ async def cb_check_sub(callback: types.CallbackQuery):
         except Exception:
             pass
         await callback.message.answer(
-            "🎉 <b>Obunangiz tasdiqlandi! Marhamat, botdan foydalaning:</b>",
+            "🎉 <b>Obunangiz tasdiqlandi! TITUL platformasidan foydalanishingiz mumkin:</b>",
             parse_mode="HTML",
             reply_markup=main_menu(uid)
         )
@@ -1010,14 +1123,14 @@ async def user_start_test_create(message: types.Message, state: FSMContext):
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="📋 1. 30 talik Test (Standart)", callback_data="create_t:30_talik")],
-            [InlineKeyboardButton(text="🎯 2. 43 talik Milliy Sertifikat (Rasch Modeli + 41-43 Rasm)", callback_data="create_t:43_ms")],
+            [InlineKeyboardButton(text="🎯 2. 43 talik Milliy Sertifikat (Rasch + 41-43 Rasm)", callback_data="create_t:43_ms")],
             [InlineKeyboardButton(text="🏛 3. 90 talik DTM Blok Testi", callback_data="create_t:90_dtm")]
         ]
     )
     await message.answer(
-        "➕ <b>YANGI TEST YARATISH BO'LIMI</b>\n"
+        "➕ <b>TITUL | YANGI TEST YARATISH BO'LIMI (BARCHA UCHUN)</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "O'zingiz yoki guruhingiz uchun yangi test yaratishingiz mumkin.\n"
+        "Har bir ustoz va o'quvchi o'z testini yaratib, elektron titul orqali tekshirtirishi mumkin.\n"
         "Qaysi formatdagi testni yaratmoqchisiz? Tanlang 👇",
         parse_mode="HTML",
         reply_markup=kb
@@ -1032,7 +1145,7 @@ async def cb_select_create_type(callback: types.CallbackQuery, state: FSMContext
     cancel_kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="❌ Bekor qilish")]], resize_keyboard=True)
     await callback.message.answer(
         "✏️ <b>Test nomini kiriting</b>\n"
-        "<i>(Masalan: «Kimyo MS 1-variant» yoki «Organika 30 talik»)</i>:",
+        "<i>(Masalan: «TITUL MS 1-variant» yoki «Organika 30 talik»)</i>:",
         parse_mode="HTML",
         reply_markup=cancel_kb
     )
@@ -1053,6 +1166,7 @@ async def process_test_title(message: types.Message, state: FSMContext):
         "📤 Endi quyidagilardan birini yuboring:\n"
         "1️⃣ <b>Kalitlarni matn ko'rinishida:</b>\n"
         "   <code>1A 2B 3C 4D ...</code> yoki <code>ABCD...</code>\n"
+        "   <i>(43 talik MS uchun 1-40 savollar kalitini yozing, 41-43 ni o'quvchilar rasmga olib tashlaydi)</i>\n"
         "2️⃣ Yoki <b>Test savollari PDF/Rasmini</b> yuboring — AI o'zi yechib kalit tuzadi!",
         parse_mode="HTML"
     )
@@ -1062,8 +1176,8 @@ async def handle_user_test_upload(message: types.Message, state: FSMContext):
     uid = message.from_user.id
     data = await state.get_data()
     test_type = data.get("test_type", "30_talik")
-    title = data.get("title", "Maxsus Test")
-    prefix = "TEST" if test_type == "30_talik" else ("MS" if test_type == "43_ms" else "DTM")
+    title = data.get("title", "TITUL Maxsus Test")
+    prefix = "TITUL" if test_type == "30_talik" else ("MS" if test_type == "43_ms" else "DTM")
     test_code = f"{prefix}-{datetime.now().strftime('%d%H%M%S')[-5:]}"
 
     if message.text:
@@ -1082,8 +1196,9 @@ async def handle_user_test_upload(message: types.Message, state: FSMContext):
             f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"🔑 Test kodi: <code>{test_code}</code>\n"
             f"📚 Nomi: <b>{html.escape(title)}</b>\n"
-            f"🔢 Savollar soni: <b>{len(parsed_keys)} ta</b>\n\n"
-            f"👉 O'quvchilar <b>«📲 Elektron Test Ishlash (Mock)»</b> bo'limiga kirib, <code>{test_code}</code> kodini kiritish orqali elektron titulda yechishlari mumkin!",
+            f"🔢 Kalitlar soni: <b>{len(parsed_keys)} ta</b>\n\n"
+            f"👉 O'quvchilar <b>«📲 Elektron Titul Tekshirish»</b> bo'limiga kirib, <code>{test_code}</code> kodini kiritish orqali elektron titulda belgilashlari mumkin!\n"
+            f"📢 Test tugagach, <b>«📢 Testni Yakunlash (PDF + Post)»</b> bo'limidan natijalarni PDF va Post shaklida e'lon qilasiz!",
             parse_mode="HTML",
             reply_markup=main_menu(uid)
         )
@@ -1129,13 +1244,13 @@ async def handle_user_test_upload(message: types.Message, state: FSMContext):
         f"🔑 Test kodi: <code>{test_code}</code>\n"
         f"📚 Nomi: <b>{html.escape(title)}</b>\n"
         f"🔢 Topilgan kalitlar: <b>{len(keys_dict)} ta</b>\n\n"
-        f"👉 Endi <b>«📲 Elektron Test Ishlash (Mock)»</b> tugmasi orqali <code>{test_code}</code> kodini terib ishlash mumkin!",
+        f"👉 Endi <b>«📲 Elektron Titul Tekshirish»</b> tugmasi orqali <code>{test_code}</code> kodini terib ishlash mumkin!",
         parse_mode="HTML",
         reply_markup=main_menu(uid)
     )
 
 # -------------------------------------------------------------
-# ELEKTRON TEST ISHLASH (MOCK REJIMI + 41, 42, 43 RASM)
+# ALOHIDA ELEKTRON TITUL TEKSHIRISH VA 41, 42, 43 RASM YUKLASH
 # -------------------------------------------------------------
 @dp.message(F.text == "📋 Faol Testlar Baza")
 async def show_active_tests_list(message: types.Message):
@@ -1146,19 +1261,19 @@ async def show_active_tests_list(message: types.Message):
 
     recent = db_get_recent_tests(12)
     if not recent:
-        await message.answer("📭 Hozircha faol testlar yo'q. «➕ Test Yaratish» tugmasi orqali birinchi testni qo'shing!")
+        await message.answer("📭 Hozircha faol testlar yo'q. «➕ Test Yaratish (Barcha uchun)» tugmasi orqali birinchi testni qo'shing!")
         return
 
     kb_rows = []
-    lines = ["📋 <b>FAOL TESTLAR RO'YXATI:</b>\n━━━━━━━━━━━━━━━━━━━━━━━━"]
+    lines = ["📋 <b>TITUL | FAOL TESTLAR RO'YXATI:</b>\n━━━━━━━━━━━━━━━━━━━━━━━━"]
     for r_code, r_type, r_title, _ in recent:
         badge = "30 talik" if r_type == "30_talik" else ("43 MS Rasch" if r_type == "43_ms" else "90 DTM")
         lines.append(f"🔹 <code>{r_code}</code> — <b>{html.escape(r_title)}</b> <i>({badge})</i>")
-        kb_rows.append([InlineKeyboardButton(text=f"📲 Elektron Yechish: {r_code} ({r_title[:18]})", callback_data=f"solve_now:{r_code}")])
+        kb_rows.append([InlineKeyboardButton(text=f"📲 Elektron Titulni Ochish: {r_code}", callback_data=f"solve_now:{r_code}")])
 
     await message.answer("\n".join(lines), parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
 
-@dp.message(F.text == "📲 Elektron Test Ishlash (Mock)")
+@dp.message(F.text == "📲 Elektron Titul Tekshirish")
 async def start_electronic_test_menu(message: types.Message, state: FSMContext):
     uid = message.from_user.id
     if not await check_channel_subscription(uid):
@@ -1168,21 +1283,21 @@ async def start_electronic_test_menu(message: types.Message, state: FSMContext):
     await state.set_state(StudentTestSolve.waiting_test_code)
     cancel_kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="❌ Bekor qilish")]], resize_keyboard=True)
 
-    recent = db_get_recent_tests(5)
+    recent = db_get_recent_tests(6)
     inline_kb = None
     if recent:
-        rows = [[InlineKeyboardButton(text=f"📲 {c} — {t}", callback_data=f"solve_now:{c}")] for c, _, t, _ in recent]
+        rows = [[InlineKeyboardButton(text=f"📲 Titulni ochish: {c} — {t[:20]}", callback_data=f"solve_now:{c}")] for c, _, t, _ in recent]
         inline_kb = InlineKeyboardMarkup(inline_keyboard=rows)
 
     await message.answer(
-        "📲 <b>ELEKTRON TEST TEKSHIRISH VA MOCK BO'LIMI</b>\n"
+        "📲 <b>ALOHIDA ELEKTRON TITUL TEKSHIRISH BO'LIMI</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "🔑 Test kodini yozib yuboring <i>(masalan: <code>MS-12345</code>)</i>:",
         parse_mode="HTML",
         reply_markup=cancel_kb
     )
     if inline_kb:
-        await message.answer("Yoki oxirgi qo'shilgan testlardan birini tanlang 👇", reply_markup=inline_kb)
+        await message.answer("Yoki ro'yxatdagi faol testlardan birini tanlab darhol elektron titulni oching 👇", reply_markup=inline_kb)
 
 @dp.callback_query(F.data.startswith("solve_now:"))
 async def cb_solve_test_now(callback: types.CallbackQuery, state: FSMContext):
@@ -1204,7 +1319,7 @@ async def process_code_for_exam(message: types.Message, state: FSMContext):
     await launch_electronic_exam(message, message.from_user.id, state, row)
 
 async def launch_electronic_exam(message: types.Message, user_id: int, state: FSMContext, row: tuple):
-    test_code, test_type, title, _, _, file_id, file_type = row
+    test_code, test_type, title, _, _, file_id, file_type, _, _ = row
 
     ACTIVE_EXAM_SESSIONS[user_id] = test_code
 
@@ -1229,7 +1344,7 @@ async def launch_electronic_exam(message: types.Message, user_id: int, state: FS
             pass
 
     await message.answer(
-        f"🔒 <b>MOCK IMTIHON REJIMI FAOL!</b>\n"
+        f"🔒 <b>TITUL MOCK IMTIHON REJIMI FAOL!</b>\n"
         f"Test ishlayotgan vaqtingizda <b>«🤖 AI Masala Yechish»</b> bo'limi avtomatik ravishda bloklandi.\n"
         f"Quyi menyudan foydalanib titulni boshqarishingiz mumkin 👇",
         parse_mode="HTML",
@@ -1238,11 +1353,11 @@ async def launch_electronic_exam(message: types.Message, user_id: int, state: FS
 
     kb = build_electronic_sheet_kb(test_type, {}, page=1, written_photos={})
     await message.answer(
-        f"📲 <b>ELEKTRON JAVOBLAR VARAQASI (TITUL)</b>\n"
+        f"📲 <b>TITUL | ELEKTRON JAVOBLAR VARAQASI</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"📚 Test: <b>{html.escape(title)}</b> (<code>{test_code}</code>)\n"
         f"📌 Tugmalar ustiga bosib javoblaringizni belgilang.\n"
-        f"<i>(43 talik MS testida 4-betga o'tib 36–40-savollarni yozishingiz va 41, 42, 43-masalalarning yechim rasmini yuklashingiz mumkin!)</i>",
+        f"📸 <b>43 talik MS testida «📍33-43 (Ochiq/Rasm)» sahifasiga o'tib 41, 42, 43-masalalarning yechim rasmlarini yuklang!</b>",
         parse_mode="HTML",
         reply_markup=kb
     )
@@ -1264,7 +1379,7 @@ async def reopen_electronic_sheet(message: types.Message, state: FSMContext):
     kb = build_electronic_sheet_kb(test_type, ans, page=page, written_photos=w_photos)
     await message.answer(
         f"📲 <b>ELEKTRON TITUL: {html.escape(title)}</b> (<code>{test_code}</code>)\n"
-        f"✅ Belgilangan javoblar: <b>{len(ans)} ta</b> | 📸 Rasmlar: <b>{len(w_photos)}/3 ta</b>",
+        f"✅ Belgilangan javoblar: <b>{len(ans)} ta</b> | 📸 Rasmlar (41-43): <b>{len(w_photos)}/3 ta</b>",
         parse_mode="HTML",
         reply_markup=kb
     )
@@ -1355,7 +1470,7 @@ async def cb_upload_written_photo(callback: types.CallbackQuery, state: FSMConte
     await state.set_state(StudentTestSolve.waiting_written_photo)
     await callback.message.answer(
         f"📸 <b>{q_num}-masala yechimi tushirilgan rasmni yuboring!</b>\n"
-        f"<i>(Daftardagi yechimingizni aniq qilib rasmga olib shu yerga tashlang)</i> 👇",
+        f"<i>(Daftardagi yechimingizni aniq rasmga olib shu yerga tashlang — AI uni 0 dan 2.5 ballgacha baholaydi)</i> 👇",
         parse_mode="HTML"
     )
     await callback.answer()
@@ -1366,7 +1481,7 @@ async def receive_written_solution_photo(message: types.Message, state: FSMConte
     q_num = str(data.get("uploading_photo_q", "41"))
     file_id = message.photo[-1].file_id
 
-    wait = await message.answer(f"⏳ <b>{q_num}-masala yechimi rasmi tekshirilmoqda va saqlanmoqda...</b>", parse_mode="HTML")
+    wait = await message.answer(f"⏳ <b>{q_num}-masala yechimi rasmi AI orqali tekshirilmoqda...</b>", parse_mode="HTML")
 
     score_val = 2.0
     comment = "Qabul qilindi"
@@ -1388,20 +1503,26 @@ async def receive_written_solution_photo(message: types.Message, state: FSMConte
     await wait.delete()
 
     test_code = data.get("active_test_code", "MS")
-    try:
-        await bot.send_photo(
-            ADMIN_ID,
-            file_id,
-            caption=(
-                f"📸 <b>Yozma ish yechimi ({q_num}-masala)</b>\n"
-                f"👤 O'quvchi: {html.escape(message.from_user.full_name)}\n"
-                f"🔑 Test: <code>{test_code}</code>\n"
-                f"🤖 AI bahosi: <b>{score_val} / 2.5 ball</b> ({html.escape(comment)})"
-            ),
-            parse_mode="HTML"
-        )
-    except Exception:
-        pass
+    row = db_get_test(test_code)
+    creator_id = row[7] if row and len(row) > 7 and row[7] else ADMIN_ID
+
+    for target_id in {ADMIN_ID, creator_id}:
+        if not target_id:
+            continue
+        try:
+            await bot.send_photo(
+                target_id,
+                file_id,
+                caption=(
+                    f"📸 <b>TITUL | Yozma ish yechimi ({q_num}-masala)</b>\n"
+                    f"👤 O'quvchi: {html.escape(message.from_user.full_name)}\n"
+                    f"🔑 Test: <code>{test_code}</code>\n"
+                    f"🤖 AI bahosi: <b>{score_val} / 2.5 ball</b> ({html.escape(comment)})"
+                ),
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass
 
     kb = build_electronic_sheet_kb(
         data.get("active_test_type", "43_ms"),
@@ -1411,7 +1532,7 @@ async def receive_written_solution_photo(message: types.Message, state: FSMConte
     )
     await message.answer(
         f"✅ <b>{q_num}-masala yechimi rasmi yuklandi!</b>\n"
-        f"📊 Dastlabki baho: <b>{score_val} / 2.5 ball</b>\n"
+        f"📊 AI bahosi: <b>{score_val} / 2.5 ball</b>\n"
         f"💬 Izoh: <i>{html.escape(comment)}</i>\n\n"
         f"Titulda davom eting yoki yakunlang 👇",
         parse_mode="HTML",
@@ -1420,7 +1541,7 @@ async def receive_written_solution_photo(message: types.Message, state: FSMConte
 
 @dp.message(StudentTestSolve.waiting_written_photo)
 async def receive_written_photo_invalid(message: types.Message):
-    await message.answer("⚠️ Iltimos, yechimingizni **rasm (foto)** ko'rinishida yuboring!")
+    await message.answer("⚠️ Iltimos, yechimingizni <b>rasm (foto)</b> ko'rinishida yuboring!", parse_mode="HTML")
 
 @dp.callback_query(F.data == "efinish")
 async def cb_finish_electronic_exam(callback: types.CallbackQuery, state: FSMContext):
@@ -1452,17 +1573,19 @@ async def cb_finish_electronic_exam(callback: types.CallbackQuery, state: FSMCon
         await callback.message.answer("❌ Test bazadan topilmadi.", reply_markup=main_menu(uid))
         return
 
-    _, test_type, title, keys_json, _, _, _ = row
+    _, test_type, title, keys_json, _, _, _, _, _ = row
     correct_keys = json.loads(keys_json)
     student_ans = data.get("e_answers", {})
     w_scores = data.get("written_scores", {})
 
     res = evaluate_student_submission(test_type, correct_keys, student_ans, written_scores=w_scores, test_code=code)
     w_total = sum(float(v) for v in w_scores.values())
+    student_name = callback.from_user.full_name or "O'quvchi"
+
     db_save_result(
         code,
         uid,
-        callback.from_user.full_name or "O'quvchi",
+        student_name,
         res["correct_count"],
         res["total_score"],
         res["grade"],
@@ -1475,10 +1598,23 @@ async def cb_finish_electronic_exam(callback: types.CallbackQuery, state: FSMCon
         f"{res['summary']}\n\n"
         f"📋 <b>Tahlil va Xatolar:</b>\n"
         f"{html.escape(mistakes_str)}\n\n"
-        f"🔓 <i>Mock imtihon yakunlandi! Endi «🤖 AI Masala Yechish» bo'limidan yana foydalanishingiz mumkin.</i>"
+        f"🔓 <i>Mock imtihon yakunlandi! Quyida joriy Reyting Posti va PDF Natijalar jadvali taqdim etiladi 👇</i>"
     )
     await callback.message.answer(report, parse_mode="HTML", reply_markup=main_menu(uid))
-    await callback.answer("🎉 Natijangiz Rasch modelida hisoblandi!")
+
+    # Test yakunlangach darhol PDF va Post shaklida natijani chiqarish
+    all_results = db_get_top_results(code, 100)
+    post_text = generate_announcement_post(code, title, test_type, all_results, correct_keys)
+    pdf_bytes = generate_test_results_pdf(code, title, test_type, all_results)
+    pdf_file = BufferedInputFile(pdf_bytes, filename=f"TITUL_{code}_Natijalar.pdf")
+
+    await callback.message.answer_document(
+        pdf_file,
+        caption=f"📄 <b>TITUL | {html.escape(title)} ({code}) — Rasmiy PDF Natijalar Jadvali</b>",
+        parse_mode="HTML"
+    )
+    await callback.message.answer(post_text, parse_mode="HTML", disable_web_page_preview=True)
+    await callback.answer("🎉 Natijangiz PDF va Post shaklida tayyorlandi!")
 
 @dp.message(StudentTestSolve.in_electronic_exam, F.text)
 async def quick_text_fill_in_exam(message: types.Message, state: FSMContext):
@@ -1487,7 +1623,7 @@ async def quick_text_fill_in_exam(message: types.Message, state: FSMContext):
     parsed = parse_input_answers(message.text or "", test_type)
     if not parsed:
         await message.answer(
-            "💡 Tugmalar orqali belgilang yoki <code>1A 2B 3C...</code> ko'rinishida yozing.",
+            "💡 Elektron titul tugmalari orqali belgilang yoki <code>1A 2B 3C...</code> ko'rinishida yozing.",
             parse_mode="HTML"
         )
         return
@@ -1504,6 +1640,69 @@ async def quick_text_fill_in_exam(message: types.Message, state: FSMContext):
     )
 
 # -------------------------------------------------------------
+# TESTNI YAKUNLASH VA NATIJALARNI PDF + POST SHAKLIDA E'LON QILISH
+# -------------------------------------------------------------
+@dp.message(F.text == "📢 Testni Yakunlash (PDF + Post)")
+async def finish_and_announce_test_menu(message: types.Message):
+    uid = message.from_user.id
+    if not await check_channel_subscription(uid):
+        await prompt_subscription(message)
+        return
+
+    my_tests = db_get_user_tests(uid, 10)
+    if not my_tests:
+        my_tests = db_get_recent_tests(8)
+
+    if not my_tests:
+        await message.answer("📭 Hozircha e'lon qilinadigan testlar yo'q.")
+        return
+
+    kb = [
+        [InlineKeyboardButton(text=f"📢 PDF + Post chiqarish: {c} ({t[:20]})", callback_data=f"announce:{c}")]
+        for c, _, t, _ in my_tests
+    ]
+    await message.answer(
+        "📢 <b>TITUL | TESTNI YAKUNLASH VA NATIJALARNI E'LON QILISH</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "Qaysi testni yakunlab, uning <b>PDF jadvali va tayyor kanal Postini</b> olmoqchisiz? Tanlang 👇",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb)
+    )
+
+@dp.callback_query(F.data.startswith("announce:"))
+async def cb_announce_test_results(callback: types.CallbackQuery):
+    code = callback.data.split(":")[1]
+    row = db_get_test(code)
+    if not row:
+        await callback.answer("❌ Test topilmadi!", show_alert=True)
+        return
+
+    test_code, test_type, title, keys_json, _, _, _, _, _ = row
+    keys_dict = json.loads(keys_json)
+    results = db_get_top_results(test_code, 100)
+
+    await callback.answer("📄 PDF va Post tayyorlanmoqda...")
+
+    pdf_bytes = generate_test_results_pdf(test_code, title, test_type, results)
+    post_text = generate_announcement_post(test_code, title, test_type, results, keys_dict)
+
+    pdf_file = BufferedInputFile(pdf_bytes, filename=f"TITUL_{test_code}_Yakuniy_Natijalar.pdf")
+    await callback.message.answer_document(
+        pdf_file,
+        caption=(
+            f"📊 <b>TITUL | YAKUNIY PDF HISOBOT</b>\n"
+            f"🔑 Test kodi: <code>{test_code}</code> | 📚 {html.escape(title)}\n"
+            f"👥 Jami yechganlar: <b>{len(results)} nafar</b>"
+        ),
+        parse_mode="HTML"
+    )
+    await callback.message.answer(
+        post_text,
+        parse_mode="HTML",
+        disable_web_page_preview=True
+    )
+
+# -------------------------------------------------------------
 # REYTING VA NATIJALAR
 # -------------------------------------------------------------
 @dp.message(F.text == "🏆 Reyting & Natijalar")
@@ -1515,23 +1714,12 @@ async def show_rating_menu(message: types.Message):
     if not recent:
         await message.answer("📭 Hozircha natijalar yo'q.")
         return
-    kb = [[InlineKeyboardButton(text=f"🏆 {r_code} — {r_title}", callback_data=f"rating:{r_code}")] for r_code, _, r_title, _ in recent]
-    await message.answer("🏆 <b>Qaysi testning reyting jadvalini ko'rmoqchisiz?</b>", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
-
-@dp.callback_query(F.data.startswith("rating:"))
-async def cb_rating(callback: types.CallbackQuery):
-    code = callback.data.split(":")[1]
-    top = db_get_top_results(code, 20)
-    if not top:
-        await callback.answer("Bu test bo'yicha hali natijalar yo'q!", show_alert=True)
-        return
-    lines = [f"🏆 <b>{html.escape(code)} BO'YICHA TOP NATIJALAR:</b>\n━━━━━━━━━━━━━━━━━━━━━━━━"]
-    medals = {1: "🥇", 2: "🥈", 3: "🥉"}
-    for i, (name, corr, score, grade) in enumerate(top, 1):
-        m = medals.get(i, f"{i}.")
-        lines.append(f"{m} <b>{html.escape(name)}</b> — <b>{score} ball</b> ({corr} ta | {grade})")
-    await callback.message.answer("\n".join(lines), parse_mode="HTML")
-    await callback.answer()
+    kb = [[InlineKeyboardButton(text=f"🏆 {r_code} — {r_title} (PDF + Post)", callback_data=f"announce:{r_code}")] for r_code, _, r_title, _ in recent]
+    await message.answer(
+        "🏆 <b>Qaysi testning reyting jadvali (PDF va Post) ni ko'rmoqchisiz?</b>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb)
+    )
 
 # -------------------------------------------------------------
 # AI MASALA YECHISH (MOCK TEST PAYTIDA QAT'IY BLOKLANADI!)
@@ -1559,7 +1747,7 @@ async def start_ai_solver(message: types.Message, state: FSMContext):
 
     await state.set_state(AISolveProblem.waiting_problem_photo)
     await message.answer(
-        "📸 <b>AI KIMYO MASALA YECHISH BO'LIMI</b>\n"
+        "📸 <b>TITUL | AI KIMYO MASALA YECHISH BO'LIMI (24/7 FAOL)</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "Tushunmagan kimyo masalangiz yoki savolingiz rasmini yuboring.\n"
         "Sun'iy intellekt uni bosqichma-bosqich yechib beradi 👇",
@@ -1574,7 +1762,7 @@ async def solve_photo(message: types.Message, state: FSMContext):
         await message.answer("⛔️ Mock test vaqtida AI masala yechish bloklangan!", reply_markup=exam_active_reply_kb())
         return
 
-    wait = await message.answer("🤖 AI masalani tahlil qilib yechmoqda, 10–15 soniya kuting...")
+    wait = await message.answer("🤖 TITUL AI masalani tahlil qilib yechmoqda, 10–15 soniya kuting...")
     try:
         file_id = message.photo[-1].file_id
         tg_file = await bot.get_file(file_id)
@@ -1583,7 +1771,7 @@ async def solve_photo(message: types.Message, state: FSMContext):
         sol = await ai_solve_photo_problem(buf.getvalue(), "image/jpeg")
         await state.clear()
         await wait.delete()
-        await message.answer(f"🧪 <b>AI Masala Yechimi:</b>\n\n{sol}", parse_mode="HTML", reply_markup=main_menu(uid))
+        await message.answer(f"🧪 <b>TITUL AI Masala Yechimi:</b>\n\n{sol}", parse_mode="HTML", reply_markup=main_menu(uid))
     except Exception as e:
         await state.clear()
         await wait.edit_text(f"❌ Xato: {e}")
@@ -1591,6 +1779,7 @@ async def solve_photo(message: types.Message, state: FSMContext):
 @dp.message(F.text == "👨‍🏫 Ustoz & Bog'lanish")
 async def contact_info(message: types.Message):
     await message.answer(
+        f"📋 <b>Platforma:</b> TITUL Elektron Test Tizimi\n"
         f"👨‍🏫 <b>Ustoz:</b> Azizbek Ibrohimov\n"
         f"📢 <b>Rasmiy kanal:</b> {DEFAULT_CHANNEL_URL}\n"
         f"📞 <b>Murojaat uchun:</b> {ADMIN_USERNAME}",
@@ -1615,7 +1804,7 @@ async def admin_panel(message: types.Message, state: FSMContext = None):
         [InlineKeyboardButton(text="🗑 Testni bazadan o'chirish", callback_data="adm_del")]
     ])
     await message.answer(
-        f"👑 <b>ADMIN BOSHQARUV PANELI</b>\n"
+        f"👑 <b>TITUL | ADMIN BOSHQARUV PANELI</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🔑 Joriy AI kalit: <code>{masked}</code>\n"
         f"📝 Faol imtihon topshirayotganlar: <b>{len(ACTIVE_EXAM_SESSIONS)} kishi</b>",
@@ -1642,7 +1831,7 @@ async def save_gemini_key(message: types.Message, state: FSMContext):
 async def adm_stats(callback: types.CallbackQuery):
     s = db_get_stats()
     await callback.message.answer(
-        f"📊 <b>BOT STATISTIKASI:</b>\n"
+        f"📊 <b>TITUL BOT STATISTIKASI:</b>\n"
         f"👥 Foydalanuvchilar: <b>{s['users']} ta</b>\n"
         f"🧪 Yaratilgan testlar: <b>{s['tests']} ta</b>\n"
         f"📝 Topshirilgan natijalar: <b>{s['results']} ta</b>",
@@ -1667,7 +1856,7 @@ async def do_del(message: types.Message, state: FSMContext):
 # 24/7 WEB SERVER
 # -------------------------------------------------------------
 async def handle_ping(request):
-    return web.Response(text="A+ Kimyo AI Electronic Mock Bot active 24/7!")
+    return web.Response(text="TITUL Electronic Test & AI Bot active 24/7!")
 
 async def start_web_server():
     app = web.Application()
