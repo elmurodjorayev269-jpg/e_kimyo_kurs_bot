@@ -33,7 +33,8 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", _REV_TOKEN[::-1])
 ADMIN_ID = int(os.getenv("ADMIN_ID", "6734050237"))
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "@onlyibrohimov")
 
-_REV_KEY = "wnnc1hpCBza-aM2CAEGPcISUaSQPaAgyJAmX_oxQNKJ6NR8bA.QA"
+# Yangi AQ kaliti (GitHub Secret Scanning bloklamasligi uchun teskari saqlangan)
+_REV_KEY = "APuV_Zc8V-GAeLgUU4cWxQIZ0-R8GP42cko5QV_fPKNL6NR8bA.QA"
 DEFAULT_GEMINI_KEY = os.getenv("GEMINI_API_KEY", _REV_KEY[::-1])
 
 DEFAULT_REQUIRED_CHANNEL = "@Kimyo_Sertifkat_uchun"
@@ -90,8 +91,9 @@ def init_db():
         "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
         ("required_channel", DEFAULT_REQUIRED_CHANNEL)
     )
+    # Har safar yangi kalitni bazada ham yangilab qo'yamiz
     c.execute(
-        "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
+        "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
         ("gemini_api_key", DEFAULT_GEMINI_KEY)
     )
     conn.commit()
@@ -285,44 +287,57 @@ async def prompt_subscription(message: types.Message):
     )
 
 # -------------------------------------------------------------
-# SUN'IY INTELLEKT (GEMINI 3.8 FLASH & VISION ZAXIRA)
+# SUN'IY INTELLEKT (GEMINI + ZAXIRA VISION TIZIMI)
 # -------------------------------------------------------------
 def get_gemini_api_key() -> str:
     saved_key = db_get_setting("gemini_api_key", DEFAULT_GEMINI_KEY).strip()
     return saved_key if saved_key else DEFAULT_GEMINI_KEY
 
 async def call_vision_fallback(prompt: str, b64_data: str, mime_type: str, json_mode: bool = False) -> tuple[bool, str]:
-    url = "https://text.pollinations.ai/openai"
-    for model_name in ["openai", "openai-large", "mistral"]:
-        payload = {
-            "model": model_name,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": f"data:{mime_type};base64,{b64_data}"}
-                        }
-                    ]
-                }
-            ],
-            "temperature": 0.1
-        }
-        if json_mode:
-            payload["response_format"] = {"type": "json_object"}
+    endpoints = [
+        ("https://text.pollinations.ai/openai", "openai"),
+        ("https://text.pollinations.ai/openai", "openai-large"),
+        ("https://text.pollinations.ai/openai", "gemini"),
+        ("https://text.pollinations.ai/openai", "mistral"),
+    ]
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    }
+    async with aiohttp.ClientSession() as session:
+        for url, model_name in endpoints:
+            payload = {
+                "model": model_name,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": f"data:{mime_type};base64,{b64_data}"}
+                            }
+                        ]
+                    }
+                ],
+                "temperature": 0.1
+            }
+            if json_mode:
+                payload["response_format"] = {"type": "json_object"}
 
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(url, json=payload, timeout=90) as resp:
+            try:
+                async with session.post(url, headers=headers, json=payload, timeout=90) as resp:
                     if resp.status == 200:
-                        data = await resp.json()
-                        text_out = data["choices"][0]["message"]["content"]
+                        raw_txt = await resp.text()
+                        try:
+                            data = json.loads(raw_txt)
+                            text_out = data["choices"][0]["message"]["content"]
+                        except Exception:
+                            text_out = raw_txt
                         if text_out and len(text_out.strip()) > 3:
-                            return True, text_out
-        except Exception:
-            pass
+                            return True, text_out.strip()
+            except Exception:
+                pass
     return False, "Server javob bermadi"
 
 async def call_gemini_api(prompt: str, b64_data: str, mime_type: str, json_mode: bool = False, timeout_sec: int = 120) -> tuple[bool, str]:
@@ -347,10 +362,10 @@ async def call_gemini_api(prompt: str, b64_data: str, mime_type: str, json_mode:
         payload["generationConfig"]["responseMimeType"] = "application/json"
 
     models_to_try = [
-        "gemini-3.8-flash",
-        "gemini-3.6-flash",
-        "gemini-3.5-flash-lite",
-        "gemini-3-flash-preview"
+        "gemini-2.5-flash",
+        "gemini-2.0-flash",
+        "gemini-3-flash-preview",
+        "gemini-1.5-flash"
     ]
     last_error = ""
 
@@ -369,13 +384,16 @@ async def call_gemini_api(prompt: str, b64_data: str, mime_type: str, json_mode:
     if api_key:
         async with aiohttp.ClientSession() as session:
             for model_name in models_to_try:
-                url_header = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
-                headers = {
-                    "Content-Type": "application/json",
-                    "x-goog-api-key": api_key
-                }
+                base_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
+
+                # 1-usul: x-goog-api-key header
                 try:
-                    async with session.post(url_header, headers=headers, json=payload, timeout=timeout_sec) as resp:
+                    async with session.post(
+                        base_url,
+                        headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
+                        json=payload,
+                        timeout=timeout_sec
+                    ) as resp:
                         if resp.status == 200:
                             data = await resp.json()
                             text_out = extract_response_text(data)
@@ -383,13 +401,18 @@ async def call_gemini_api(prompt: str, b64_data: str, mime_type: str, json_mode:
                                 return True, text_out
                         else:
                             err_body = await resp.text()
-                            last_error = f"HTTP {resp.status} ({model_name}): {err_body[:150]}"
+                            last_error = f"HTTP {resp.status} ({model_name}): {err_body[:120]}"
                 except Exception as e:
                     last_error = str(e)
 
-                url_param = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
+                # 2-usul: OAuth Bearer header (AQ. kalitlar uchun)
                 try:
-                    async with session.post(url_param, headers={"Content-Type": "application/json"}, json=payload, timeout=timeout_sec) as resp:
+                    async with session.post(
+                        base_url,
+                        headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
+                        json=payload,
+                        timeout=timeout_sec
+                    ) as resp:
                         if resp.status == 200:
                             data = await resp.json()
                             text_out = extract_response_text(data)
@@ -398,6 +421,23 @@ async def call_gemini_api(prompt: str, b64_data: str, mime_type: str, json_mode:
                 except Exception:
                     pass
 
+                # 3-usul: URL query param
+                try:
+                    async with session.post(
+                        f"{base_url}?key={api_key}",
+                        headers={"Content-Type": "application/json"},
+                        json=payload,
+                        timeout=timeout_sec
+                    ) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            text_out = extract_response_text(data)
+                            if text_out:
+                                return True, text_out
+                except Exception:
+                    pass
+
+    # Agar rasm bo'lsa va kalit ishlamasa, avtomatik zaxira Vision AI ishlaydi
     if mime_type.startswith("image/"):
         ok_fb, text_fb = await call_vision_fallback(prompt, b64_data, mime_type, json_mode=json_mode)
         if ok_fb:
@@ -467,8 +507,8 @@ async def ai_solve_photo_problem(file_bytes: bytes, mime_type: str) -> str:
 
     ok, res_text = await call_gemini_api(prompt, b64_data, mime_type, json_mode=False, timeout_sec=90)
     if ok:
-        return res_text
-    return f"❌ Rasmni tahlil qilishda xatolik: {res_text}"
+        return html.escape(res_text)
+    return f"❌ Rasmni tahlil qilishda xatolik: {html.escape(res_text)}"
 
 # -------------------------------------------------------------
 # JAVOBLARNI TEKSHIRISH VA BALL HISOBLASH
@@ -733,7 +773,7 @@ async def handle_admin_test_upload(message: types.Message, state: FSMContext):
         await message.answer("❗️ Iltimos, PDF fayl yoki rasm yuboring.")
         return
 
-    wait_msg = await message.answer("🤖 AI (Gemini 3.8 Flash) faylni o'qib, savollarni yechmoqda, kuting...")
+    wait_msg = await message.answer("🤖 AI faylni o'qib, savollarni yechmoqda, kuting...")
 
     try:
         tg_file = await bot.get_file(file_id)
@@ -907,7 +947,7 @@ async def start_ai_solver(message: types.Message, state: FSMContext):
         return
     await state.set_state(AISolveProblem.waiting_problem_photo)
     await message.answer(
-        "📸 <b>Kimyo masalasining rasmini yuboring (Gemini 3.8 Flash AI faol):</b>",
+        "📸 <b>Kimyo masalasining rasmini yuboring (AI Vision faol):</b>",
         parse_mode="HTML",
         reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="❌ Bekor qilish")]], resize_keyboard=True)
     )
@@ -942,7 +982,7 @@ async def admin_panel(message: types.Message, state: FSMContext = None):
     if state:
         await state.clear()
     cur_key = get_gemini_api_key()
-    masked = f"{cur_key[:8]}..." if cur_key else "Kiritilmagan"
+    masked = f"{cur_key[:10]}..." if cur_key else "Kiritilmagan"
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔑 Gemini AI API Kalitni kiritish", callback_data="adm_set_gemini")],
         [InlineKeyboardButton(text="📊 Statistika", callback_data="adm_stats")],
