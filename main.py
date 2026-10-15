@@ -25,7 +25,7 @@ from aiogram.types import (
 )
 
 # -------------------------------------------------------------
-# SOZLAMALAR (GitHub Secret Scanning ushlamasligi uchun teskari yozilgan)
+# SOZLAMALAR
 # -------------------------------------------------------------
 _REV_TOKEN = "s-BpMl4q53yLNCTEWSAcmjA5Hp0lRm8UFAA:3840376368"
 BOT_TOKEN = os.getenv("BOT_TOKEN", _REV_TOKEN[::-1])
@@ -36,7 +36,6 @@ ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "@onlyibrohimov")
 _REV_KEY = "wnnc1hpCBza-aM2CAEGPcISUaSQPaAgyJAmX_oxQNKJ6NR8bA.QA"
 DEFAULT_GEMINI_KEY = os.getenv("GEMINI_API_KEY", _REV_KEY[::-1])
 
-# Majburiy obuna kanali
 DEFAULT_REQUIRED_CHANNEL = "@Kimyo_Sertifkat_uchun"
 DEFAULT_CHANNEL_URL = "https://t.me/Kimyo_Sertifkat_uchun"
 
@@ -286,14 +285,13 @@ async def prompt_subscription(message: types.Message):
     )
 
 # -------------------------------------------------------------
-# SUN'IY INTELLEKT (GEMINI AI + BEPUL VISION ZAXIRA)
+# SUN'IY INTELLEKT (GEMINI 3.8 FLASH & VISION ZAXIRA)
 # -------------------------------------------------------------
 def get_gemini_api_key() -> str:
     saved_key = db_get_setting("gemini_api_key", DEFAULT_GEMINI_KEY).strip()
     return saved_key if saved_key else DEFAULT_GEMINI_KEY
 
 async def call_vision_fallback(prompt: str, b64_data: str, mime_type: str, json_mode: bool = False) -> tuple[bool, str]:
-    """Agar Gemini kalitida xatolik bo'lsa, bepul Vision AI orqali rasmni o'qib tahlil qiladi."""
     url = "https://text.pollinations.ai/openai"
     for model_name in ["openai", "openai-large", "mistral"]:
         payload = {
@@ -323,9 +321,8 @@ async def call_vision_fallback(prompt: str, b64_data: str, mime_type: str, json_
                         text_out = data["choices"][0]["message"]["content"]
                         if text_out and len(text_out.strip()) > 3:
                             return True, text_out
-        except Exception as e:
-            logging.warning(f"Vision fallback ({model_name}) xatosi: {e}")
-
+        except Exception:
+            pass
     return False, "Server javob bermadi"
 
 async def call_gemini_api(prompt: str, b64_data: str, mime_type: str, json_mode: bool = False, timeout_sec: int = 120) -> tuple[bool, str]:
@@ -351,7 +348,6 @@ async def call_gemini_api(prompt: str, b64_data: str, mime_type: str, json_mode:
 
     models_to_try = [
         "gemini-3.8-flash",
-        "gemini-4-argon",
         "gemini-3.6-flash",
         "gemini-3.5-flash-lite",
         "gemini-3-flash-preview"
@@ -363,7 +359,6 @@ async def call_gemini_api(prompt: str, b64_data: str, mime_type: str, json_mode:
         if not candidates:
             return ""
         parts = candidates[0].get("content", {}).get("parts", [])
-        # Gemini 3.8 Flash va 4 Argon "thought" qismlarini ajratib, asosiy javobni olish
         non_thought = [p.get("text", "") for p in parts if "text" in p and not p.get("thought", False)]
         if non_thought:
             return "\n".join(non_thought).strip()
@@ -374,7 +369,6 @@ async def call_gemini_api(prompt: str, b64_data: str, mime_type: str, json_mode:
     if api_key:
         async with aiohttp.ClientSession() as session:
             for model_name in models_to_try:
-                # 1-usul: x-goog-api-key header orqali (yangi AQ. va AIzaSy kalitlari uchun)
                 url_header = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
                 headers = {
                     "Content-Type": "application/json",
@@ -393,7 +387,6 @@ async def call_gemini_api(prompt: str, b64_data: str, mime_type: str, json_mode:
                 except Exception as e:
                     last_error = str(e)
 
-                # 2-usul: ?key= parametr orqali
                 url_param = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
                 try:
                     async with session.post(url_param, headers={"Content-Type": "application/json"}, json=payload, timeout=timeout_sec) as resp:
@@ -405,7 +398,6 @@ async def call_gemini_api(prompt: str, b64_data: str, mime_type: str, json_mode:
                 except Exception:
                     pass
 
-    # Agar rasm bo'lsa va Gemini kaliti ishlamasa, avtomatik zaxira Vision AI ishga tushadi
     if mime_type.startswith("image/"):
         ok_fb, text_fb = await call_vision_fallback(prompt, b64_data, mime_type, json_mode=json_mode)
         if ok_fb:
@@ -609,7 +601,6 @@ class AdminAITestCreate(StatesGroup):
     waiting_file_or_keys = State()
 
 class AdminPanel(StatesGroup):
-    waiting_channel = State()
     waiting_gemini_key = State()
     waiting_delete_code = State()
 
@@ -742,7 +733,7 @@ async def handle_admin_test_upload(message: types.Message, state: FSMContext):
         await message.answer("❗️ Iltimos, PDF fayl yoki rasm yuboring.")
         return
 
-    wait_msg = await message.answer("🤖 AI faylni o'qib, savollarni yechmoqda, kuting...")
+    wait_msg = await message.answer("🤖 AI (Gemini 3.8 Flash) faylni o'qib, savollarni yechmoqda, kuting...")
 
     try:
         tg_file = await bot.get_file(file_id)
@@ -932,7 +923,7 @@ async def solve_photo(message: types.Message, state: FSMContext):
         sol = await ai_solve_photo_problem(buf.getvalue(), "image/jpeg")
         await state.clear()
         await wait.delete()
-        await message.answer(f"🧪 AI Masala Yechimi:\n\n{sol}", reply_markup=main_menu(message.from_user.id))
+        await message.answer(f"🧪 <b>AI Masala Yechimi:</b>\n\n{sol}", parse_mode="HTML", reply_markup=main_menu(message.from_user.id))
     except Exception as e:
         await state.clear()
         await wait.edit_text(f"❌ Xato: {e}")
@@ -942,7 +933,7 @@ async def contact_info(message: types.Message):
     await message.answer(f"👨‍🏫 Ustoz: Azizbek Ibrohimov\n📢 Kanal: {DEFAULT_CHANNEL_URL}\n📞 Admin: {ADMIN_USERNAME}")
 
 # -------------------------------------------------------------
-# ADMIN PANEL (GEMINI KALIT KIRITISH BILAN)
+# ADMIN PANEL
 # -------------------------------------------------------------
 @dp.message(Command("admin"))
 async def admin_panel(message: types.Message, state: FSMContext = None):
@@ -969,7 +960,7 @@ async def adm_set_gemini_cb(callback: types.CallbackQuery, state: FSMContext):
         return
     await state.set_state(AdminPanel.waiting_gemini_key)
     await callback.message.answer(
-        "🔑 Yangi <b>Gemini AI API kalitingizni</b> yuboring (masalan: <code>AIzaSy...</code> yoki <code>AQ...</code>):",
+        "🔑 Yangi <b>Gemini AI API kalitingizni</b> yuboring:",
         parse_mode="HTML"
     )
     await callback.answer()
@@ -980,7 +971,7 @@ async def save_gemini_key(message: types.Message, state: FSMContext):
     db_set_setting("gemini_api_key", new_key)
     await state.clear()
     await message.answer(
-        "✅ <b>Gemini AI API kaliti saqlandi!</b>\nEndi bemalol PDF yoki rasm yuborishingiz mumkin.",
+        "✅ <b>Gemini AI API kaliti saqlandi!</b>",
         parse_mode="HTML",
         reply_markup=main_menu(ADMIN_ID)
     )
