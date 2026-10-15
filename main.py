@@ -344,19 +344,37 @@ async def call_gemini_api(prompt: str, b64_data: str, mime_type: str, json_mode:
                 ]
             }
         ],
-        "generationConfig": {
-            "temperature": 0.1
-        }
+        "generationConfig": {}
     }
     if json_mode:
         payload["generationConfig"]["responseMimeType"] = "application/json"
 
-    models_to_try = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
+    models_to_try = [
+        "gemini-3.8-flash",
+        "gemini-4-argon",
+        "gemini-3.6-flash",
+        "gemini-3.5-flash-lite",
+        "gemini-3-flash-preview"
+    ]
     last_error = ""
+
+    def extract_response_text(data: dict) -> str:
+        candidates = data.get("candidates", [])
+        if not candidates:
+            return ""
+        parts = candidates[0].get("content", {}).get("parts", [])
+        # Gemini 3.8 Flash va 4 Argon "thought" qismlarini ajratib, asosiy javobni olish
+        non_thought = [p.get("text", "") for p in parts if "text" in p and not p.get("thought", False)]
+        if non_thought:
+            return "\n".join(non_thought).strip()
+        if parts and "text" in parts[-1]:
+            return parts[-1]["text"].strip()
+        return ""
 
     if api_key:
         async with aiohttp.ClientSession() as session:
             for model_name in models_to_try:
+                # 1-usul: x-goog-api-key header orqali (yangi AQ. va AIzaSy kalitlari uchun)
                 url_header = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
                 headers = {
                     "Content-Type": "application/json",
@@ -366,13 +384,26 @@ async def call_gemini_api(prompt: str, b64_data: str, mime_type: str, json_mode:
                     async with session.post(url_header, headers=headers, json=payload, timeout=timeout_sec) as resp:
                         if resp.status == 200:
                             data = await resp.json()
-                            text_out = data["candidates"][0]["content"]["parts"][0]["text"]
-                            return True, text_out
+                            text_out = extract_response_text(data)
+                            if text_out:
+                                return True, text_out
                         else:
                             err_body = await resp.text()
-                            last_error = f"HTTP {resp.status}: {err_body[:150]}"
+                            last_error = f"HTTP {resp.status} ({model_name}): {err_body[:150]}"
                 except Exception as e:
                     last_error = str(e)
+
+                # 2-usul: ?key= parametr orqali
+                url_param = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
+                try:
+                    async with session.post(url_param, headers={"Content-Type": "application/json"}, json=payload, timeout=timeout_sec) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            text_out = extract_response_text(data)
+                            if text_out:
+                                return True, text_out
+                except Exception:
+                    pass
 
     # Agar rasm bo'lsa va Gemini kaliti ishlamasa, avtomatik zaxira Vision AI ishga tushadi
     if mime_type.startswith("image/"):
@@ -884,7 +915,11 @@ async def start_ai_solver(message: types.Message, state: FSMContext):
         await prompt_subscription(message)
         return
     await state.set_state(AISolveProblem.waiting_problem_photo)
-    await message.answer("📸 Kimyo masalasining rasmini yuboring:", reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="❌ Bekor qilish")]], resize_keyboard=True))
+    await message.answer(
+        "📸 <b>Kimyo masalasining rasmini yuboring (Gemini 3.8 Flash AI faol):</b>",
+        parse_mode="HTML",
+        reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="❌ Bekor qilish")]], resize_keyboard=True)
+    )
 
 @dp.message(AISolveProblem.waiting_problem_photo, F.photo)
 async def solve_photo(message: types.Message, state: FSMContext):
