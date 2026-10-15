@@ -9,12 +9,13 @@ import os
 import re
 import sqlite3
 import sys
+import urllib.parse
 from datetime import datetime
 
 import aiohttp
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import CommandStart, Command
+from aiogram.filters import CommandStart, Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -26,14 +27,13 @@ from aiogram.types import (
     BufferedInputFile,
 )
 
-# PDF yaratish uchun ReportLab
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
 
 # -------------------------------------------------------------
-# SOZLAMALAR (TITUL PLATFORMASI)
+# SOZLAMALAR VA KONSTANTALAR
 # -------------------------------------------------------------
 _REV_TOKEN = "s-BpMl4q53yLNCTEWSAcmjA5Hp0lRm8UFAA:3840376368"
 BOT_TOKEN = os.getenv("BOT_TOKEN", _REV_TOKEN[::-1])
@@ -47,14 +47,14 @@ DEFAULT_GEMINI_KEY = os.getenv("GEMINI_API_KEY", _REV_KEY[::-1])
 DEFAULT_REQUIRED_CHANNEL = "@Kimyo_Sertifkat_uchun"
 DEFAULT_CHANNEL_URL = "https://t.me/Kimyo_Sertifkat_uchun"
 
+# Mock imtihon ishlayotgan o'quvchilarni nazorat qilish (AI masala yechishni bloklash uchun)
+ACTIVE_EXAM_SESSIONS: dict[int, str] = {}
+
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
-# Mock test ishlayotgan o'quvchilarni kuzatish (AI yordamchini bloklash uchun)
-ACTIVE_EXAM_SESSIONS = {}  # {user_id: test_code}
-
 # -------------------------------------------------------------
-# MA'LUMOTLAR BAZASI
+# MA'LUMOTLAR BAZASI (SQLITE)
 # -------------------------------------------------------------
 def init_db():
     conn = sqlite3.connect("database.db")
@@ -83,7 +83,7 @@ def init_db():
             file_id TEXT,
             file_type TEXT,
             creator_id INTEGER DEFAULT 0,
-            is_finished INTEGER DEFAULT 0,
+            status TEXT DEFAULT 'active',
             created_at TEXT
         )
     """)
@@ -101,14 +101,15 @@ def init_db():
             submitted_at TEXT
         )
     """)
-    for col_sql in [
+    # Eski jadval ustunlarini xavfsiz yangilash
+    for alter_sql in [
         "ALTER TABLE tests ADD COLUMN creator_id INTEGER DEFAULT 0",
-        "ALTER TABLE tests ADD COLUMN is_finished INTEGER DEFAULT 0",
-        "ALTER TABLE test_results ADD COLUMN answers_json TEXT DEFAULT '{}'",
+        "ALTER TABLE tests ADD COLUMN status TEXT DEFAULT 'active'",
         "ALTER TABLE test_results ADD COLUMN written_score REAL DEFAULT 0",
+        "ALTER TABLE test_results ADD COLUMN answers_json TEXT DEFAULT '{}'",
     ]:
         try:
-            c.execute(col_sql)
+            c.execute(alter_sql)
         except Exception:
             pass
 
@@ -117,7 +118,7 @@ def init_db():
         ("required_channel", DEFAULT_REQUIRED_CHANNEL)
     )
     c.execute(
-        "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
+        "INSERT OR replace INTO settings (key, value) VALUES (?, ?)",
         ("gemini_api_key", DEFAULT_GEMINI_KEY)
     )
     conn.commit()
@@ -132,6 +133,14 @@ def db_add_user(user_id: int, full_name: str, username: str):
     )
     conn.commit()
     conn.close()
+
+def db_get_all_user_ids() -> list[int]:
+    conn = sqlite3.connect("database.db")
+    c = conn.cursor()
+    c.execute("SELECT user_id FROM users")
+    rows = [r[0] for r in c.fetchall()]
+    conn.close()
+    return rows
 
 def db_get_setting(key: str, default: str = "") -> str:
     conn = sqlite3.connect("database.db")
@@ -148,15 +157,24 @@ def db_set_setting(key: str, val: str):
     conn.commit()
     conn.close()
 
-def db_save_test(test_code: str, test_type: str, title: str, keys_dict: dict, explanation: str = "", file_id: str = "", file_type: str = "", creator_id: int = 0):
+def db_save_test(
+    test_code: str,
+    test_type: str,
+    title: str,
+    keys_dict: dict,
+    explanation: str = "",
+    file_id: str = "",
+    file_type: str = "",
+    creator_id: int = 0
+):
     conn = sqlite3.connect("database.db")
     c = conn.cursor()
     c.execute(
         """INSERT OR REPLACE INTO tests 
-           (test_code, test_type, title, keys_json, ai_explanation, file_id, file_type, creator_id, is_finished, created_at) 
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)""",
+           (test_code, test_type, title, keys_json, ai_explanation, file_id, file_type, creator_id, status, created_at) 
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?)""",
         (
-            test_code.upper(),
+            test_code.upper().strip(),
             test_type,
             title,
             json.dumps(keys_dict, ensure_ascii=False),
@@ -174,7 +192,8 @@ def db_get_test(test_code: str):
     conn = sqlite3.connect("database.db")
     c = conn.cursor()
     c.execute(
-        "SELECT test_code, test_type, title, keys_json, ai_explanation, file_id, file_type, creator_id, is_finished FROM tests WHERE test_code = ?",
+        """SELECT test_code, test_type, title, keys_json, ai_explanation, file_id, file_type, creator_id, status 
+           FROM tests WHERE test_code = ?""",
         (test_code.upper().strip(),)
     )
     row = c.fetchone()
@@ -193,48 +212,61 @@ def db_delete_test(test_code: str) -> bool:
 def db_get_recent_tests(limit: int = 12):
     conn = sqlite3.connect("database.db")
     c = conn.cursor()
-    c.execute("SELECT test_code, test_type, title, created_at FROM tests ORDER BY created_at DESC LIMIT ?", (limit,))
+    c.execute(
+        "SELECT test_code, test_type, title, created_at FROM tests ORDER BY created_at DESC LIMIT ?",
+        (limit,)
+    )
     rows = c.fetchall()
     conn.close()
     return rows
 
-def db_get_user_tests(user_id: int, limit: int = 10):
+def db_get_user_tests(user_id: int, limit: int = 12):
     conn = sqlite3.connect("database.db")
     c = conn.cursor()
     if user_id == ADMIN_ID:
-        c.execute("SELECT test_code, test_type, title, created_at FROM tests ORDER BY created_at DESC LIMIT ?", (limit,))
+        c.execute(
+            "SELECT test_code, test_type, title, created_at FROM tests ORDER BY created_at DESC LIMIT ?",
+            (limit,)
+        )
     else:
-        c.execute("SELECT test_code, test_type, title, created_at FROM tests WHERE creator_id = ? ORDER BY created_at DESC LIMIT ?", (user_id, limit))
+        c.execute(
+            "SELECT test_code, test_type, title, created_at FROM tests WHERE creator_id = ? ORDER BY created_at DESC LIMIT ?",
+            (user_id, limit)
+        )
     rows = c.fetchall()
     conn.close()
     return rows
 
-def db_save_result(test_code: str, user_id: int, full_name: str, correct_count: int, total_score: float, grade: str, written_score: float = 0.0, answers_dict: dict = None):
+def db_save_result(
+    test_code: str,
+    user_id: int,
+    full_name: str,
+    correct_count: int,
+    total_score: float,
+    grade: str,
+    written_score: float = 0.0,
+    answers_dict: dict = None
+):
     conn = sqlite3.connect("database.db")
     c = conn.cursor()
-    ans_json = json.dumps(answers_dict or {}, ensure_ascii=False)
     c.execute(
-        """INSERT INTO test_results (test_code, user_id, full_name, correct_count, total_score, grade, written_score, answers_json, submitted_at)
+        """INSERT INTO test_results 
+           (test_code, user_id, full_name, correct_count, total_score, grade, written_score, answers_json, submitted_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (test_code.upper(), user_id, full_name, correct_count, total_score, grade, written_score, ans_json, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        (
+            test_code.upper().strip(),
+            user_id,
+            full_name,
+            correct_count,
+            total_score,
+            grade,
+            written_score,
+            json.dumps(answers_dict or {}, ensure_ascii=False),
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        )
     )
     conn.commit()
     conn.close()
-
-def db_get_all_submissions_for_test(test_code: str) -> list[dict]:
-    conn = sqlite3.connect("database.db")
-    c = conn.cursor()
-    c.execute("SELECT answers_json FROM test_results WHERE test_code = ?", (test_code.upper().strip(),))
-    rows = c.fetchall()
-    conn.close()
-    result = []
-    for (a_json,) in rows:
-        if a_json:
-            try:
-                result.append(json.loads(a_json))
-            except Exception:
-                pass
-    return result
 
 def db_get_top_results(test_code: str, limit: int = 100):
     conn = sqlite3.connect("database.db")
@@ -251,7 +283,22 @@ def db_get_top_results(test_code: str, limit: int = 100):
     conn.close()
     return rows
 
-def db_get_stats():
+def db_get_all_submissions_for_test(test_code: str) -> list[dict]:
+    conn = sqlite3.connect("database.db")
+    c = conn.cursor()
+    c.execute("SELECT answers_json FROM test_results WHERE test_code = ?", (test_code.upper().strip(),))
+    rows = c.fetchall()
+    conn.close()
+    out = []
+    for (aj,) in rows:
+        if aj:
+            try:
+                out.append(json.loads(aj))
+            except Exception:
+                pass
+    return out
+
+def db_get_stats() -> dict:
     conn = sqlite3.connect("database.db")
     c = conn.cursor()
     c.execute("SELECT COUNT(*) FROM users")
@@ -264,12 +311,13 @@ def db_get_stats():
     return {"users": users, "tests": tests_cnt, "results": results_cnt}
 
 # -------------------------------------------------------------
-# MAJBURIY OBUNA TEKSHIRUVI (XATOSIZ REJIM)
+# MAJBURIY OBUNA TEKSHIRUVI
 # -------------------------------------------------------------
 def get_required_channel_data():
     raw = db_get_setting("required_channel", DEFAULT_REQUIRED_CHANNEL).strip()
     if not raw or raw.lower() in ["none", "0", "off"]:
         return None, None
+
     if "t.me/" in raw:
         uname = raw.split("t.me/")[-1].split("/")[0].split("?")[0].strip()
         return f"@{uname}", f"https://t.me/{uname}"
@@ -281,6 +329,8 @@ def get_required_channel_data():
     return f"@{raw}", f"https://t.me/{raw}"
 
 async def check_channel_subscription(user_id: int) -> bool:
+    if user_id == ADMIN_ID:
+        return True
     chat_id, _ = get_required_channel_data()
     if not chat_id:
         return True
@@ -293,6 +343,7 @@ async def check_channel_subscription(user_id: int) -> bool:
             return True
         return False
     except Exception:
+        # Agar bot kanalda admin bo'lmasa, foydalanuvchilarni bloklab qo'ymaslik uchun ruxsat beramiz
         return True
 
 async def prompt_subscription(message: types.Message):
@@ -307,122 +358,178 @@ async def prompt_subscription(message: types.Message):
         ]
     )
     await message.answer(
-        "🛑 <b>Diqqat! TITUL botidan foydalanish uchun rasmiy kanalimizga obuna bo'lishingiz shart!</b>\n\n"
+        "🛑 <b>Diqqat! TITUL platformasidan foydalanish uchun rasmiy kanalimizga obuna bo'ling:</b>\n\n"
         f"👉 Kanal: <a href='{ch_url}'>{chat_id or '@Kimyo_Sertifkat_uchun'}</a>\n\n"
-        "Pastdagi <b>«📢 Kanalga a'zo bo'lish»</b> tugmasini bosib qo'shiling, so'ng <b>«✅ Obunani tekshirish»</b> tugmasini bosing 👇",
+        "Obuna bo'lgach, <b>«✅ Obunani tekshirish»</b> tugmasini bosing 👇",
         parse_mode="HTML",
         disable_web_page_preview=True,
         reply_markup=kb
     )
 
 # -------------------------------------------------------------
-# MATNNI CHIROYLI TELEGRAM FORMATIGA O'TKAZISH (FORMATTER)
+# TELEGRAM UCHUN MATN VA FORMULA TOZALAGICH
 # -------------------------------------------------------------
-SUB_MAP = str.maketrans("0123456789+-", "₀₁₂₃₄₅₆₇₈₉₊₋")
-SUP_MAP = str.maketrans("0123456789+-", "⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻")
-
 def clean_ai_text_for_telegram(text: str) -> str:
     if not text:
         return ""
+    t = text.replace("$$", "").replace("$", "")
     replacements = {
-        r"\rightarrow": " → ",
-        r"\longrightarrow": " ⟶ ",
-        r"\leftarrow": " ← ",
-        r"\leftrightarrow": " ↔ ",
-        r"\rightleftharpoons": " ⇌ ",
-        r"\downarrow": "↓",
-        r"\uparrow": "↑",
-        r"\cdot": "·",
-        r"\times": "×",
-        r"\div": "÷",
-        r"\pm": "±",
-        r"\approx": "≈",
-        r"\neq": "≠",
-        r"\leq": "≤",
-        r"\geq": "≥",
-        r"\implies": " ⇒ ",
-        r"\Rightarrow": " ⇒ ",
-        r"\%": "%",
-        r"\circ": "°",
-        r"^\circ": "°",
+        "\\rightarrow": "→",
+        "\\leftarrow": "←",
+        "\\leftrightarrow": "↔",
+        "\\Rightarrow": "⇒",
+        "\\cdot": "·",
+        "\\times": "×",
+        "\\approx": "≈",
+        "\\leq": "≤",
+        "\\geq": "≥",
+        "\\neq": "≠",
+        "\\%": "%",
+        "\\text": "",
+        "\\mathrm": "",
     }
     for k, v in replacements.items():
-        text = text.replace(k, v)
+        t = t.replace(k, v)
 
-    text = re.sub(r"\\(?:text|mathrm|textbf|mathbf)\{([^}]*)\}", r"\1", text)
-    text = re.sub(r"\\frac\{([^}]*)\}\{([^}]*)\}", r"(\1 / \2)", text)
-    text = re.sub(r"_\{([0-9+-]+)\}", lambda m: m.group(1).translate(SUB_MAP), text)
-    text = re.sub(r"_([0-9])", lambda m: m.group(1).translate(SUB_MAP), text)
-    text = re.sub(r"\^\{([0-9+-]+)\}", lambda m: m.group(1).translate(SUP_MAP), text)
-    text = re.sub(r"\^([0-9+-])", lambda m: m.group(1).translate(SUP_MAP), text)
-    text = text.replace("$$", "").replace("$", "")
-    text = re.sub(r"\\([a-zA-Z]+)", r"\1", text)
-    text = html.escape(text)
-    text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
-    text = re.sub(r"^#{1,4}\s*(.+)$", r"📌 <b>\1</b>", text, flags=re.MULTILINE)
-    text = re.sub(r"^\s*\*\s+", "• ", text, flags=re.MULTILINE)
-    return text.strip()
+    t = re.sub(r"\\frac\{([^{}]+)\}\{([^{}]+)\}", r"(\1/\2)", t)
+    t = re.sub(r"\{([^{}]+)\}", r"\1", t)
+
+    sub_map = str.maketrans("0123456789", "₀₁₂₃₄₅₆₇₈₉")
+    t = re.sub(r"_([0-9]+)", lambda m: m.group(1).translate(sub_map), t)
+    t = re.sub(r"([A-Za-z\)])([0-9]+)", lambda m: m.group(1) + m.group(2).translate(sub_map), t)
+
+    t = html.escape(t)
+    t = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", t)
+    t = re.sub(r"^#{1,4}\s*(.+)$", r"📌 <b>\1</b>", t, flags=re.MULTILINE)
+    return t.strip()
 
 # -------------------------------------------------------------
-# DOIMIY ISHLOVCHI SUN'IY INTELLEKT (GEMINI + MULTI-PROVIDER VISION)
+# DOIMIY ISHLOVCHI SUN'IY INTELLEKT (5 BOSQICHLI TIZIM)
 # -------------------------------------------------------------
 def get_gemini_api_key() -> str:
     saved_key = db_get_setting("gemini_api_key", DEFAULT_GEMINI_KEY).strip()
     return saved_key if saved_key else DEFAULT_GEMINI_KEY
 
-async def call_vision_fallback(prompt: str, b64_data: str, mime_type: str, json_mode: bool = False) -> tuple[bool, str]:
-    """24/7 kalitsiz ishlovchi zaxira Vision AI provayderlari."""
-    endpoints = [
-        ("https://text.pollinations.ai/openai", "openai"),
-        ("https://text.pollinations.ai/openai", "openai-large"),
-        ("https://text.pollinations.ai/openai", "gpt-4o-mini"),
-        ("https://text.pollinations.ai/openai", "mistral"),
-    ]
-    for url, model_name in endpoints:
-        payload = {
-            "model": model_name,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": "Sen TITUL platformasining oliy toifali Kimyo va aniq fanlar ekspertisan."
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": f"data:{mime_type};base64,{b64_data}"}
-                        }
-                    ]
-                }
-            ],
-            "temperature": 0.1
+async def extract_text_via_free_ocr(b64_data: str, mime_type: str) -> str:
+    """Rasm ichidagi masala matnini bepul OCR orqali ajratib olish."""
+    url = "https://api.ocr.space/parse/image"
+    for engine in ["2", "1"]:
+        form_data = {
+            "apikey": "helloworld",
+            "base64Image": f"data:{mime_type};base64,{b64_data}",
+            "language": "eng",
+            "isOverlayRequired": "false",
+            "OCREngine": engine,
         }
-        if json_mode:
-            payload["response_format"] = {"type": "json_object"}
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.post(url, json=payload, timeout=90) as resp:
+                async with session.post(url, data=form_data, timeout=25) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        parsed_list = data.get("ParsedResults", [])
+                        if parsed_list:
+                            txt = parsed_list[0].get("ParsedText", "").strip()
+                            if len(txt) > 3:
+                                return txt
+        except Exception:
+            pass
+    return ""
+
+async def call_text_ai_fallback(prompt: str, extracted_text: str) -> tuple[bool, str]:
+    """OCR orqali olingan matnni Text AI orqali yechish."""
+    full_prompt = f"{prompt}\n\nMasala sharti:\n{extracted_text}"
+    async with aiohttp.ClientSession() as session:
+        # 1. OpenAI-compatible POST endpoint
+        for model_name in ["openai", "openai-large", "mistral"]:
+            payload = {
+                "model": model_name,
+                "messages": [{"role": "user", "content": full_prompt}],
+                "temperature": 0.1
+            }
+            try:
+                async with session.post("https://text.pollinations.ai/openai", json=payload, timeout=60) as resp:
                     if resp.status == 200:
                         data = await resp.json()
                         text_out = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-                        if text_out and len(text_out.strip()) > 3:
+                        if text_out and len(text_out.strip()) > 5:
                             return True, text_out.strip()
+            except Exception:
+                pass
+
+        # 2. Oddiy GET endpoint
+        try:
+            encoded = urllib.parse.quote(full_prompt[:1500])
+            async with session.get(f"https://text.pollinations.ai/{encoded}", timeout=45) as resp:
+                if resp.status == 200:
+                    txt = (await resp.text()).strip()
+                    if len(txt) > 5 and not txt.startswith("<!"):
+                        return True, txt
         except Exception:
             pass
-    return False, "AI server javob bermadi, qaytadan urinib ko'ring."
 
-async def call_gemini_api(prompt: str, b64_data: str, mime_type: str, json_mode: bool = False, timeout_sec: int = 120) -> tuple[bool, str]:
+    return False, ""
+
+async def call_vision_fallback(prompt: str, b64_data: str, mime_type: str, json_mode: bool = False) -> tuple[bool, str]:
+    """Kalitsiz ishlovchi Vision AI + OCR zaxira tizimi."""
+    url = "https://text.pollinations.ai/openai"
+    async with aiohttp.ClientSession() as session:
+        for model_name in ["openai", "openai-large", "mistral"]:
+            payload = {
+                "model": model_name,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": f"data:{mime_type};base64,{b64_data}"}
+                            }
+                        ]
+                    }
+                ],
+                "temperature": 0.1
+            }
+            if json_mode:
+                payload["response_format"] = {"type": "json_object"}
+
+            try:
+                async with session.post(url, json=payload, timeout=75) as resp:
+                    if resp.status == 200:
+                        raw_resp = await resp.text()
+                        try:
+                            data = json.loads(raw_resp)
+                            text_out = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                            if text_out and len(text_out.strip()) > 3:
+                                return True, text_out.strip()
+                        except Exception:
+                            if len(raw_resp.strip()) > 5 and not raw_resp.strip().startswith("<!"):
+                                return True, raw_resp.strip()
+            except Exception:
+                pass
+
+    # Agar Vision server javob bermasa, rasmdan matnni OCR qilib o'qib, matnli AI ga yuboramiz
+    ocr_text = await extract_text_via_free_ocr(b64_data, mime_type)
+    if ocr_text:
+        ok_txt, res_txt = await call_text_ai_fallback(prompt, ocr_text)
+        if ok_txt:
+            return True, res_txt
+
+    return False, "AI server javob bermadi"
+
+async def call_gemini_api(prompt: str, b64_data: str, mime_type: str, json_mode: bool = False, timeout_sec: int = 90) -> tuple[bool, str]:
     api_key = get_gemini_api_key()
-    payload = {
+
+    # Vertex AI va Gemini standartiga mos payload ("role": "user" ikkalasida ham ishlaydi)
+    payload_vertex = {
         "contents": [
             {
+                "role": "user",
                 "parts": [
                     {"text": prompt},
                     {
-                        "inline_data": {
-                            "mime_type": mime_type,
+                        "inlineData": {
+                            "mimeType": mime_type,
                             "data": b64_data
                         }
                     }
@@ -432,12 +539,12 @@ async def call_gemini_api(prompt: str, b64_data: str, mime_type: str, json_mode:
         "generationConfig": {}
     }
     if json_mode:
-        payload["generationConfig"]["responseMimeType"] = "application/json"
+        payload_vertex["generationConfig"]["responseMimeType"] = "application/json"
 
     models_to_try = [
         "gemini-2.5-flash",
         "gemini-2.0-flash",
-        "gemini-3-flash-preview",
+        "gemini-2.0-flash-001",
         "gemini-1.5-flash"
     ]
     last_error = ""
@@ -454,22 +561,38 @@ async def call_gemini_api(prompt: str, b64_data: str, mime_type: str, json_mode:
             return parts[-1]["text"].strip()
         return ""
 
-    if api_key and not api_key.startswith("AQ."):
+    if api_key:
         async with aiohttp.ClientSession() as session:
             for model_name in models_to_try:
-                url_param = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
-                try:
-                    async with session.post(url_param, headers={"Content-Type": "application/json"}, json=payload, timeout=timeout_sec) as resp:
-                        if resp.status == 200:
-                            data = await resp.json()
-                            text_out = extract_response_text(data)
-                            if text_out:
-                                return True, text_out
-                        else:
-                            last_error = f"HTTP {resp.status}"
-                except Exception as e:
-                    last_error = str(e)
+                # 1. AQ. kalitlari uchun Vertex AI Express endpointi + Standart Gemini endpointi
+                endpoints = [
+                    (
+                        f"https://aiplatform.googleapis.com/v1/publishers/google/models/{model_name}:generateContent?key={api_key}",
+                        {"Content-Type": "application/json"}
+                    ),
+                    (
+                        f"https://aiplatform.googleapis.com/v1beta1/publishers/google/models/{model_name}:generateContent?key={api_key}",
+                        {"Content-Type": "application/json"}
+                    ),
+                    (
+                        f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}",
+                        {"Content-Type": "application/json"}
+                    ),
+                ]
+                for url_endpoint, req_headers in endpoints:
+                    try:
+                        async with session.post(url_endpoint, headers=req_headers, json=payload_vertex, timeout=timeout_sec) as resp:
+                            if resp.status == 200:
+                                data = await resp.json()
+                                text_out = extract_response_text(data)
+                                if text_out:
+                                    return True, text_out
+                            else:
+                                last_error = f"HTTP {resp.status}"
+                    except Exception as e:
+                        last_error = str(e)
 
+    # 2. Zaxira Vision + OCR AI
     if mime_type.startswith("image/"):
         ok_fb, text_fb = await call_vision_fallback(prompt, b64_data, mime_type, json_mode=json_mode)
         if ok_fb:
@@ -504,14 +627,15 @@ async def ai_analyze_test_document(file_bytes: bytes, mime_type: str, test_type:
             '{"title": "TITUL 90 talik DTM Blok Testi", "keys": {"1": "A", "2": "C"}, "explanation": "Izoh"}'
         )
 
-    ok, res_text = await call_gemini_api(prompt, b64_data, mime_type, json_mode=True, timeout_sec=120)
+    ok, res_text = await call_gemini_api(prompt, b64_data, mime_type, json_mode=True, timeout_sec=100)
     if not ok:
         return {"error": res_text}
 
     try:
         raw_text = res_text.strip()
-        if raw_text.startswith("```"):
-            raw_text = re.sub(r"^```(?:json)?|```$", "", raw_text, flags=re.MULTILINE).strip()
+        m = re.search(r"\{.*\}", raw_text, flags=re.DOTALL)
+        if m:
+            raw_text = m.group(0)
         return json.loads(raw_text)
     except Exception as e:
         return {"error": f"JSON o'qishda xato: {e}"}
@@ -528,7 +652,8 @@ async def ai_grade_written_work(file_bytes: bytes, q_num: int) -> tuple[float, s
     ok, res_text = await call_gemini_api(prompt, b64_data, "image/jpeg", json_mode=True, timeout_sec=60)
     if ok:
         try:
-            raw = re.sub(r"^```(?:json)?|```$", "", res_text.strip(), flags=re.MULTILINE).strip()
+            m = re.search(r"\{.*\}", res_text.strip(), flags=re.DOTALL)
+            raw = m.group(0) if m else res_text.strip()
             data = json.loads(raw)
             score = float(data.get("score", 2.0))
             score = max(0.0, min(2.5, score))
@@ -543,12 +668,12 @@ async def ai_solve_photo_problem(file_bytes: bytes, mime_type: str) -> str:
     prompt = (
         "Sen TITUL platformasining tajribali ustozi Azizbek Ibrohimovning sun'iy intellekt yordamchisisan. "
         "Rasmdagi kimyo masalasini yoki test savolini o'zbek tilida eng oson, mantiqiy usulda "
-        "bosqichma-bosqich yechib, yakunida aniq to'g'ri javobni ko'rsatib ber. "
-        "MUHIM: Formulalarda hech qanday LaTeX ($...$, \\rightarrow) ishlatma! Oddiy H₂SO₄, → belgilaridan foydalan."
+        "bosqichma-bosqich yechib, yakunida aniq to'g'ri javobni ko'rsatib ber."
     )
     ok, res_text = await call_gemini_api(prompt, b64_data, mime_type, json_mode=False, timeout_sec=90)
     if ok:
-        return clean_ai_text_for_telegram(res_text)
+        cleaned = clean_ai_text_for_telegram(res_text)
+        return cleaned[:3800] if len(cleaned) > 3800 else cleaned
     return f"❌ Rasmni tahlil qilishda xatolik: {html.escape(res_text)}"
 
 # -------------------------------------------------------------
@@ -793,14 +918,12 @@ def evaluate_student_submission(test_type: str, correct_keys: dict, student_ans:
 # PDF VA POST SHAKLIDA NATIJALAR GENERATORI
 # -------------------------------------------------------------
 def clean_ascii_for_pdf(txt: str) -> str:
-    """ReportLab standart shriftida xatolik chiqmasligi uchun lotin/raqam belgilarni tozalash."""
     if not txt:
         return ""
     cleaned = re.sub(r"[^\x20-\x7E]", "", str(txt)).strip()
     return cleaned if cleaned else "O'quvchi"
 
 def generate_test_results_pdf(test_code: str, title: str, test_type: str, results: list) -> bytes:
-    """Test yakunlanganda yoki o'quvchi topshirganda rasmiy TITUL PDF jadvalini yaratish."""
     buf = io.BytesIO()
     doc = SimpleDocTemplate(buf, pagesize=A4, rightMargin=30, leftMargin=30, topMargin=35, bottomMargin=30)
     styles = getSampleStyleSheet()
@@ -823,7 +946,7 @@ def generate_test_results_pdf(test_code: str, title: str, test_type: str, result
     )
 
     elements = []
-    elements.append(Paragraph(f"TITUL - ELEKTRON TEST NATIJALARI JADVALI", title_style))
+    elements.append(Paragraph("TITUL - ELEKTRON TEST NATIJALARI JADVALI", title_style))
     elements.append(Paragraph(
         f"Test kodi: <b>{clean_ascii_for_pdf(test_code)}</b> | Nomi: <b>{clean_ascii_for_pdf(title)}</b> | Sana: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
         sub_style
@@ -867,7 +990,6 @@ def generate_test_results_pdf(test_code: str, title: str, test_type: str, result
     return buf.getvalue()
 
 def generate_announcement_post(test_code: str, title: str, test_type: str, results: list, keys_dict: dict) -> str:
-    """Kanal yoki guruhga e'lon qilish uchun tayyor chiroyli Post matni."""
     badge = "30 talik Standart" if test_type == "30_talik" else ("43 talik Milliy Sertifikat (Rasch)" if test_type == "43_ms" else "90 talik DTM Blok")
     lines = [
         f"📣 <b>TITUL | RASMIY TEST NATIJALARI E'LONI</b>",
@@ -1015,9 +1137,11 @@ class UserTestCreate(StatesGroup):
 class AdminPanel(StatesGroup):
     waiting_gemini_key = State()
     waiting_delete_code = State()
+    waiting_broadcast_msg = State()
+    waiting_channel_username = State()
 
 # -------------------------------------------------------------
-# YANGI ZAMONAVIY "TITUL" INTERFEYSI VA MENYULAR
+# MENYULAR
 # -------------------------------------------------------------
 def main_menu(user_id: int = 0):
     kb = [
@@ -1034,11 +1158,10 @@ def main_menu(user_id: int = 0):
             KeyboardButton(text="🤖 AI Masala Yechish (Rasm)")
         ],
         [
-            KeyboardButton(text="👨‍🏫 Ustoz & Bog'lanish")
+            KeyboardButton(text="👨‍🏫 Ustoz & Bog'lanish"),
+            KeyboardButton(text="👑 Admin Boshqaruv Paneli")
         ]
     ]
-    if user_id == ADMIN_ID:
-        kb.append([KeyboardButton(text="👑 Admin Boshqaruv Paneli")])
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
 def exam_active_reply_kb():
@@ -1051,9 +1174,9 @@ def exam_active_reply_kb():
     )
 
 # -------------------------------------------------------------
-# START VA OBUNA
+# HAR QANDAY HOLATDA ISHLOVCHI GLOBAL BUYRUQLAR VA ADMIN PANEL
 # -------------------------------------------------------------
-@dp.message(CommandStart())
+@dp.message(CommandStart(), StateFilter("*"))
 async def cmd_start(message: types.Message, state: FSMContext):
     uid = message.from_user.id
     ACTIVE_EXAM_SESSIONS.pop(uid, None)
@@ -1079,6 +1202,168 @@ async def cmd_start(message: types.Message, state: FSMContext):
     )
     await message.answer(text, parse_mode="HTML", reply_markup=main_menu(uid))
 
+@dp.message(Command("admin"), StateFilter("*"))
+@dp.message(F.text == "👑 Admin Boshqaruv Paneli", StateFilter("*"))
+async def admin_panel(message: types.Message, state: FSMContext):
+    uid = message.from_user.id
+    await state.clear()
+
+    if uid != ADMIN_ID:
+        await message.answer(
+            f"🔒 <b>Bu bo'lim faqat platforma bosh admini uchun!</b>\n"
+            f"Sizning Telegram ID raqamingiz: <code>{uid}</code>\n"
+            f"<i>(O'z testlaringizni yaratish va yakunlash uchun asosiy menyudagi «➕ Test Yaratish» va «📢 Testni Yakunlash» tugmalaridan foydalaning)</i>",
+            parse_mode="HTML",
+            reply_markup=main_menu(uid)
+        )
+        return
+
+    cur_key = get_gemini_api_key()
+    masked = f"{cur_key[:10]}..." if cur_key else "Kiritilmagan"
+    req_ch = db_get_setting("required_channel", DEFAULT_REQUIRED_CHANNEL)
+    s = db_get_stats()
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📊 Bot Statistikasi (Batafsil)", callback_data="adm_stats")],
+        [InlineKeyboardButton(text="📢 Barchaga Xabar Yuborish (Reklama)", callback_data="adm_broadcast")],
+        [InlineKeyboardButton(text="🔑 Gemini AI API Kalitni Yangilash", callback_data="adm_set_gemini")],
+        [InlineKeyboardButton(text="📡 Majburiy Obuna Kanalini Sozlash", callback_data="adm_set_channel")],
+        [InlineKeyboardButton(text="🗑 Testni Bazadan O'chirish", callback_data="adm_del")]
+    ])
+    await message.answer(
+        f"👑 <b>TITUL | ADMIN BOSHQARUV PANELI</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"👥 Jami foydalanuvchilar: <b>{s['users']} nafar</b>\n"
+        f"🧪 Bazadagi testlar: <b>{s['tests']} ta</b>\n"
+        f"📝 Topshirilgan natijalar: <b>{s['results']} ta</b>\n"
+        f"⏳ Hozir Mock imtihon ishlayotganlar: <b>{len(ACTIVE_EXAM_SESSIONS)} kishi</b>\n"
+        f"📢 Majburiy kanal: <code>{html.escape(req_ch)}</code>\n"
+        f"🔑 AI Kalit: <code>{html.escape(masked)}</code>\n\n"
+        f"Kerakli amalni tanlang 👇",
+        parse_mode="HTML",
+        reply_markup=kb
+    )
+
+@dp.callback_query(F.data == "adm_stats")
+async def adm_stats_cb(callback: types.CallbackQuery):
+    s = db_get_stats()
+    recent = db_get_recent_tests(5)
+    t_list = "\n".join([f"• <code>{c}</code> — {html.escape(t)}" for c, _, t, _ in recent]) or "Yo'q"
+    await callback.message.answer(
+        f"📊 <b>TITUL PLATFORMASI STATISTIKASI:</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"👥 Ro'yxatdan o'tganlar: <b>{s['users']} ta</b>\n"
+        f"🧪 Jami yaratilgan testlar: <b>{s['tests']} ta</b>\n"
+        f"📝 Jami tekshirilgan titul natijalari: <b>{s['results']} ta</b>\n\n"
+        f"📋 <b>Oxirgi 5 ta test:</b>\n{t_list}",
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data == "adm_set_gemini")
+async def adm_set_gemini_cb(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Faqat admin uchun!", show_alert=True)
+        return
+    await state.set_state(AdminPanel.waiting_gemini_key)
+    await callback.message.answer(
+        "🔑 Yangi <b>Gemini AI API kalitingizni</b> yuboring:\n"
+        "<i>(Ham AIzaSy... ham AQ.Ab8... kalitlari to'liq qo'llab-quvvatlanadi)</i>",
+        parse_mode="HTML",
+        reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="❌ Bekor qilish")]], resize_keyboard=True)
+    )
+    await callback.answer()
+
+@dp.message(AdminPanel.waiting_gemini_key)
+async def save_gemini_key(message: types.Message, state: FSMContext):
+    new_key = (message.text or "").strip()
+    db_set_setting("gemini_api_key", new_key)
+    await state.clear()
+    await message.answer(
+        "✅ <b>Gemini AI API kaliti muvaffaqiyatli saqlandi!</b>",
+        parse_mode="HTML",
+        reply_markup=main_menu(message.from_user.id)
+    )
+
+@dp.callback_query(F.data == "adm_set_channel")
+async def adm_set_channel_cb(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Faqat admin uchun!", show_alert=True)
+        return
+    await state.set_state(AdminPanel.waiting_channel_username)
+    await callback.message.answer(
+        "📡 Majburiy obuna uchun kanal username'ini yuboring (masalan: <code>@Kimyo_Sertifkat_uchun</code>) yoki o'chirish uchun <code>off</code> deb yozing:",
+        parse_mode="HTML",
+        reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="❌ Bekor qilish")]], resize_keyboard=True)
+    )
+    await callback.answer()
+
+@dp.message(AdminPanel.waiting_channel_username)
+async def save_channel_username(message: types.Message, state: FSMContext):
+    ch = (message.text or "").strip()
+    db_set_setting("required_channel", ch)
+    await state.clear()
+    await message.answer(
+        f"✅ Majburiy obuna kanali yangilandi: <code>{html.escape(ch)}</code>",
+        parse_mode="HTML",
+        reply_markup=main_menu(message.from_user.id)
+    )
+
+@dp.callback_query(F.data == "adm_broadcast")
+async def adm_broadcast_cb(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Faqat admin uchun!", show_alert=True)
+        return
+    await state.set_state(AdminPanel.waiting_broadcast_msg)
+    await callback.message.answer(
+        "📢 <b>Barcha foydalanuvchilarga yuboriladigan xabar (matn, rasm yoki post) ni yuboring:</b>",
+        parse_mode="HTML",
+        reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="❌ Bekor qilish")]], resize_keyboard=True)
+    )
+    await callback.answer()
+
+@dp.message(AdminPanel.waiting_broadcast_msg)
+async def process_broadcast(message: types.Message, state: FSMContext):
+    await state.clear()
+    users = db_get_all_user_ids()
+    sent = 0
+    wait = await message.answer(f"⏳ Xabar {len(users)} ta foydalanuvchiga yuborilmoqda...")
+    for u_id in users:
+        try:
+            await message.copy_to(u_id)
+            sent += 1
+            await asyncio.sleep(0.04)
+        except Exception:
+            pass
+    await wait.delete()
+    await message.answer(
+        f"✅ <b>Xabar {sent} / {len(users)} nafar foydalanuvchiga yetkazildi!</b>",
+        parse_mode="HTML",
+        reply_markup=main_menu(message.from_user.id)
+    )
+
+@dp.callback_query(F.data == "adm_del")
+async def adm_del_cb(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Faqat admin uchun!", show_alert=True)
+        return
+    await state.set_state(AdminPanel.waiting_delete_code)
+    await callback.message.answer(
+        "🗑 O'chirmoqchi bo'lgan test kodini yuboring:",
+        reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="❌ Bekor qilish")]], resize_keyboard=True)
+    )
+    await callback.answer()
+
+@dp.message(AdminPanel.waiting_delete_code)
+async def do_del_test(message: types.Message, state: FSMContext):
+    code = (message.text or "").strip().upper()
+    ok = db_delete_test(code)
+    await state.clear()
+    await message.answer(
+        f"{'✅ Test bazadan o\'chirildi!' if ok else '❌ Bunday kodli test topilmadi.'}",
+        reply_markup=main_menu(message.from_user.id)
+    )
+
 @dp.callback_query(F.data == "btn_check_sub")
 async def cb_check_sub(callback: types.CallbackQuery):
     uid = callback.from_user.id
@@ -1099,7 +1384,7 @@ async def cb_check_sub(callback: types.CallbackQuery):
 async def cb_noop(callback: types.CallbackQuery):
     await callback.answer()
 
-@dp.message(F.text.in_(["❌ Bekor qilish", "🛑 Testni Bekor Qilish (Chiqish)"]))
+@dp.message(F.text.in_(["❌ Bekor qilish", "🛑 Testni Bekor Qilish (Chiqish)"]), StateFilter("*"))
 async def cancel_any_state(message: types.Message, state: FSMContext):
     uid = message.from_user.id
     ACTIVE_EXAM_SESSIONS.pop(uid, None)
@@ -1109,13 +1394,14 @@ async def cancel_any_state(message: types.Message, state: FSMContext):
 # -------------------------------------------------------------
 # BARCHA UCHUN OCHIQ TEST YARATISH BO'LIMI
 # -------------------------------------------------------------
-@dp.message(F.text == "➕ Test Yaratish (Barcha uchun)")
+@dp.message(F.text == "➕ Test Yaratish (Barcha uchun)", StateFilter("*"))
 async def user_start_test_create(message: types.Message, state: FSMContext):
     uid = message.from_user.id
     if uid in ACTIVE_EXAM_SESSIONS:
         await message.answer("⛔️ Siz hozir Mock test ishlayapsiz! Avval testni yakunlang.")
         return
 
+    await state.clear()
     if not await check_channel_subscription(uid):
         await prompt_subscription(message)
         return
@@ -1252,9 +1538,12 @@ async def handle_user_test_upload(message: types.Message, state: FSMContext):
 # -------------------------------------------------------------
 # ALOHIDA ELEKTRON TITUL TEKSHIRISH VA 41, 42, 43 RASM YUKLASH
 # -------------------------------------------------------------
-@dp.message(F.text == "📋 Faol Testlar Baza")
-async def show_active_tests_list(message: types.Message):
+@dp.message(F.text == "📋 Faol Testlar Baza", StateFilter("*"))
+async def show_active_tests_list(message: types.Message, state: FSMContext):
     uid = message.from_user.id
+    if uid not in ACTIVE_EXAM_SESSIONS:
+        await state.clear()
+
     if not await check_channel_subscription(uid):
         await prompt_subscription(message)
         return
@@ -1273,7 +1562,7 @@ async def show_active_tests_list(message: types.Message):
 
     await message.answer("\n".join(lines), parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
 
-@dp.message(F.text == "📲 Elektron Titul Tekshirish")
+@dp.message(F.text == "📲 Elektron Titul Tekshirish", StateFilter("*"))
 async def start_electronic_test_menu(message: types.Message, state: FSMContext):
     uid = message.from_user.id
     if not await check_channel_subscription(uid):
@@ -1362,7 +1651,7 @@ async def launch_electronic_exam(message: types.Message, user_id: int, state: FS
         reply_markup=kb
     )
 
-@dp.message(F.text == "📋 Elektron Titulni Qayta Ochish")
+@dp.message(F.text == "📋 Elektron Titulni Qayta Ochish", StateFilter("*"))
 async def reopen_electronic_sheet(message: types.Message, state: FSMContext):
     data = await state.get_data()
     test_code = data.get("active_test_code")
@@ -1602,7 +1891,6 @@ async def cb_finish_electronic_exam(callback: types.CallbackQuery, state: FSMCon
     )
     await callback.message.answer(report, parse_mode="HTML", reply_markup=main_menu(uid))
 
-    # Test yakunlangach darhol PDF va Post shaklida natijani chiqarish
     all_results = db_get_top_results(code, 100)
     post_text = generate_announcement_post(code, title, test_type, all_results, correct_keys)
     pdf_bytes = generate_test_results_pdf(code, title, test_type, all_results)
@@ -1642,9 +1930,12 @@ async def quick_text_fill_in_exam(message: types.Message, state: FSMContext):
 # -------------------------------------------------------------
 # TESTNI YAKUNLASH VA NATIJALARNI PDF + POST SHAKLIDA E'LON QILISH
 # -------------------------------------------------------------
-@dp.message(F.text == "📢 Testni Yakunlash (PDF + Post)")
-async def finish_and_announce_test_menu(message: types.Message):
+@dp.message(F.text == "📢 Testni Yakunlash (PDF + Post)", StateFilter("*"))
+async def finish_and_announce_test_menu(message: types.Message, state: FSMContext):
     uid = message.from_user.id
+    if uid not in ACTIVE_EXAM_SESSIONS:
+        await state.clear()
+
     if not await check_channel_subscription(uid):
         await prompt_subscription(message)
         return
@@ -1705,9 +1996,13 @@ async def cb_announce_test_results(callback: types.CallbackQuery):
 # -------------------------------------------------------------
 # REYTING VA NATIJALAR
 # -------------------------------------------------------------
-@dp.message(F.text == "🏆 Reyting & Natijalar")
-async def show_rating_menu(message: types.Message):
-    if not await check_channel_subscription(message.from_user.id):
+@dp.message(F.text == "🏆 Reyting & Natijalar", StateFilter("*"))
+async def show_rating_menu(message: types.Message, state: FSMContext):
+    uid = message.from_user.id
+    if uid not in ACTIVE_EXAM_SESSIONS:
+        await state.clear()
+
+    if not await check_channel_subscription(uid):
         await prompt_subscription(message)
         return
     recent = db_get_recent_tests(10)
@@ -1724,7 +2019,7 @@ async def show_rating_menu(message: types.Message):
 # -------------------------------------------------------------
 # AI MASALA YECHISH (MOCK TEST PAYTIDA QAT'IY BLOKLANADI!)
 # -------------------------------------------------------------
-@dp.message(F.text == "🤖 AI Masala Yechish (Rasm)")
+@dp.message(F.text == "🤖 AI Masala Yechish (Rasm)", StateFilter("*"))
 async def start_ai_solver(message: types.Message, state: FSMContext):
     uid = message.from_user.id
 
@@ -1776,8 +2071,10 @@ async def solve_photo(message: types.Message, state: FSMContext):
         await state.clear()
         await wait.edit_text(f"❌ Xato: {e}")
 
-@dp.message(F.text == "👨‍🏫 Ustoz & Bog'lanish")
-async def contact_info(message: types.Message):
+@dp.message(F.text == "👨‍🏫 Ustoz & Bog'lanish", StateFilter("*"))
+async def contact_info(message: types.Message, state: FSMContext):
+    if message.from_user.id not in ACTIVE_EXAM_SESSIONS:
+        await state.clear()
     await message.answer(
         f"📋 <b>Platforma:</b> TITUL Elektron Test Tizimi\n"
         f"👨‍🏫 <b>Ustoz:</b> Azizbek Ibrohimov\n"
@@ -1785,72 +2082,6 @@ async def contact_info(message: types.Message):
         f"📞 <b>Murojaat uchun:</b> {ADMIN_USERNAME}",
         parse_mode="HTML"
     )
-
-# -------------------------------------------------------------
-# ADMIN PANEL
-# -------------------------------------------------------------
-@dp.message(Command("admin"))
-@dp.message(F.text == "👑 Admin Boshqaruv Paneli")
-async def admin_panel(message: types.Message, state: FSMContext = None):
-    if message.from_user.id != ADMIN_ID:
-        return
-    if state:
-        await state.clear()
-    cur_key = get_gemini_api_key()
-    masked = f"{cur_key[:8]}..." if cur_key else "Kiritilmagan"
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔑 Gemini AI API Kalitni yangilash", callback_data="adm_set_gemini")],
-        [InlineKeyboardButton(text="📊 Bot Statistikasi", callback_data="adm_stats")],
-        [InlineKeyboardButton(text="🗑 Testni bazadan o'chirish", callback_data="adm_del")]
-    ])
-    await message.answer(
-        f"👑 <b>TITUL | ADMIN BOSHQARUV PANELI</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🔑 Joriy AI kalit: <code>{masked}</code>\n"
-        f"📝 Faol imtihon topshirayotganlar: <b>{len(ACTIVE_EXAM_SESSIONS)} kishi</b>",
-        parse_mode="HTML",
-        reply_markup=kb
-    )
-
-@dp.callback_query(F.data == "adm_set_gemini")
-async def adm_set_gemini_cb(callback: types.CallbackQuery, state: FSMContext):
-    if callback.from_user.id != ADMIN_ID:
-        return
-    await state.set_state(AdminPanel.waiting_gemini_key)
-    await callback.message.answer("🔑 Yangi <b>Gemini AI API kalitingizni</b> yuboring:", parse_mode="HTML")
-    await callback.answer()
-
-@dp.message(AdminPanel.waiting_gemini_key)
-async def save_gemini_key(message: types.Message, state: FSMContext):
-    new_key = (message.text or "").strip()
-    db_set_setting("gemini_api_key", new_key)
-    await state.clear()
-    await message.answer("✅ <b>Gemini AI API kaliti saqlandi!</b>", parse_mode="HTML", reply_markup=main_menu(ADMIN_ID))
-
-@dp.callback_query(F.data == "adm_stats")
-async def adm_stats(callback: types.CallbackQuery):
-    s = db_get_stats()
-    await callback.message.answer(
-        f"📊 <b>TITUL BOT STATISTIKASI:</b>\n"
-        f"👥 Foydalanuvchilar: <b>{s['users']} ta</b>\n"
-        f"🧪 Yaratilgan testlar: <b>{s['tests']} ta</b>\n"
-        f"📝 Topshirilgan natijalar: <b>{s['results']} ta</b>",
-        parse_mode="HTML"
-    )
-    await callback.answer()
-
-@dp.callback_query(F.data == "adm_del")
-async def adm_del(callback: types.CallbackQuery, state: FSMContext):
-    await state.set_state(AdminPanel.waiting_delete_code)
-    await callback.message.answer("🗑 O'chirmoqchi bo'lgan test kodini yuboring:")
-    await callback.answer()
-
-@dp.message(AdminPanel.waiting_delete_code)
-async def do_del(message: types.Message, state: FSMContext):
-    code = (message.text or "").strip().upper()
-    ok = db_delete_test(code)
-    await state.clear()
-    await message.answer(f"{'✅ Test o\'chirildi!' if ok else '❌ Bunday kodli test topilmadi.'}", reply_markup=main_menu(ADMIN_ID))
 
 # -------------------------------------------------------------
 # 24/7 WEB SERVER
