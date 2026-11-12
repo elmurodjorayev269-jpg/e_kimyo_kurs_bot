@@ -595,4 +595,4 @@ if __name__ == "__main__":
     threading.Thread(target=run_web, daemon=True).start()
     bot.remove_webhook()
     print("Bot ishga tushdi...")
-    bot.infinity_polling(skip_pending=True)
+    bot.infinity_polling(none_stop=True, interval=0, timeout=20)
