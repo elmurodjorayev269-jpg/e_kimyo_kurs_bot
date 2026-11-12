@@ -1,778 +1,742 @@
-import os
-import sqlite3
-import threading
+import asyncio
+import html
+import logging
+import re
 from datetime import datetime
-from flask import Flask
-import telebot
-from telebot.types import (
-    ReplyKeyboardMarkup, KeyboardButton,
-    InlineKeyboardMarkup, InlineKeyboardButton,
-    ReplyKeyboardRemove
-)
+from zoneinfo import ZoneInfo
+
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.client.default import DefaultBotProperties
+from aiogram.filters import Command, CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import (CallbackQuery, InlineKeyboardButton,
+                           InlineKeyboardMarkup, KeyboardButton, Message,
+                           ReplyKeyboardMarkup)
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+import aiosqlite
 
 # ================= SOZLAMALAR =================
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8636730483:AAFU8mRl0pH5AjmCASWETCNLy35q4lMpB-s")
-ADMIN_PAROL = "kimyo2026"  # Botda /admin kimyo2026 deb yozsangiz admin bo'lasiz
-KANAL_USER = "@kimyo_sertifkat_uchun"
-KARTA_RAQAM = "8600 0000 0000 0000"  # Karta raqamingizni keyin admin paneldan ham o'zgartirsa bo'ladi
-KARTA_EGASI = "Azizbek Ibrohimov"
+BOT_TOKEN = "8636730483:AAFPSG094HwEzScSHZ170hRD1_xNC6Au0tg"
+CARD_NUMBER = "9860350142097954"
+CARD_OWNER = "Azizbek Ibrohimov"
+TEST_QUESTIONS = 43
+ADMIN_IDS = set()  # birinchi /admin yozgan odam admin bo'ladi
+# ==============================================
 
-bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
-app = Flask(__name__)
+DB_PATH = "kurs.db"
 
-# Vaqtinchalik holatlarni saqlash (FSM)
-user_states = {}
-user_data = {}
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS users(
+    id INTEGER PRIMARY KEY, full_name TEXT, username TEXT,
+    joined TEXT DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS courses(
+    id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, price INTEGER, active INTEGER DEFAULT 1);
+CREATE TABLE IF NOT EXISTS enrollments(
+    id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, course_id INTEGER,
+    status TEXT DEFAULT 'pending', receipt TEXT, created TEXT DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS lessons(
+    id INTEGER PRIMARY KEY AUTOINCREMENT, course_id INTEGER, title TEXT,
+    content_chat INTEGER, content_msg INTEGER);
+CREATE TABLE IF NOT EXISTS homeworks(
+    id INTEGER PRIMARY KEY AUTOINCREMENT, course_id INTEGER, title TEXT,
+    description TEXT, deadline TEXT, reported INTEGER DEFAULT 0);
+CREATE TABLE IF NOT EXISTS submissions(
+    id INTEGER PRIMARY KEY AUTOINCREMENT, hw_id INTEGER, user_id INTEGER,
+    created TEXT DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS tests(
+    id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, answer_key TEXT, active INTEGER DEFAULT 1,
+    created TEXT DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS test_results(
+    id INTEGER PRIMARY KEY AUTOINCREMENT, test_id INTEGER, user_id INTEGER,
+    score INTEGER, total INTEGER, created TEXT DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(test_id, user_id));
+"""
 
-# ================= MA'LUMOTLAR BAZASI (SQLite) =================
-def init_db():
-    conn = sqlite3.connect("database.db")
-    c = conn.cursor()
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            full_name TEXT,
-            username TEXT,
-            phone TEXT DEFAULT '',
-            is_admin INTEGER DEFAULT 0,
-            joined_at TEXT
-        )
-    """)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS tests (
-            test_code INTEGER PRIMARY KEY AUTOINCREMENT,
-            test_type TEXT DEFAULT 'oddiy',
-            title TEXT,
-            answers TEXT,
-            created_at TEXT
-        )
-    """)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS results (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            full_name TEXT,
-            test_code INTEGER,
-            score INTEGER,
-            total INTEGER,
-            percent REAL,
-            checked_at TEXT
-        )
-    """)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS materials (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            title TEXT,
-            file_id TEXT,
-            file_type TEXT,
-            added_at TEXT
-        )
-    """)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value TEXT
-        )
-    """)
-    conn.commit()
-    conn.close()
 
-def get_setting(key, default=""):
-    conn = sqlite3.connect("database.db")
-    c = conn.cursor()
-    c.execute("SELECT value FROM settings WHERE key = ?", (key,))
-    row = c.fetchone()
-    conn.close()
-    return row[0] if row else default
+async def init():
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.executescript(SCHEMA)
+        await db.commit()
+    for r in await q("SELECT value FROM settings WHERE key='admin'"):
+        ADMIN_IDS.add(int(r["value"]))
 
-def set_setting(key, value):
-    conn = sqlite3.connect("database.db")
-    c = conn.cursor()
-    c.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value))
-    conn.commit()
-    conn.close()
 
-def db_add_user(user_id, full_name, username):
-    conn = sqlite3.connect("database.db")
-    c = conn.cursor()
-    c.execute(
-        "INSERT OR IGNORE INTO users (user_id, full_name, username, joined_at) VALUES (?, ?, ?, ?)",
-        (user_id, full_name, username or "", datetime.now().strftime("%Y-%m-%d %H:%M"))
-    )
-    conn.commit()
-    conn.close()
+async def q(sql, args=(), one=False, commit=False):
+    """commit=True -> lastrowid; one=True -> bitta qator yoki None; aks holda ro'yxat."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(sql, args)
+        if commit:
+            await db.commit()
+            return cur.lastrowid
+        rows = await cur.fetchall()
+        if one:
+            return rows[0] if rows else None
+        return rows
 
-def db_is_admin(user_id):
-    conn = sqlite3.connect("database.db")
-    c = conn.cursor()
-    c.execute("SELECT is_admin FROM users WHERE user_id = ?", (user_id,))
-    row = c.fetchone()
-    conn.close()
-    return bool(row and row[0] == 1)
 
-def db_set_admin(user_id):
-    conn = sqlite3.connect("database.db")
-    c = conn.cursor()
-    c.execute("UPDATE users SET is_admin = 1 WHERE user_id = ?", (user_id,))
-    conn.commit()
-    conn.close()
+TZ = ZoneInfo("Asia/Tashkent")
+esc = html.escape
 
-def db_get_admins():
-    conn = sqlite3.connect("database.db")
-    c = conn.cursor()
-    c.execute("SELECT user_id FROM users WHERE is_admin = 1")
-    rows = [r[0] for r in c.fetchall()]
-    conn.close()
-    return rows
+admin = Router()
+admin.message.filter(lambda m: m.from_user.id in ADMIN_IDS)
+admin.callback_query.filter(lambda c: c.from_user.id in ADMIN_IDS)
+student = Router()
 
-# ================= TUGMALAR (MENYULAR) =================
-def main_menu(user_id):
-    kb = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    kb.add(
-        KeyboardButton("📝 Test tekshirish"),
-        KeyboardButton("🏆 Test reytingi"),
-        KeyboardButton("✍️ Kursga yozilish"),
-        KeyboardButton("📚 Bepul darsliklar"),
-        KeyboardButton("ℹ️ Kurslar haqida"),
-        KeyboardButton("📞 Admin bilan aloqa")
-    )
-    if db_is_admin(user_id):
-        kb.add(KeyboardButton("⚙️ Admin Panel"))
-    return kb
 
-def admin_menu():
-    kb = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    kb.add(
-        KeyboardButton("➕ Yangi test yaratish"),
-        KeyboardButton("📋 Testlar roʻyxati"),
-        KeyboardButton("🗑 Testni oʻchirish"),
-        KeyboardButton("📥 Darslik (PDF/Video) qoʻshish"),
-        KeyboardButton("💳 Karta raqamni oʻzgartirish"),
-        KeyboardButton("📊 Statistika"),
-        KeyboardButton("📢 Hammaga xabar (Rassilka)"),
-        KeyboardButton("🔙 Asosiy menyu")
-    )
-    return kb
+# ───────────────────────── Holatlar ─────────────────────────
+class Pay(StatesGroup):
+    receipt = State()
 
-def cancel_kb():
-    kb = ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.add(KeyboardButton("❌ Bekor qilish"))
-    return kb
 
-# ================= /START VA /ADMIN =================
-@bot.message_handler(commands=['start'])
-def start_cmd(message):
-    uid = message.from_user.id
-    user_states.pop(uid, None)
-    db_add_user(uid, message.from_user.full_name, message.from_user.username)
-    
-    text = (
-        f"Assalomu alaykum, <b>{message.from_user.full_name}</b>! 👋\n\n"
-        f"🧪 <b>A+ Kimyo | Online Maktabi</b>ning rasmiy botiga xush kelibsiz!\n\n"
-        f"🔹 Diagnostik va Milliy sertifikat testlarini tekshiring\n"
-        f"🔹 Bepul PDF qoʻllanmalar va video-darslarni oling\n"
-        f"🔹 Maxsus onlayn kurslarimizga roʻyxatdan oʻting\n\n"
-        f"👇 Quyidagi menyudan kerakli boʻlimni tanlang:"
-    )
-    bot.send_message(uid, text, reply_markup=main_menu(uid))
+class Sub(StatesGroup):
+    work = State()
 
-@bot.message_handler(commands=['admin'])
-def admin_cmd(message):
-    uid = message.from_user.id
-    db_add_user(uid, message.from_user.full_name, message.from_user.username)
-    parts = message.text.split()
-    if len(parts) > 1 and parts[1] == ADMIN_PAROL:
-        db_set_admin(uid)
-        bot.send_message(uid, "✅ <b>Tabriklaymiz! Sizga Admin huquqi berildi.</b>", reply_markup=admin_menu())
-    elif db_is_admin(uid):
-        bot.send_message(uid, "⚙️ <b>Admin Panelga xush kelibsiz:</b>", reply_markup=admin_menu())
-    else:
-        bot.send_message(uid, "🔒 Admin boʻlish uchun parolni yozing:\n<code>/admin kimyo2026</code>")
 
-# ================= BEKOR QILISH VA ORQAGA =================
-@bot.message_handler(func=lambda m: m.text in ["❌ Bekor qilish", "🔙 Asosiy menyu"])
-def cancel_action(message):
-    uid = message.from_user.id
-    user_states.pop(uid, None)
-    bot.send_message(uid, "🏠 Asosiy menyu:", reply_markup=main_menu(uid))
+class TestS(StatesGroup):
+    answers = State()
 
-@bot.message_handler(func=lambda m: m.text == "⚙️ Admin Panel")
-def open_admin(message):
-    uid = message.from_user.id
-    if db_is_admin(uid):
-        user_states.pop(uid, None)
-        bot.send_message(uid, "⚙️ <b>Admin Panel:</b>", reply_markup=admin_menu())
 
-# ================= MA'LUMOT BO'LIMLARI =================
-@bot.message_handler(func=lambda m: m.text == "ℹ️ Kurslar haqida")
-def about_courses(message):
-    text = (
-        "🧪 <b>A+ KIMYO | ONLINE MAKTABI KURSLARI</b>\n\n"
-        "1️⃣ <b>Noldan Kimyo (Fundamental baza):</b>\n"
-        "• Kimyoni 0 dan boshlovchilar uchun maxsus tizimli darslar\n"
-        "• Har bir mavzu boʻyicha video-yechim va testlar\n\n"
-        "2️⃣ <b>Milliy Sertifikat va Attestatsiya guruhi:</b>\n"
-        "• Yuqori ball (A+, A, B) olish uchun intensiv tayyorlov\n"
-        "• Oʻqituvchilar va abituriyentlar uchun maxsus baza\n"
-        "• Har hafta diagnostik testlar va jonli tahlillar\n\n"
-        f"📢 <b>Rasmiy kanalimiz:</b> {KANAL_USER}\n"
-        "✍️ Roʻyxatdan oʻtish uchun <b>«✍️ Kursga yozilish»</b> tugmasini bosing!"
-    )
-    bot.send_message(message.chat.id, text)
+class AddCourse(StatesGroup):
+    title = State()
+    price = State()
 
-@bot.message_handler(func=lambda m: m.text == "📞 Admin bilan aloqa")
-def contact_admin(message):
-    text = (
-        "👨‍🏫 <b>Muallif va kurs rahbari:</b> Azizbek Ibrohimov\n\n"
-        f"📢 <b>Telegram kanal:</b> {KANAL_USER}\n"
-        "💬 Kurslar boʻyicha savollaringiz boʻlsa, kanalimiz orqali bogʻlanishingiz yoki toʻgʻridan-toʻgʻri bot orqali kursga yozilishingiz mumkin."
-    )
-    bot.send_message(message.chat.id, text)
 
-# ================= BEPUL DARSLIKLAR =================
-@bot.message_handler(func=lambda m: m.text == "📚 Bepul darsliklar")
-def show_materials(message):
-    conn = sqlite3.connect("database.db")
-    c = conn.cursor()
-    c.execute("SELECT id, title FROM materials ORDER BY id DESC LIMIT 20")
-    rows = c.fetchall()
-    conn.close()
+class AddLesson(StatesGroup):
+    title = State()
+    content = State()
 
-    if not rows:
-        return bot.send_message(
-            message.chat.id,
-            f"📂 Hozircha botga darsliklar yuklanmagan.\nBarcha yangi PDF va video darslarni kanalimizdan topishingiz mumkin: {KANAL_USER}"
-        )
 
-    kb = InlineKeyboardMarkup(row_width=1)
-    for r in rows:
-        kb.add(InlineKeyboardButton(f"📥 {r[1]}", callback_data=f"mat_{r[0]}"))
-    
-    bot.send_message(message.chat.id, "📚 <b>Yuklab olish uchun kerakli darslik ustiga bosing:</b>", reply_markup=kb)
+class AddHw(StatesGroup):
+    title = State()
+    desc = State()
+    deadline = State()
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith("mat_"))
-def send_material(call):
-    mat_id = int(call.data.split("_")[1])
-    conn = sqlite3.connect("database.db")
-    c = conn.cursor()
-    c.execute("SELECT title, file_id, file_type FROM materials WHERE id = ?", (mat_id,))
-    row = c.fetchone()
-    conn.close()
 
-    if not row:
-        return bot.answer_callback_query(call.id, "Fayl topilmadi!", show_alert=True)
+class AddTest(StatesGroup):
+    title = State()
+    key = State()
 
-    title, file_id, file_type = row
-    caption = f"📘 <b>{title}</b>\n\n📢 {KANAL_USER}"
-    if file_type == "document":
-        bot.send_document(call.message.chat.id, file_id, caption=caption)
-    elif file_type == "video":
-        bot.send_video(call.message.chat.id, file_id, caption=caption)
-    elif file_type == "photo":
-        bot.send_photo(call.message.chat.id, file_id, caption=caption)
-    bot.answer_callback_query(call.id)
 
-# ================= TEST TEKSHIRISH =================
-@bot.message_handler(func=lambda m: m.text == "📝 Test tekshirish")
-def ask_test_code(message):
-    uid = message.from_user.id
-    user_states[uid] = "wait_test_input"
-    text = (
-        "📝 <b>Testni tekshirish uchun:</b>\n\n"
-        "1️⃣ Yoki <b>Test kodini</b> yuboring (masalan: <code>1</code>)\n"
-        "2️⃣ Yoki <b>Kod*javoblar</b> koʻrinishida birdan yuboring (masalan: <code>1*abcdabcd...</code>)"
-    )
-    bot.send_message(uid, text, reply_markup=cancel_kb())
+class Broadcast(StatesGroup):
+    text = State()
 
-@bot.message_handler(func=lambda m: user_states.get(m.from_user.id) == "wait_test_input")
-def process_test_input(message):
-    uid = message.from_user.id
-    txt = message.text.strip()
 
-    # Agar 123*abcd formatda yuborsa
-    if "*" in txt:
-        parts = txt.split("*", 1)
-        if not parts[0].isdigit():
-            return bot.send_message(uid, "⚠️ Test kodi faqat raqam boʻlishi kerak! Masalan: <code>1*abcd</code>")
-        test_code = int(parts[0])
-        user_ans = parts[1].strip().lower()
-        evaluate_test(message, test_code, user_ans)
-    else:
-        if not txt.isdigit():
-            return bot.send_message(uid, "⚠️ Iltimos, test kodini raqam bilan kiriting!")
-        test_code = int(txt)
-        conn = sqlite3.connect("database.db")
-        c = conn.cursor()
-        c.execute("SELECT title, answers FROM tests WHERE test_code = ?", (test_code,))
-        row = c.fetchone()
-        conn.close()
+# ───────────────────────── Yordamchilar ─────────────────────────
+MENU = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="📚 Kurslar"), KeyboardButton(text="📖 Mening kurslarim")],
+        [KeyboardButton(text="📝 Vazifa topshirish"),
+         KeyboardButton(text=f"🧪 Test tekshirish ({TEST_QUESTIONS} talik)")],
+        [KeyboardButton(text="🏆 Reyting")],
+    ],
+    resize_keyboard=True,
+)
 
-        if not row:
-            return bot.send_message(uid, "❌ Bunday kodli test topilmadi! Kodni tekshirib qayta yozing:")
 
-        user_data[uid] = {"test_code": test_code}
-        user_states[uid] = "wait_test_answers"
-        bot.send_message(
-            uid,
-            f"📘 <b>Test:</b> {row[0]}\n"
-            f"❓ <b>Savollar soni:</b> {len(row[1])} ta\n\n"
-            f"✍️ Javoblaringizni ketma-ket harflar bilan yuboring (masalan: <code>abcdabcd...</code>):"
-        )
+def parse_answers(text: str) -> dict:
+    """'1a2b3c' yoki '1-a 2-b' yoki 'abcd...' formatlarini {raqam: harf} ga aylantiradi."""
+    t = text.lower()
+    pairs = re.findall(r"(\d+)\s*[-.):]?\s*([a-d])", t)
+    if pairs:
+        return {int(n): l for n, l in pairs}
+    return {i + 1: l for i, l in enumerate(re.findall(r"[a-d]", t))}
 
-@bot.message_handler(func=lambda m: user_states.get(m.from_user.id) == "wait_test_answers")
-def process_test_answers(message):
-    uid = message.from_user.id
-    test_code = user_data[uid]["test_code"]
-    user_ans = message.text.strip().lower()
-    evaluate_test(message, test_code, user_ans)
 
-def evaluate_test(message, test_code, user_ans):
-    uid = message.from_user.id
-    conn = sqlite3.connect("database.db")
-    c = conn.cursor()
-    c.execute("SELECT title, answers FROM tests WHERE test_code = ?", (test_code,))
-    row = c.fetchone()
+def name_of(u) -> str:
+    return esc(u.full_name or "Noma'lum")
 
-    if not row:
-        conn.close()
-        return bot.send_message(uid, "❌ Bunday kodli test topilmadi!")
 
-    title, correct_ans = row[0], row[1].lower()
-    if len(user_ans) != len(correct_ans):
-        conn.close()
-        return bot.send_message(
-            uid,
-            f"⚠️ <b>Javoblar soni mos kelmadi!</b>\n"
-            f"Testda <b>{len(correct_ans)} ta</b> savol bor, siz esa <b>{len(user_ans)} ta</b> belgi yubordingiz.\n"
-            f"Qaytadan toʻgʻri yozib yuboring:"
-        )
+async def has_access(user_id: int, course_id: int) -> bool:
+    r = await q("SELECT 1 FROM enrollments WHERE user_id=? AND course_id=? AND status='approved'",
+                (user_id, course_id), one=True)
+    return r is not None
 
-    score = 0
-    details = []
-    for i, (u, k) in enumerate(zip(user_ans, correct_ans), start=1):
-        if u == k:
-            score += 1
-            details.append(f"{i}. ✅")
-        else:
-            details.append(f"{i}. ❌ ({u.upper()})")
 
-    total = len(correct_ans)
-    percent = round((score / total) * 100, 1)
-
-    # Oldin ishlagan bo'lsa yangilamaslik yoki qo'shish
-    c.execute("SELECT id FROM results WHERE user_id = ? AND test_code = ?", (uid, test_code))
-    existing = c.fetchone()
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
-    if not existing:
-        c.execute(
-            "INSERT INTO results (user_id, full_name, test_code, score, total, percent, checked_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (uid, message.from_user.full_name, test_code, score, total, percent, now_str)
-        )
-        conn.commit()
-    conn.close()
-
-    user_states.pop(uid, None)
-    
-    # Darajani aniqlash
-    if percent >= 86:
-        daraja = "🏆 A+ / A daraja (Aʼlo!)"
-    elif percent >= 70:
-        daraja = "🥈 B+ / B daraja (Yaxshi!)"
-    elif percent >= 60:
-        daraja = "🥉 C+ / C daraja (Qoniqarli)"
-    else:
-        daraja = "📚 Yana koʻproq oʻqish kerak!"
-
-    # Natijani chiroyli Ustun ko'rinishida chiqarish
-    detail_text = " | ".join(details[:40])
-    res_msg = (
-        f"📊 <b>TEST NATIJANGIZ:</b>\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"👤 <b>Oʻquvchi:</b> {message.from_user.full_name}\n"
-        f"🔢 <b>Test kodi:</b> <code>{test_code}</code>\n"
-        f"📘 <b>Mavzu:</b> {title}\n"
-        f"✅ <b>Toʻgʻri javoblar:</b> {score} / {total} ta (<b>{percent}%</b>)\n"
-        f"🎖 <b>Koʻrsatkich:</b> {daraja}\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"🔍 <b>Tahlil:</b>\n{detail_text}\n\n"
-        f"📢 {KANAL_USER}"
-    )
-    bot.send_message(uid, res_msg, reply_markup=main_menu(uid))
-
-# ================= TEST REYTINGI =================
-@bot.message_handler(func=lambda m: m.text == "🏆 Test reytingi")
-def ask_rating_code(message):
-    uid = message.from_user.id
-    user_states[uid] = "wait_rating_code"
-    bot.send_message(uid, "🏆 Reytingni koʻrish uchun <b>Test kodini</b> kiriting:", reply_markup=cancel_kb())
-
-@bot.message_handler(func=lambda m: user_states.get(m.from_user.id) == "wait_rating_code")
-def show_test_rating(message):
-    uid = message.from_user.id
-    if not message.text.isdigit():
-        return bot.send_message(uid, "⚠️ Test kodini raqamda yozing!")
-    
-    code = int(message.text)
-    conn = sqlite3.connect("database.db")
-    c = conn.cursor()
-    c.execute("SELECT title FROM tests WHERE test_code = ?", (code,))
-    t_row = c.fetchone()
-    if not t_row:
-        conn.close()
-        return bot.send_message(uid, "❌ Bunday kodli test topilmadi!")
-
-    c.execute(
-        "SELECT full_name, score, total, percent FROM results WHERE test_code = ? ORDER BY score DESC, id ASC LIMIT 25",
-        (code,)
-    )
-    rows = c.fetchall()
-    conn.close()
-    user_states.pop(uid, None)
-
-    if not rows:
-        return bot.send_message(uid, "📭 Bu testni hali hech kim ishlamagan.", reply_markup=main_menu(uid))
-
-    medals = ["🥇", "🥈", "🥉"]
-    text = f"🏆 <b>TEST #{code} REYTINGI (TOP-25)</b>\n📘 <b>{t_row[0]}</b>\n━━━━━━━━━━━━━━━━━━\n"
-    for idx, r in enumerate(rows, start=1):
-        m = medals[idx - 1] if idx <= 3 else f"<b>{idx}.</b>"
-        text += f"{m} {r[0]} — <b>{r[1]}/{r[2]}</b> ({r[3]}%)\n"
-    
-    bot.send_message(uid, text, reply_markup=main_menu(uid))
-
-# ================= KURSGA YOZILISH VA TO'LOV =================
-@bot.message_handler(func=lambda m: m.text == "✍️ Kursga yozilish")
-def reg_step1(message):
-    uid = message.from_user.id
-    user_states[uid] = "reg_name"
-    bot.send_message(uid, "✍️ <b>Ism va familiyangizni kiriting:</b>", reply_markup=cancel_kb())
-
-@bot.message_handler(func=lambda m: user_states.get(m.from_user.id) == "reg_name")
-def reg_step2(message):
-    uid = message.from_user.id
-    user_data[uid] = {"ism": message.text}
-    user_states[uid] = "reg_phone"
-    
-    kb = ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.add(KeyboardButton("📱 Telefon raqamni yuborish", request_contact=True))
-    kb.add(KeyboardButton("❌ Bekor qilish"))
-    bot.send_message(uid, "📱 <b>Telefon raqamingizni yuboring</b> (pastdagi tugmani bosing yoki yozing):", reply_markup=kb)
-
-@bot.message_handler(content_types=['contact', 'text'], func=lambda m: user_states.get(m.from_user.id) == "reg_phone")
-def reg_step3(message):
-    uid = message.from_user.id
-    if message.text == "❌ Bekor qilish":
-        return cancel_action(message)
-    
-    phone = message.contact.phone_number if message.contact else message.text
-    user_data[uid]["phone"] = phone
-    user_states[uid] = "reg_receipt"
-
-    karta = get_setting("karta", KARTA_RAQAM)
-    egasi = get_setting("egasi", KARTA_EGASI)
-
-    text = (
-        f"💳 <b>Kurs uchun toʻlov rekvizitlari:</b>\n\n"
-        f"Karta: <code>{karta}</code>\n"
-        f"Egasi: <b>{egasi}</b>\n\n"
-        f"📸 Toʻlovni amalga oshirgach, <b>toʻlov cheki rasmini (skrinshotni)</b> shu yerga yuboring:"
-    )
-    bot.send_message(uid, text, reply_markup=cancel_kb())
-
-@bot.message_handler(content_types=['photo'], func=lambda m: user_states.get(m.from_user.id) == "reg_receipt")
-def reg_finish(message):
-    uid = message.from_user.id
-    info = user_data.get(uid, {})
-    photo_id = message.photo[-1].file_id
-    admins = db_get_admins()
-
-    kb = InlineKeyboardMarkup()
-    kb.add(
-        InlineKeyboardButton("✅ Tasdiqlash", callback_data=f"pay_ok_{uid}"),
-        InlineKeyboardButton("❌ Rad etish", callback_data=f"pay_no_{uid}")
-    )
-
-    caption = (
-        f"🆕 <b>YANGI KURS ARIZASI (TOʻLOV CHEKI)</b>\n\n"
-        f"👤 <b>Oʻquvchi:</b> {info.get('ism')}\n"
-        f"📞 <b>Tel:</b> {info.get('phone')}\n"
-        f"🔗 <b>Username:</b> @{message.from_user.username or 'yoq'}\n"
-        f"🆔 <b>ID:</b> <code>{uid}</code>"
-    )
-
-    for adm in admins:
+async def notify_admins(bot: Bot, text: str, **kw):
+    for a in ADMIN_IDS:
         try:
-            bot.send_photo(adm, photo_id, caption=caption, reply_markup=kb)
+            await bot.send_message(a, text, **kw)
+        except Exception as e:
+            logging.warning("Adminga yuborilmadi %s: %s", a, e)
+
+
+async def missing_students(hw):
+    return await q(
+        """SELECT u.id, u.full_name, u.username FROM enrollments e
+           JOIN users u ON u.id = e.user_id
+           WHERE e.course_id=? AND e.status='approved'
+             AND u.id NOT IN (SELECT user_id FROM submissions WHERE hw_id=?)""",
+        (hw["course_id"], hw["id"]))
+
+
+async def send_missing_report(bot: Bot, hw):
+    rows = await missing_students(hw)
+    if not rows:
+        await notify_admins(bot, f"✅ «{esc(hw['title'])}» vazifasini hamma topshirgan.")
+        return
+    lines = [f"❗ <b>{esc(hw['title'])}</b> — topshirmaganlar ({len(rows)} ta):"]
+    for r in rows:
+        un = f" @{r['username']}" if r["username"] else ""
+        lines.append(f"• {esc(r['full_name'] or '—')}{un}")
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="📩 Ularga eslatma yuborish", callback_data=f"remind:{hw['id']}")]])
+    await notify_admins(bot, "\n".join(lines[:60]), reply_markup=kb)
+
+
+async def deadline_job(bot: Bot):
+    now = datetime.now(TZ).strftime("%Y-%m-%d %H:%M")
+    for hw in await q("SELECT * FROM homeworks WHERE reported=0 AND deadline<=?", (now,)):
+        await send_missing_report(bot, hw)
+        await q("UPDATE homeworks SET reported=1 WHERE id=?", (hw["id"],), commit=True)
+
+
+# ───────────────────────── TALABA ─────────────────────────
+@student.message(CommandStart())
+async def start(m: Message, state: FSMContext):
+    await state.clear()
+    u = m.from_user
+    await q("INSERT OR IGNORE INTO users(id) VALUES(?)", (u.id,), commit=True)
+    await q("UPDATE users SET full_name=?, username=? WHERE id=?",
+            (u.full_name, u.username, u.id), commit=True)
+    await m.answer(f"Assalomu alaykum, <b>{esc(u.full_name)}</b>! 👋\nOnlayn kurs botiga xush kelibsiz.",
+                   reply_markup=MENU)
+
+
+@student.message(Command("admin"))
+async def claim_admin(m: Message):
+    if ADMIN_IDS:
+        return await m.answer("Bu buyruq faqat admin uchun.")
+    ADMIN_IDS.add(m.from_user.id)
+    await q("INSERT OR REPLACE INTO settings(key, value) VALUES('admin', ?)", (str(m.from_user.id),), commit=True)
+    await m.answer("✅ Siz admin bo'ldingiz! Panel:", reply_markup=admin_kb())
+
+
+@student.message(F.text == "📚 Kurslar")
+async def courses(m: Message, state: FSMContext):
+    await state.clear()
+    rows = await q("SELECT * FROM courses WHERE active=1")
+    if not rows:
+        return await m.answer("Hozircha kurslar yo'q.")
+    kb = InlineKeyboardBuilder()
+    for c in rows:
+        kb.button(text=f"{c['title']} — {c['price']:,} so'm".replace(",", " "), callback_data=f"course:{c['id']}")
+    kb.adjust(1)
+    await m.answer("Kursni tanlang:", reply_markup=kb.as_markup())
+
+
+@student.callback_query(F.data.startswith("course:"))
+async def course_info(c: CallbackQuery):
+    cid = int(c.data.split(":")[1])
+    course = await q("SELECT * FROM courses WHERE id=?", (cid,), one=True)
+    if not course:
+        return await c.answer("Kurs topilmadi", show_alert=True)
+    if await has_access(c.from_user.id, cid):
+        return await c.message.answer("✅ Bu kursga kirish ochiq. «📖 Mening kurslarim» bo'limiga o'ting.")
+    pend = await q("SELECT 1 FROM enrollments WHERE user_id=? AND course_id=? AND status='pending'",
+                   (c.from_user.id, cid), one=True)
+    if pend:
+        return await c.message.answer("⏳ Chekingiz tekshirilmoqda, biroz kuting.")
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="💳 To'lov qildim", callback_data=f"pay:{cid}")]])
+    await c.message.answer(
+        f"<b>{esc(course['title'])}</b>\nNarxi: <b>{course['price']:,}</b> so'm\n\n"
+        f"Quyidagi kartaga to'lang:\n💳 <code>{CARD_NUMBER}</code>\n👤 {esc(CARD_OWNER)}\n\n"
+        "To'lagach «To'lov qildim» tugmasini bosib, chek rasmini yuboring.".replace(",", " "),
+        reply_markup=kb)
+    await c.answer()
+
+
+@student.callback_query(F.data.startswith("pay:"))
+async def pay_start(c: CallbackQuery, state: FSMContext):
+    await state.set_state(Pay.receipt)
+    await state.update_data(course_id=int(c.data.split(":")[1]))
+    await c.message.answer("📸 To'lov chekining rasmini yuboring.")
+    await c.answer()
+
+
+@student.message(Pay.receipt, F.photo)
+async def pay_receipt(m: Message, state: FSMContext, bot: Bot):
+    data = await state.get_data()
+    course = await q("SELECT * FROM courses WHERE id=?", (data["course_id"],), one=True)
+    fid = m.photo[-1].file_id
+    eid = await q("INSERT INTO enrollments(user_id, course_id, receipt) VALUES(?,?,?)",
+                  (m.from_user.id, course["id"], fid), commit=True)
+    await state.clear()
+    await m.answer("✅ Chek qabul qilindi. Admin tasdiqlagach sizga xabar keladi.")
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Tasdiqlash", callback_data=f"payok:{eid}"),
+        InlineKeyboardButton(text="❌ Rad etish", callback_data=f"payno:{eid}")]])
+    un = f" @{m.from_user.username}" if m.from_user.username else ""
+    for a in ADMIN_IDS:
+        try:
+            await bot.send_photo(
+                a, fid, reply_markup=kb,
+                caption=f"💰 Yangi to'lov\n👤 {name_of(m.from_user)}{un}\n📚 {esc(course['title'])}\n"
+                        f"💵 {course['price']:,} so'm".replace(",", " "))
+        except Exception as e:
+            logging.warning("Chek adminga yuborilmadi: %s", e)
+
+
+@student.message(Pay.receipt)
+async def pay_not_photo(m: Message):
+    await m.answer("Iltimos, chek <b>rasmini</b> yuboring.")
+
+
+@student.message(F.text == "📖 Mening kurslarim")
+async def my_courses(m: Message, state: FSMContext):
+    await state.clear()
+    rows = await q("""SELECT c.id, c.title FROM enrollments e JOIN courses c ON c.id=e.course_id
+                      WHERE e.user_id=? AND e.status='approved'""", (m.from_user.id,))
+    if not rows:
+        return await m.answer("Sizda hali faol kurs yo'q. «📚 Kurslar» orqali sotib oling.")
+    kb = InlineKeyboardBuilder()
+    for c in rows:
+        kb.button(text=c["title"], callback_data=f"lessons:{c['id']}")
+    kb.adjust(1)
+    await m.answer("Kurslaringiz:", reply_markup=kb.as_markup())
+
+
+@student.callback_query(F.data.startswith("lessons:"))
+async def lessons_list(c: CallbackQuery):
+    cid = int(c.data.split(":")[1])
+    if not await has_access(c.from_user.id, cid):
+        return await c.answer("Ruxsat yo'q", show_alert=True)
+    rows = await q("SELECT * FROM lessons WHERE course_id=? ORDER BY id", (cid,))
+    if not rows:
+        await c.message.answer("Darslar hali qo'shilmagan.")
+    else:
+        kb = InlineKeyboardBuilder()
+        for i, l in enumerate(rows, 1):
+            kb.button(text=f"{i}. {l['title']}", callback_data=f"lesson:{l['id']}")
+        kb.adjust(1)
+        await c.message.answer("Darslar:", reply_markup=kb.as_markup())
+    await c.answer()
+
+
+@student.callback_query(F.data.startswith("lesson:"))
+async def lesson_send(c: CallbackQuery, bot: Bot):
+    l = await q("SELECT * FROM lessons WHERE id=?", (int(c.data.split(":")[1]),), one=True)
+    if not l or not await has_access(c.from_user.id, l["course_id"]):
+        return await c.answer("Ruxsat yo'q", show_alert=True)
+    await bot.copy_message(c.from_user.id, l["content_chat"], l["content_msg"])
+    await c.answer()
+
+
+# ── Vazifa topshirish ──
+@student.message(F.text == "📝 Vazifa topshirish")
+async def hw_list(m: Message, state: FSMContext):
+    await state.clear()
+    now = datetime.now(TZ).strftime("%Y-%m-%d %H:%M")
+    rows = await q(
+        """SELECT h.* FROM homeworks h JOIN enrollments e ON e.course_id=h.course_id
+           WHERE e.user_id=? AND e.status='approved' AND h.deadline>?
+             AND h.id NOT IN (SELECT hw_id FROM submissions WHERE user_id=?)
+           ORDER BY h.deadline""", (m.from_user.id, now, m.from_user.id))
+    if not rows:
+        return await m.answer("Topshirilishi kerak bo'lgan vazifa yo'q 🎉")
+    kb = InlineKeyboardBuilder()
+    for h in rows:
+        kb.button(text=f"{h['title']} (⏰ {h['deadline']})", callback_data=f"hw:{h['id']}")
+    kb.adjust(1)
+    await m.answer("Vazifani tanlang:", reply_markup=kb.as_markup())
+
+
+@student.callback_query(F.data.startswith("hw:"))
+async def hw_pick(c: CallbackQuery, state: FSMContext):
+    h = await q("SELECT * FROM homeworks WHERE id=?", (int(c.data.split(":")[1]),), one=True)
+    if not h or not await has_access(c.from_user.id, h["course_id"]):
+        return await c.answer("Ruxsat yo'q", show_alert=True)
+    await state.set_state(Sub.work)
+    await state.update_data(hw_id=h["id"])
+    await c.message.answer(f"<b>{esc(h['title'])}</b>\n{esc(h['description'] or '')}\n\n"
+                           "Ishingizni yuboring (matn, rasm yoki fayl):")
+    await c.answer()
+
+
+@student.message(Sub.work)
+async def hw_submit(m: Message, state: FSMContext, bot: Bot):
+    data = await state.get_data()
+    h = await q("SELECT * FROM homeworks WHERE id=?", (data["hw_id"],), one=True)
+    await q("INSERT INTO submissions(hw_id, user_id) VALUES(?,?)", (h["id"], m.from_user.id), commit=True)
+    await state.clear()
+    await m.answer("✅ Vazifa qabul qilindi. Rahmat!")
+    for a in ADMIN_IDS:
+        try:
+            await bot.send_message(a, f"📥 {name_of(m.from_user)} «{esc(h['title'])}» vazifasini topshirdi:")
+            await m.copy_to(a)
+        except Exception as e:
+            logging.warning("Vazifa adminga yuborilmadi: %s", e)
+
+
+# ── 43 talik test (alohida bo'lim) ──
+@student.message(F.text.startswith("🧪 Test tekshirish"))
+async def test_list(m: Message, state: FSMContext):
+    await state.clear()
+    rows = await q("SELECT * FROM tests WHERE active=1 ORDER BY id DESC")
+    if not rows:
+        return await m.answer("Hozircha faol test yo'q.")
+    kb = InlineKeyboardBuilder()
+    for t in rows:
+        kb.button(text=t["title"], callback_data=f"test:{t['id']}")
+    kb.adjust(1)
+    await m.answer(f"🧪 <b>Test tekshirish ({TEST_QUESTIONS} talik)</b>\nTestni tanlang:",
+                   reply_markup=kb.as_markup())
+
+
+@student.callback_query(F.data.startswith("test:"))
+async def test_pick(c: CallbackQuery, state: FSMContext):
+    tid = int(c.data.split(":")[1])
+    done = await q("SELECT * FROM test_results WHERE test_id=? AND user_id=?", (tid, c.from_user.id), one=True)
+    if done:
+        await c.message.answer(f"Siz bu testni topshirgansiz: <b>{done['score']}/{done['total']}</b>")
+        return await c.answer()
+    await state.set_state(TestS.answers)
+    await state.update_data(test_id=tid)
+    await c.message.answer(
+        f"{TEST_QUESTIONS} ta javobingizni yuboring (A, B, C, D).\n"
+        "Format: <code>1a2b3c4d...</code> yoki <code>abcd...</code>\n"
+        "Rasm yuborsangiz, admin qo'lda tekshiradi.")
+    await c.answer()
+
+
+@student.message(TestS.answers, F.photo)
+async def test_photo(m: Message, state: FSMContext, bot: Bot):
+    data = await state.get_data()
+    t = await q("SELECT * FROM tests WHERE id=?", (data["test_id"],), one=True)
+    await state.clear()
+    await m.answer("📸 Rasm adminga yuborildi, natija keyin aytiladi.")
+    for a in ADMIN_IDS:
+        try:
+            await bot.send_message(a, f"🧪 {name_of(m.from_user)} «{esc(t['title'])}» testi javob varaqasini yubordi:")
+            await m.copy_to(a)
+        except Exception as e:
+            logging.warning("Test rasmi adminga yuborilmadi: %s", e)
+
+
+@student.message(TestS.answers, F.text)
+async def test_check(m: Message, state: FSMContext):
+    data = await state.get_data()
+    t = await q("SELECT * FROM tests WHERE id=?", (data["test_id"],), one=True)
+    ans = parse_answers(m.text)
+    if len(ans) < TEST_QUESTIONS or any(i not in ans for i in range(1, TEST_QUESTIONS + 1)):
+        return await m.answer(f"❗ {TEST_QUESTIONS} ta javob kerak, siz {len(ans)} ta yubordingiz. Qayta yuboring.")
+    key = t["answer_key"]
+    wrong = [i for i in range(1, TEST_QUESTIONS + 1) if ans[i] != key[i - 1]]
+    score = TEST_QUESTIONS - len(wrong)
+    await q("INSERT OR IGNORE INTO test_results(test_id, user_id, score, total) VALUES(?,?,?,?)",
+            (t["id"], m.from_user.id, score, TEST_QUESTIONS), commit=True)
+    await state.clear()
+    text = f"✅ To'g'ri javoblar: <b>{score}/{TEST_QUESTIONS}</b>"
+    if wrong:
+        text += "\n❌ Xato savollar: " + ", ".join(map(str, wrong))
+    await m.answer(text)
+
+
+@student.message(F.text == "🏆 Reyting")
+async def rating(m: Message, state: FSMContext):
+    await state.clear()
+    t = await q("SELECT * FROM tests WHERE active=1 ORDER BY id DESC LIMIT 1", one=True)
+    if not t:
+        return await m.answer("Hozircha reyting yo'q.")
+    rows = await q("""SELECT u.full_name, r.score, r.total FROM test_results r JOIN users u ON u.id=r.user_id
+                      WHERE r.test_id=? ORDER BY r.score DESC, r.created LIMIT 15""", (t["id"],))
+    if not rows:
+        return await m.answer("Bu testni hali hech kim topshirmagan.")
+    medals = ["🥇", "🥈", "🥉"]
+    lines = [f"🏆 <b>{esc(t['title'])}</b> reytingi:"]
+    for i, r in enumerate(rows):
+        lines.append(f"{medals[i] if i < 3 else str(i + 1) + '.'} {esc(r['full_name'] or '—')} — {r['score']}/{r['total']}")
+    await m.answer("\n".join(lines))
+
+
+# ───────────────────────── ADMIN ─────────────────────────
+def admin_kb():
+    kb = InlineKeyboardBuilder()
+    for text, cb in [("➕ Kurs", "adm:course"), ("➕ Dars", "adm:lesson"), ("➕ Vazifa", "adm:hw"),
+                     (f"➕ Test ({TEST_QUESTIONS} talik)", "adm:test"), ("👥 Talabalar", "adm:students"),
+                     ("📊 Statistika", "adm:stats"), ("❗ Topshirmaganlar", "adm:missing"),
+                     ("📢 Xabar yuborish", "adm:bc")]:
+        kb.button(text=text, callback_data=cb)
+    kb.adjust(2)
+    return kb.as_markup()
+
+
+@admin.message(Command("admin"))
+async def admin_panel(m: Message, state: FSMContext):
+    await state.clear()
+    await m.answer("🛠 <b>Admin panel</b>", reply_markup=admin_kb())
+
+
+@admin.callback_query(F.data.startswith("payok:"))
+async def pay_ok(c: CallbackQuery, bot: Bot):
+    e = await q("SELECT * FROM enrollments WHERE id=?", (int(c.data.split(":")[1]),), one=True)
+    if not e or e["status"] != "pending":
+        return await c.answer("Allaqachon ko'rib chiqilgan", show_alert=True)
+    await q("UPDATE enrollments SET status='approved' WHERE id=?", (e["id"],), commit=True)
+    course = await q("SELECT * FROM courses WHERE id=?", (e["course_id"],), one=True)
+    await c.message.edit_caption(caption=(c.message.caption or "") + "\n\n✅ Tasdiqlandi", reply_markup=None)
+    try:
+        await bot.send_message(e["user_id"], f"✅ To'lovingiz tasdiqlandi! «{esc(course['title'])}» kursi ochildi.\n"
+                                             "«📖 Mening kurslarim» bo'limiga o'ting.")
+    except Exception:
+        pass
+    await c.answer("Tasdiqlandi")
+
+
+@admin.callback_query(F.data.startswith("payno:"))
+async def pay_no(c: CallbackQuery, bot: Bot):
+    e = await q("SELECT * FROM enrollments WHERE id=?", (int(c.data.split(":")[1]),), one=True)
+    if not e or e["status"] != "pending":
+        return await c.answer("Allaqachon ko'rib chiqilgan", show_alert=True)
+    await q("UPDATE enrollments SET status='rejected' WHERE id=?", (e["id"],), commit=True)
+    await c.message.edit_caption(caption=(c.message.caption or "") + "\n\n❌ Rad etildi", reply_markup=None)
+    try:
+        await bot.send_message(e["user_id"], "❌ To'lovingiz tasdiqlanmadi. Chekni tekshirib, qaytadan yuboring.")
+    except Exception:
+        pass
+    await c.answer("Rad etildi")
+
+
+async def courses_kb(prefix: str):
+    kb = InlineKeyboardBuilder()
+    for c in await q("SELECT * FROM courses WHERE active=1"):
+        kb.button(text=c["title"], callback_data=f"{prefix}:{c['id']}")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+# ── Kurs qo'shish ──
+@admin.callback_query(F.data == "adm:course")
+async def a_course(c: CallbackQuery, state: FSMContext):
+    await state.set_state(AddCourse.title)
+    await c.message.answer("Kurs nomini yozing:")
+    await c.answer()
+
+
+@admin.message(AddCourse.title, F.text)
+async def a_course_title(m: Message, state: FSMContext):
+    await state.update_data(title=m.text)
+    await state.set_state(AddCourse.price)
+    await m.answer("Narxini yozing (so'mda, faqat raqam):")
+
+
+@admin.message(AddCourse.price, F.text)
+async def a_course_price(m: Message, state: FSMContext):
+    digits = re.sub(r"\D", "", m.text)
+    if not digits:
+        return await m.answer("Faqat raqam yozing.")
+    d = await state.get_data()
+    await q("INSERT INTO courses(title, price) VALUES(?,?)", (d["title"], int(digits)), commit=True)
+    await state.clear()
+    await m.answer("✅ Kurs qo'shildi.", reply_markup=admin_kb())
+
+
+# ── Dars qo'shish ──
+@admin.callback_query(F.data == "adm:lesson")
+async def a_lesson(c: CallbackQuery):
+    await c.message.answer("Qaysi kursga dars qo'shamiz?", reply_markup=await courses_kb("lc"))
+    await c.answer()
+
+
+@admin.callback_query(F.data.startswith("lc:"))
+async def a_lesson_course(c: CallbackQuery, state: FSMContext):
+    await state.update_data(course_id=int(c.data.split(":")[1]))
+    await state.set_state(AddLesson.title)
+    await c.message.answer("Dars nomini yozing:")
+    await c.answer()
+
+
+@admin.message(AddLesson.title, F.text)
+async def a_lesson_title(m: Message, state: FSMContext):
+    await state.update_data(title=m.text)
+    await state.set_state(AddLesson.content)
+    await m.answer("Dars materialini yuboring (matn, video, fayl, rasm — hammasi mumkin):")
+
+
+@admin.message(AddLesson.content)
+async def a_lesson_content(m: Message, state: FSMContext):
+    d = await state.get_data()
+    await q("INSERT INTO lessons(course_id, title, content_chat, content_msg) VALUES(?,?,?,?)",
+            (d["course_id"], d["title"], m.chat.id, m.message_id), commit=True)
+    await state.clear()
+    await m.answer("✅ Dars qo'shildi. (Shu xabarni chatdan o'chirmang.)", reply_markup=admin_kb())
+
+
+# ── Vazifa qo'shish ──
+@admin.callback_query(F.data == "adm:hw")
+async def a_hw(c: CallbackQuery):
+    await c.message.answer("Qaysi kurs uchun vazifa?", reply_markup=await courses_kb("hc"))
+    await c.answer()
+
+
+@admin.callback_query(F.data.startswith("hc:"))
+async def a_hw_course(c: CallbackQuery, state: FSMContext):
+    await state.update_data(course_id=int(c.data.split(":")[1]))
+    await state.set_state(AddHw.title)
+    await c.message.answer("Vazifa nomini yozing:")
+    await c.answer()
+
+
+@admin.message(AddHw.title, F.text)
+async def a_hw_title(m: Message, state: FSMContext):
+    await state.update_data(title=m.text)
+    await state.set_state(AddHw.desc)
+    await m.answer("Vazifa tavsifini yozing:")
+
+
+@admin.message(AddHw.desc, F.text)
+async def a_hw_desc(m: Message, state: FSMContext):
+    await state.update_data(desc=m.text)
+    await state.set_state(AddHw.deadline)
+    await m.answer("Topshirish muddati (Toshkent vaqti): <code>2026-11-20 23:59</code>")
+
+
+@admin.message(AddHw.deadline, F.text)
+async def a_hw_deadline(m: Message, state: FSMContext, bot: Bot):
+    try:
+        dl = datetime.strptime(m.text.strip(), "%Y-%m-%d %H:%M").strftime("%Y-%m-%d %H:%M")
+    except ValueError:
+        return await m.answer("Format noto'g'ri. Misol: <code>2026-11-20 23:59</code>")
+    d = await state.get_data()
+    await q("INSERT INTO homeworks(course_id, title, description, deadline) VALUES(?,?,?,?)",
+            (d["course_id"], d["title"], d["desc"], dl), commit=True)
+    await state.clear()
+    await m.answer("✅ Vazifa qo'shildi. Talabalarga xabar yuborildi.", reply_markup=admin_kb())
+    for s in await q("SELECT user_id FROM enrollments WHERE course_id=? AND status='approved'", (d["course_id"],)):
+        try:
+            await bot.send_message(s["user_id"], f"📝 Yangi vazifa: <b>{esc(d['title'])}</b>\n⏰ Muddat: {dl}\n"
+                                                 "«📝 Vazifa topshirish» bo'limidan yuboring.")
         except Exception:
             pass
 
-    user_states.pop(uid, None)
-    bot.send_message(
-        uid,
-        "✅ <b>Toʻlov cheki qabul qilindi va adminga yuborildi!</b>\n"
-        "Tekshirib tasdiqlangach, sizga shu yerda xabar keladi.",
-        reply_markup=main_menu(uid)
-    )
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith("pay_"))
-def handle_payment_decision(call):
-    parts = call.data.split("_")
-    action, target_uid = parts[1], int(parts[2])
+# ── Test qo'shish (43 talik) ──
+@admin.callback_query(F.data == "adm:test")
+async def a_test(c: CallbackQuery, state: FSMContext):
+    await state.set_state(AddTest.title)
+    await c.message.answer("Test nomini yozing:")
+    await c.answer()
 
-    if action == "ok":
-        bot.send_message(
-            target_uid,
-            "🎉 <b>Tabriklaymiz! Toʻlovingiz tasdiqlandi.</b>\n"
-            "Tez orada ustoz sizni yopiq guruhga qoʻshadi yoki havola yuboradi!"
-        )
-        bot.edit_message_caption(
-            caption=call.message.caption + "\n\n✅ <b>TASDIQLANDI</b>",
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id
-        )
-        bot.answer_callback_query(call.id, "Tasdiqlandi!")
-    else:
-        bot.send_message(
-            target_uid,
-            "❌ <b>Toʻlov cheki tasdiqlanmadi.</b>\nIltimos, qaytadan tekshirib yuboring yoki adminga murojaat qiling."
-        )
-        bot.edit_message_caption(
-            caption=call.message.caption + "\n\n❌ <b>RAD ETILDI</b>",
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id
-        )
-        bot.answer_callback_query(call.id, "Rad etildi!")
 
-# ================= ADMIN PANEL FUNKSIYALARI =================
-# 1. Yangi test yaratish
-@bot.message_handler(func=lambda m: m.text == "➕ Yangi test yaratish")
-def adm_new_test(message):
-    uid = message.from_user.id
-    if not db_is_admin(uid):
-        return
-    user_states[uid] = "adm_test_title"
-    bot.send_message(uid, "📘 <b>Yangi test nomini (mavzusini) yozing:</b>", reply_markup=cancel_kb())
+@admin.message(AddTest.title, F.text)
+async def a_test_title(m: Message, state: FSMContext):
+    await state.update_data(title=m.text)
+    await state.set_state(AddTest.key)
+    await m.answer(f"{TEST_QUESTIONS} ta to'g'ri javob kalitini yuboring.\n"
+                   "Misol: <code>1a2b3c4d...</code> yoki <code>abcd...</code>")
 
-@bot.message_handler(func=lambda m: user_states.get(m.from_user.id) == "adm_test_title")
-def adm_new_test_keys(message):
-    uid = message.from_user.id
-    user_data[uid] = {"title": message.text}
-    user_states[uid] = "adm_test_keys"
-    bot.send_message(uid, "🔑 <b>Toʻgʻri javoblar kalitini ketma-ket yozing</b> (masalan: <code>abcdabcd...</code>):")
 
-@bot.message_handler(func=lambda m: user_states.get(m.from_user.id) == "adm_test_keys")
-def adm_save_test(message):
-    uid = message.from_user.id
-    keys = message.text.strip().lower().replace(" ", "")
-    title = user_data[uid]["title"]
+@admin.message(AddTest.key, F.text)
+async def a_test_key(m: Message, state: FSMContext):
+    ans = parse_answers(m.text)
+    if any(i not in ans for i in range(1, TEST_QUESTIONS + 1)):
+        return await m.answer(f"❗ {TEST_QUESTIONS} ta javob kerak, siz {len(ans)} ta yubordingiz.")
+    key = "".join(ans[i] for i in range(1, TEST_QUESTIONS + 1))
+    d = await state.get_data()
+    await q("INSERT INTO tests(title, answer_key) VALUES(?,?)", (d["title"], key), commit=True)
+    await state.clear()
+    await m.answer("✅ Test qo'shildi va faollashtirildi.", reply_markup=admin_kb())
 
-    conn = sqlite3.connect("database.db")
-    c = conn.cursor()
-    c.execute(
-        "INSERT INTO tests (title, answers, created_at) VALUES (?, ?, ?)",
-        (title, keys, datetime.now().strftime("%Y-%m-%d %H:%M"))
-    )
-    code = c.lastrowid
-    conn.commit()
-    conn.close()
 
-    user_states.pop(uid, None)
-    bot.send_message(
-        uid,
-        f"✅ <b>Yangi test bazaga saqlandi!</b>\n\n"
-        f"🔢 <b>Test kodi:</b> <code>{code}</code>\n"
-        f"📘 <b>Mavzu:</b> {title}\n"
-        f"❓ <b>Savollar soni:</b> {len(keys)} ta\n\n"
-        f"Oʻquvchilar <code>{code}*{keys[:4]}...</code> koʻrinishida yoki kodni kiritib tekshirishlari mumkin.",
-        reply_markup=admin_menu()
-    )
-
-# 2. Testlar ro'yxati
-@bot.message_handler(func=lambda m: m.text == "📋 Testlar roʻyxati")
-def adm_list_tests(message):
-    uid = message.from_user.id
-    if not db_is_admin(uid):
-        return
-    conn = sqlite3.connect("database.db")
-    c = conn.cursor()
-    c.execute("SELECT test_code, title, length(answers), created_at FROM tests ORDER BY test_code DESC LIMIT 15")
-    rows = c.fetchall()
-    conn.close()
-
+# ── Talabalar / statistika / topshirmaganlar / xabar ──
+@admin.callback_query(F.data == "adm:students")
+async def a_students(c: CallbackQuery):
+    rows = await q("""SELECT u.full_name, u.username, co.title FROM enrollments e
+                      JOIN users u ON u.id=e.user_id JOIN courses co ON co.id=e.course_id
+                      WHERE e.status='approved' ORDER BY e.id DESC LIMIT 50""")
     if not rows:
-        return bot.send_message(uid, "📭 Hozircha bazada testlar yoʻq.")
-
-    text = "📋 <b>Oxirgi 15 ta test:</b>\n\n"
-    for r in rows:
-        text += f"🔹 Kod: <code>{r[0]}</code> | <b>{r[1]}</b> ({r[2]} ta) — <i>{r[3]}</i>\n"
-    bot.send_message(uid, text)
-
-# 3. Testni o'chirish
-@bot.message_handler(func=lambda m: m.text == "🗑 Testni oʻchirish")
-def adm_del_test_ask(message):
-    uid = message.from_user.id
-    if not db_is_admin(uid):
-        return
-    user_states[uid] = "adm_del_test"
-    bot.send_message(uid, "🗑 Oʻchiriladigan <b>Test kodini</b> yozing:", reply_markup=cancel_kb())
-
-@bot.message_handler(func=lambda m: user_states.get(m.from_user.id) == "adm_del_test")
-def adm_del_test_confirm(message):
-    uid = message.from_user.id
-    if not message.text.isdigit():
-        return bot.send_message(uid, "⚠️ Faqat raqam yozing!")
-    code = int(message.text)
-    conn = sqlite3.connect("database.db")
-    c = conn.cursor()
-    c.execute("DELETE FROM tests WHERE test_code = ?", (code,))
-    deleted = c.rowcount
-    conn.commit()
-    conn.close()
-    user_states.pop(uid, None)
-    if deleted:
-        bot.send_message(uid, f"✅ Kod <code>{code}</code> boʻlgan test oʻchirildi!", reply_markup=admin_menu())
+        await c.message.answer("Hali tasdiqlangan talaba yo'q.")
     else:
-        bot.send_message(uid, "❌ Bunday kodli test topilmadi.", reply_markup=admin_menu())
+        lines = ["👥 <b>Oxirgi talabalar:</b>"]
+        for r in rows:
+            un = f" @{r['username']}" if r["username"] else ""
+            lines.append(f"• {esc(r['full_name'] or '—')}{un} — {esc(r['title'])}")
+        await c.message.answer("\n".join(lines))
+    await c.answer()
 
-# 4. Bepul darslik qo'shish
-@bot.message_handler(func=lambda m: m.text == "📥 Darslik (PDF/Video) qoʻshish")
-def adm_add_mat_start(message):
-    uid = message.from_user.id
-    if not db_is_admin(uid):
-        return
-    user_states[uid] = "adm_mat_title"
-    bot.send_message(uid, "📘 <b>Darslik yoki PDF qoʻllanma nomini yozing:</b>", reply_markup=cancel_kb())
 
-@bot.message_handler(func=lambda m: user_states.get(m.from_user.id) == "adm_mat_title")
-def adm_add_mat_file(message):
-    uid = message.from_user.id
-    user_data[uid] = {"mat_title": message.text}
-    user_states[uid] = "adm_mat_file"
-    bot.send_message(uid, "📎 Endi <b>PDF fayl, Video yoki Rasmni</b> yuboring:")
+@admin.callback_query(F.data == "adm:stats")
+async def a_stats(c: CallbackQuery):
+    async def n(sql):
+        return (await q(sql, one=True))[0]
+    users = await n("SELECT COUNT(*) FROM users")
+    active = await n("SELECT COUNT(*) FROM enrollments WHERE status='approved'")
+    pending = await n("SELECT COUNT(*) FROM enrollments WHERE status='pending'")
+    subs = await n("SELECT COUNT(*) FROM submissions")
+    results = await n("SELECT COUNT(*) FROM test_results")
+    await c.message.answer(
+        "📊 <b>Statistika</b>\n"
+        f"Foydalanuvchilar: {users}\n"
+        f"Faol talabalar: {active}\n"
+        f"Kutilayotgan to'lovlar: {pending}\n"
+        f"Topshirilgan vazifalar: {subs}\n"
+        f"Test natijalari: {results}")
+    await c.answer()
 
-@bot.message_handler(content_types=['document', 'video', 'photo'], func=lambda m: user_states.get(m.from_user.id) == "adm_mat_file")
-def adm_save_mat(message):
-    uid = message.from_user.id
-    title = user_data[uid]["mat_title"]
-    
-    if message.document:
-        file_id, ftype = message.document.file_id, "document"
-    elif message.video:
-        file_id, ftype = message.video.file_id, "video"
-    else:
-        file_id, ftype = message.photo[-1].file_id, "photo"
 
-    conn = sqlite3.connect("database.db")
-    c = conn.cursor()
-    c.execute(
-        "INSERT INTO materials (title, file_id, file_type, added_at) VALUES (?, ?, ?, ?)",
-        (title, file_id, ftype, datetime.now().strftime("%Y-%m-%d %H:%M"))
-    )
-    conn.commit()
-    conn.close()
+@admin.callback_query(F.data == "adm:missing")
+async def a_missing(c: CallbackQuery, bot: Bot):
+    hws = await q("SELECT * FROM homeworks ORDER BY id DESC LIMIT 5")
+    if not hws:
+        await c.message.answer("Vazifalar yo'q.")
+    for hw in hws:
+        await send_missing_report(bot, hw)
+    await c.answer()
 
-    user_states.pop(uid, None)
-    bot.send_message(uid, f"✅ <b>«{title}»</b> bepul darsliklar boʻlimiga qoʻshildi!", reply_markup=admin_menu())
 
-# 5. Karta raqamni o'zgartirish
-@bot.message_handler(func=lambda m: m.text == "💳 Karta raqamni oʻzgartirish")
-def adm_change_card(message):
-    uid = message.from_user.id
-    if not db_is_admin(uid):
-        return
-    user_states[uid] = "adm_card"
-    bot.send_message(
-        uid,
-        "💳 Yangi karta raqami va egasini quyidagicha yuboring:\n\n"
-        "<code>8600 1234 5678 9012 | Azizbek Ibrohimov</code>",
-        reply_markup=cancel_kb()
-    )
-
-@bot.message_handler(func=lambda m: user_states.get(m.from_user.id) == "adm_card")
-def adm_save_card(message):
-    uid = message.from_user.id
-    if "|" in message.text:
-        karta, egasi = [x.strip() for x in message.text.split("|", 1)]
-        set_setting("karta", karta)
-        set_setting("egasi", egasi)
-        user_states.pop(uid, None)
-        bot.send_message(uid, f"✅ Karta yangilandi:\n<code>{karta}</code> ({egasi})", reply_markup=admin_menu())
-    else:
-        bot.send_message(uid, "⚠️ Iltimos, oʻrtasiga <b>|</b> belgisini qoʻyib yozing!")
-
-# 6. Statistika
-@bot.message_handler(func=lambda m: m.text == "📊 Statistika")
-def adm_stats(message):
-    uid = message.from_user.id
-    if not db_is_admin(uid):
-        return
-    conn = sqlite3.connect("database.db")
-    c = conn.cursor()
-    c.execute("SELECT COUNT(*) FROM users")
-    u_cnt = c.fetchone()[0]
-    c.execute("SELECT COUNT(*) FROM tests")
-    t_cnt = c.fetchone()[0]
-    c.execute("SELECT COUNT(*) FROM results")
-    r_cnt = c.fetchone()[0]
-    c.execute("SELECT COUNT(*) FROM materials")
-    m_cnt = c.fetchone()[0]
-    conn.close()
-
-    text = (
-        f"📊 <b>BOT STATISTIKASI:</b>\n\n"
-        f"👥 Jami oʻquvchilar: <b>{u_cnt} ta</b>\n"
-        f"📘 Jami testlar: <b>{t_cnt} ta</b>\n"
-        f"✅ Tekshirilgan javoblar: <b>{r_cnt} marta</b>\n"
-        f"📂 Yuklangan darsliklar: <b>{m_cnt} ta</b>"
-    )
-    bot.send_message(uid, text)
-
-# 7. Hammaga xabar yuborish (Rassilka)
-@bot.message_handler(func=lambda m: m.text == "📢 Hammaga xabar (Rassilka)")
-def adm_broadcast_ask(message):
-    uid = message.from_user.id
-    if not db_is_admin(uid):
-        return
-    user_states[uid] = "adm_broadcast"
-    bot.send_message(uid, "📢 Barcha foydalanuvchilarga boradigan xabarni (matn, rasm, video yoki post) yuboring:", reply_markup=cancel_kb())
-
-@bot.message_handler(content_types=['text', 'photo', 'video', 'document'], func=lambda m: user_states.get(m.from_user.id) == "adm_broadcast")
-def adm_broadcast_send(message):
-    uid = message.from_user.id
-    if message.text == "❌ Bekor qilish":
-        return cancel_action(message)
-
-    conn = sqlite3.connect("database.db")
-    c = conn.cursor()
-    c.execute("SELECT user_id FROM users")
-    users = [r[0] for r in c.fetchall()]
-    conn.close()
-
-    user_states.pop(uid, None)
-    bot.send_message(uid, f"⏳ Xabar {len(users)} ta foydalanuvchiga yuborilmoqda...", reply_markup=admin_menu())
-
+@admin.callback_query(F.data.startswith("remind:"))
+async def a_remind(c: CallbackQuery, bot: Bot):
+    hw = await q("SELECT * FROM homeworks WHERE id=?", (int(c.data.split(":")[1]),), one=True)
     sent = 0
-    for u in users:
+    for s in await missing_students(hw):
         try:
-            bot.copy_message(u, message.chat.id, message.message_id)
+            await bot.send_message(s["id"], f"⏰ Eslatma: «{esc(hw['title'])}» vazifasi hali topshirilmagan!")
             sent += 1
         except Exception:
             pass
+    await c.answer(f"{sent} ta talabaga yuborildi", show_alert=True)
 
-    bot.send_message(uid, f"✅ Xabar <b>{sent}</b> ta oʻquvchiga muvaffaqiyatli yetkazildi!")
 
-# ================= RENDER UCHUN WEB-SERVER (24/7) =================
-@app.route("/")
-def index():
-    return "A+ Kimyo Bot 24/7 ishlamoqda!"
+@admin.callback_query(F.data == "adm:bc")
+async def a_bc(c: CallbackQuery, state: FSMContext):
+    await state.set_state(Broadcast.text)
+    await c.message.answer("Hammaga yuboriladigan xabarni yozing:")
+    await c.answer()
 
-def run_web():
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port)
+
+@admin.message(Broadcast.text)
+async def a_bc_send(m: Message, state: FSMContext, bot: Bot):
+    await state.clear()
+    ok = 0
+    for u in await q("SELECT id FROM users"):
+        try:
+            await m.copy_to(u["id"])
+            ok += 1
+            await asyncio.sleep(0.05)
+        except Exception:
+            pass
+    await m.answer(f"📢 {ok} ta foydalanuvchiga yuborildi.")
+
+
+# ───────────────────────── Ishga tushirish ─────────────────────────
+async def main():
+    logging.basicConfig(level=logging.INFO)
+    await init()
+    bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
+    dp = Dispatcher(storage=MemoryStorage())
+    dp.include_router(admin)
+    dp.include_router(student)
+    sched = AsyncIOScheduler(timezone=TZ)
+    sched.add_job(deadline_job, "interval", minutes=30, args=[bot])
+    sched.start()
+    await dp.start_polling(bot)
+
 
 if __name__ == "__main__":
-    init_db()
-    threading.Thread(target=run_web, daemon=True).start()
-    bot.remove_webhook()
-    print("Bot ishga tushdi...")
-    bot.infinity_polling(skip_pending=True)
+    asyncio.run(main())
