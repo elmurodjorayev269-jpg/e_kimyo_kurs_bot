@@ -6,7 +6,7 @@ from telebot.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMar
 BOT_TOKEN = "8636730483:AAGl0wHYP-ZBqaEA64EKUkzSlo1G3DDmkcI"
 ADMIN_PAROL = "kimyo2026"
 KANAL_USER = "@kimyo_sertifkat_uchun"
-KARTA_RAQAM = "8600 0000 0000 0000"
+KARTA_RAQAM = "9860350142097954"
 KARTA_EGASI = "Azizbek Ibrohimov"
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
