@@ -1,10 +1,10 @@
 import os
 import json
-import random
 import sqlite3
+import random
 import threading
 from datetime import datetime
-from flask import Flask, send_file
+from flask import Flask, send_file, render_template_string
 import telebot
 from telebot.types import (
     ReplyKeyboardMarkup, KeyboardButton,
@@ -14,11 +14,10 @@ from telebot.types import (
 
 # Hisobot va Sertifikat kutubxonalari
 import openpyxl
-from openpyxl.styles import Font, PatternFill, Alignment
 from docx import Document
 from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 # ================= SOZLAMALAR =================
 BOT_TOKEN = "8636730483:AAFCHNjwvmaLZuRk3fd3sOIbN2QMYd-h_4g"
@@ -37,26 +36,166 @@ app = Flask(__name__)
 user_states = {}
 user_data = {}
 
-# ================= KIMYOVIY VIKTORINA VA LUG'AT BAZASI =================
-QUIZ_QUESTIONS = [
-    {"q": "Sulfat kislotaning molekulyar formulasi qaysi?", "opts": ["H2SO4", "H2SO3", "H2S", "HNO3"], "ans": "H2SO4"},
-    {"q": "Kaliy permanganatning formulasi qaysi?", "opts": ["KMnO4", "K2MnO4", "MnO2", "KClO3"], "ans": "KMnO4"},
-    {"q": "Oltinning kimyoviy belgisi nima?", "opts": ["Au", "Ag", "Fe", "Cu"], "ans": "Au"},
-    {"q": "Avogadro doimiysi nechaga teng?", "opts": ["6.02×10²³", "22.4", "8.31", "1.6×10⁻¹⁹"], "ans": "6.02×10²³"},
-    {"q": "Eng yengil gaz qaysi?", "opts": ["Vodorod (H2)", "Geliy (He)", "Azot (N2)", "Kislorod (O2)"], "ans": "Vodorod (H2)"},
-    {"q": "Metanning formulasi qaysi?", "opts": ["CH4", "C2H6", "C2H4", "C2H2"], "ans": "CH4"},
-    {"q": "Normal sharoitda 1 mol gaz qancha hajm egallaydi?", "opts": ["22.4 L", "24.0 L", "11.2 L", "44.8 L"], "ans": "22.4 L"},
-    {"q": "Osh tuzining kimyoviy nomi nima?", "opts": ["Natriy xlorid", "Kaliy xlorid", "Natriy karbonat", "Kalsiy xlorid"], "ans": "Natriy xlorid"}
-]
+# ================= HTML INTERAKTIV TITR SHABLONI =================
+TITR_HTML = """
+<!DOCTYPE html>
+<html lang="uz">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>A+ Kimyo | Elektron Titr</title>
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+        body { background-color: #17212b; color: #ffffff; padding-bottom: 90px; }
+        .header { position: sticky; top: 0; background: #242f3d; padding: 12px 15px; z-index: 100; border-bottom: 1px solid #0e1621; display: flex; justify-content: space-between; align-items: center; }
+        .header h2 { font-size: 16px; color: #6ab3f3; }
+        .cols-header { display: grid; grid-template-columns: 45px repeat(4, 1fr); text-align: center; padding: 8px 10px; background: #1c2733; font-weight: bold; color: #8b9bb4; font-size: 14px; position: sticky; top: 45px; z-index: 99; }
+        .q-row { display: grid; grid-template-columns: 45px repeat(4, 1fr); align-items: center; padding: 6px 10px; border-bottom: 1px solid #202b36; }
+        .q-num { font-weight: bold; color: #8b9bb4; text-align: center; font-size: 15px; }
+        .opt-btn { width: 42px; height: 42px; border-radius: 50%; border: 2px solid #3d4d5d; background: #242f3d; color: #fff; font-weight: bold; font-size: 15px; margin: 0 auto; display: flex; align-items: center; justify-content: center; cursor: pointer; transition: 0.15s; }
+        .opt-btn.active { background: #3390ec; border-color: #3390ec; box-shadow: 0 0 10px rgba(51, 144, 236, 0.5); }
+        .match-row { padding: 10px 15px; border-bottom: 1px solid #202b36; }
+        .match-grid { display: grid; grid-template-columns: repeat(6, 1fr); gap: 6px; margin-top: 8px; }
+        .match-btn { height: 38px; border-radius: 8px; border: 1px solid #3d4d5d; background: #242f3d; color: #fff; font-weight: bold; cursor: pointer; }
+        .match-btn.active { background: #3390ec; border-color: #3390ec; }
+        .open-row { padding: 12px 15px; border-bottom: 1px solid #202b36; display: flex; align-items: center; gap: 12px; }
+        .open-row label { font-weight: bold; color: #8b9bb4; min-width: 75px; }
+        .open-row input { flex: 1; padding: 10px 12px; border-radius: 8px; border: 1px solid #3d4d5d; background: #242f3d; color: #fff; font-size: 15px; outline: none; }
+        .open-row input:focus { border-color: #3390ec; }
+        .section-title { background: #0e1621; padding: 10px 15px; font-size: 13px; color: #6ab3f3; text-transform: uppercase; letter-spacing: 0.5px; font-weight: bold; }
+        .footer { position: fixed; bottom: 0; left: 0; right: 0; background: #242f3d; padding: 12px 15px; border-top: 1px solid #0e1621; }
+        .submit-btn { width: 100%; padding: 13px; background: #3390ec; color: #fff; border: none; border-radius: 10px; font-size: 16px; font-weight: bold; cursor: pointer; }
+        .code-box { padding: 12px 15px; background: #242f3d; margin: 10px; border-radius: 10px; }
+        .code-box input { width: 100%; padding: 10px; margin-top: 6px; border-radius: 8px; border: 1px solid #3d4d5d; background: #17212b; color: #fff; font-size: 16px; }
+    </style>
+</head>
+<body>
 
-CHEM_DICT = {
-    "kmno4": "🧪 <b>Kaliy permanganat (KMnO₄)</b>\nToʻq binafsha rangli kristall modda, kuchli oksidlovchi.\n• Kislotali muhitda: Mn⁺⁷ → Mn²⁺ (rangsiz eritma)\n• Neytral muhitda: Mn⁺⁷ → MnO₂ (qoʻngʻir choʻkma)\n• Ishqoriy muhitda: Mn⁺⁷ → MnO₄²⁻ (yashil eritma)",
-    "h2so4": "🧪 <b>Sulfat kislota (H₂SO₄)</b>\nKuchli ikki negizli mineral kislota. Konsentrlangan H₂SO₄ kuchli oksidlovchi va gigroskopik (suv tortuvchi) xossaga ega.",
-    "hno3": "🧪 <b>Nitrat kislota (HNO₃)</b>\nKuchli bir negizli kislota. Har qanday konsentratsiyada kuchli oksidlovchi (odatda H₂ gazi ajralmaydi).",
-    "caco3": "🧪 <b>Kalsiy karbonat (CaCO₃)</b>\nTabiatda ohaktosh, marmar va boʻr holida uchraydi. Suvda erimaydi. Qizdirilganda CaO va CO₂ ga parchalanadi.",
-    "nh3": "🧪 <b>Ammiak (NH₃)</b>\nOʻtkir hidli, suvda juda yaxshi eriydigan gaz. Suvdagi eritmasi kuchsiz asos (NH₄OH) xossasini namoyon qiladi.",
-    "naoh": "🧪 <b>Natriy gidroksid (NaOH)</b>\nOʻyuvchi natriy — kuchli ishqor, suvda yaxshi eriydi, havodan namlik va CO₂ ni yutadi."
-}
+<div class="header">
+    <h2 id="page-title">A+ Kimyo | 40 talik Titr</h2>
+    <span id="counter" style="font-size: 13px; color: #8b9bb4;">0 / 40</span>
+</div>
+
+<div class="code-box">
+    <label id="code-label" style="font-size: 13px; color: #8b9bb4;">Test kodini kiriting:</label>
+    <input type="text" id="test-meta" placeholder="6 xonali kod, masalan: 492815">
+</div>
+
+<div class="section-title">1–32: Yopiq testlar (A, B, C, D)</div>
+<div class="cols-header">
+    <div>№</div><div>A</div><div>B</div><div>C</div><div>D</div>
+</div>
+<div id="closed-questions"></div>
+
+<div class="section-title">33–35: Moslashtirish (A – F)</div>
+<div id="matching-questions"></div>
+
+<div class="section-title">36–40: Ochiq savollar (Bitta javob kiriting)</div>
+<div id="open-questions"></div>
+
+<div class="footer">
+    <button class="submit-btn" onclick="submitTitr()">✅ Javoblarni yuborish</button>
+</div>
+
+<script>
+    const tg = window.Telegram.WebApp;
+    tg.expand();
+
+    const urlParams = new URLSearchParams(window.location.search);
+    const mode = urlParams.get('mode') || 'solve';
+
+    if (mode === 'create') {
+        document.getElementById('page-title').innerText = "➕ Yangi 40 talik Test Yaratish";
+        document.getElementById('code-label').innerText = "Test nomini kiriting:";
+        document.getElementById('test-meta').placeholder = "Masalan: Milliy Sertifikat #1";
+    }
+
+    const answers = new Array(40).fill("");
+
+    function updateCounter() {
+        const filled = answers.filter(x => x !== "").length;
+        document.getElementById('counter').innerText = `${filled} / 40`;
+    }
+
+    // 1-32
+    const closedDiv = document.getElementById('closed-questions');
+    for (let i = 0; i < 32; i++) {
+        const row = document.createElement('div');
+        row.className = 'q-row';
+        row.innerHTML = `<div class="q-num">${i + 1}</div>`;
+        ['A', 'B', 'C', 'D'].forEach(opt => {
+            const btn = document.createElement('div');
+            btn.className = 'opt-btn';
+            btn.innerText = opt;
+            btn.onclick = () => {
+                row.querySelectorAll('.opt-btn').forEach(b => b.classList.remove('active'));
+                btn.classList.add('active');
+                answers[i] = opt.toLowerCase();
+                updateCounter();
+            };
+            row.appendChild(btn);
+        });
+        closedDiv.appendChild(row);
+    }
+
+    // 33-35
+    const matchDiv = document.getElementById('matching-questions');
+    for (let i = 32; i < 35; i++) {
+        const row = document.createElement('div');
+        row.className = 'match-row';
+        row.innerHTML = `<div style="font-weight:bold; color:#8b9bb4;">${i + 1}-savol javobi:</div>`;
+        const grid = document.createElement('div');
+        grid.className = 'match-grid';
+        ['A', 'B', 'C', 'D', 'E', 'F'].forEach(opt => {
+            const btn = document.createElement('button');
+            btn.className = 'match-btn';
+            btn.innerText = opt;
+            btn.onclick = () => {
+                grid.querySelectorAll('.match-btn').forEach(b => b.classList.remove('active'));
+                btn.classList.add('active');
+                answers[i] = opt.toLowerCase();
+                updateCounter();
+            };
+            grid.appendChild(btn);
+        });
+        row.appendChild(grid);
+        matchDiv.appendChild(row);
+    }
+
+    // 36-40
+    const openDiv = document.getElementById('open-questions');
+    for (let i = 35; i < 40; i++) {
+        const row = document.createElement('div');
+        row.className = 'open-row';
+        row.innerHTML = `
+            <label>${i + 1}-savol:</label>
+            <input type="text" id="q_${i}" placeholder="Javobni yozing..." oninput="updateOpen(${i})">
+        `;
+        openDiv.appendChild(row);
+    }
+
+    function updateOpen(idx) {
+        answers[idx] = document.getElementById(`q_${idx}`).value.trim().toLowerCase();
+        updateCounter();
+    }
+
+    function submitTitr() {
+        const meta = document.getElementById('test-meta').value.trim();
+        if (!meta) {
+            alert(mode === 'create' ? "Test nomini kiriting!" : "Test kodini kiriting!");
+            return;
+        }
+        tg.sendData(JSON.stringify({
+            mode: mode,
+            meta: meta,
+            answers: answers
+        }));
+    }
+</script>
+</body>
+</html>
+"""
 
 # ================= MAJBURIY OBUNA =================
 def check_subscription(user_id):
@@ -99,7 +238,7 @@ def init_db():
         """)
         c.execute("""
             CREATE TABLE IF NOT EXISTS tests (
-                test_code INTEGER PRIMARY KEY AUTOINCREMENT,
+                test_code INTEGER PRIMARY KEY,
                 title TEXT,
                 answers TEXT,
                 created_at TEXT
@@ -168,37 +307,112 @@ def db_get_admins():
         c.execute("SELECT user_id FROM users WHERE is_admin = 1")
         return [r[0] for r in c.fetchall()]
 
-# ================= AVTOMATIK SERTIFIKAT GENERATORI =================
-def generate_certificate_image(full_name, test_title, score, level):
-    filename = f"cert_{random.randint(1000,9999)}.png"
-    W, H = 1000, 700
-    img = Image.new("RGB", (W, H), color=(18, 28, 45))
+# ================= BMBA (DTM) SERTIFIKAT GENERATORI =================
+def generate_bmba_certificate(full_name, score, percent, level, photo_path):
+    cert_path = f"bmba_cert_{random.randint(1000, 9999)}.png"
+    W, H = 842, 1191  # A4 o'lchamlari 96 DPI uchun
+    
+    # Oq qog'oz foni
+    img = Image.new("RGB", (W, H), color="white")
     draw = ImageDraw.Draw(img)
-
-    # Oltin ramka
-    draw.rectangle([25, 25, W - 25, H - 25], outline=(212, 175, 55), width=8)
-    draw.rectangle([40, 40, W - 40, H - 40], outline=(106, 179, 243), width=2)
-
-    font_lg = ImageFont.load_default()
     
-    # Matnlarni markazga joylash (Pillow default shrift o'lchami bilan)
-    draw.text((340, 80), "A+ KIMYO | ONLINE MAKTABI", fill=(212, 175, 55))
-    draw.text((390, 140), "MAXSUS SERTIFIKAT", fill=(255, 255, 255))
-    draw.text((330, 210), "Ushbu sertifikat egasi:", fill=(180, 195, 210))
+    # Milliy va professional chegaralar (Skrinshotdagidek)
+    draw.rectangle([15, 15, W - 15, H - 15], outline="#1a1a1a", width=3)
+    draw.line([30, 195, W - 30, 195], fill="#0a0a0a", width=2)
     
-    # O'quvchi ismi
-    draw.text((320, 260), full_name.upper(), fill=(106, 179, 243))
+    # Gerb virtual o'rni
+    draw.ellipse([386, 35, 456, 105], outline="#1b5e20", width=3)
+    draw.ellipse([391, 40, 451, 100], fill="#0d47a1")
     
-    draw.text((280, 330), f"Sinov nomi: {test_title}", fill=(255, 255, 255))
-    draw.text((320, 380), f"To'plagan natijasi: {score} ball", fill=(46, 204, 113))
-    draw.text((320, 430), f"Darajasi: {level}", fill=(241, 196, 15))
+    font_normal = ImageFont.load_default()
+    
+    # Yuqori idoralar (Markazlashtirilgan)
+    draw.text((150, 120), "O'ZBEKISTON RESPUBLIKASI OLIY TA'LIM, FAN VA INNOVATSIYALAR VAZIRLIGI", fill="black")
+    draw.text((195, 138), "HUZURIDAGI BILIM VA MALAKALARNI BAHOLASH AGENTLIGI", fill="black")
+    
+    # To'g'risida sertifikat
+    draw.text((220, 210), "UMUMTA'LIM FANINI BILISH DARAJASI TO'G'RISIDA", fill="black")
+    draw.text((360, 230), "SERTIFIKAT", fill="black")
+    
+    # Random Sertifikat raqami (UZ26 + 6 xonali)
+    cert_num = f"UZ26 {random.randint(100000, 999999)}"
+    draw.text((50, 280), "Sertifikat raqami:")
+    draw.text((180, 280), cert_num)
+    draw.line([30, 310, W - 30, 310], fill="#cccccc", width=1)
+    
+    # Shaxsiy Ma'lumotlar sathlari
+    user_code = str(random.randint(1000000, 9999999))
+    draw.text((50, 330), "Talabgoringiz shaxsiy kodi:")
+    draw.text((260, 330), user_code)
+    
+    name_parts = full_name.split()
+    f_name = name_parts[0].upper() if len(name_parts) > 0 else "FOZILOV"
+    i_name = name_parts[1].upper() if len(name_parts) > 1 else "SHOXRUX"
+    o_name = (name_parts[2].upper() + " O'G'LI") if len(name_parts) > 2 else "SHAVKAT O'G'LI"
+    
+    draw.text((50, 365), "Familiyasi:")
+    draw.text((200, 365), f_name)
+    
+    draw.text((50, 395), "Ismi:")
+    draw.text((200, 395), i_name)
+    
+    draw.text((50, 425), "Otasining ismi:")
+    draw.text((200, 425), o_name)
+    
+    draw.line([30, 460, W - 30, 460], fill="#cccccc", width=1)
+    
+    # O'quvchi rasmini o'ng tomonga kesib, chiroyli joylashtirish
+    try:
+        user_img = Image.open(photo_path)
+        user_img = ImageOps.fit(user_img, (130, 160)) 
+        img.paste(user_img, (650, 330))
+        draw.rectangle([650, 330, 780, 490], outline="#cccccc", width=1)
+    except Exception:
+        draw.rectangle([650, 330, 780, 490], outline="red", width=1)
+        draw.text((670, 400), "Rasmda xato", fill="red")
 
-    draw.text((120, 560), f"Sana: {datetime.now().strftime('%d.%m.%Y')}", fill=(180, 195, 210))
-    draw.text((620, 560), "Kurs rahbari: Azizbek Ibrohimov", fill=(212, 175, 55))
-    draw.text((380, 620), "Telegram: @kimyo_sertifkat_uchun", fill=(140, 155, 175))
-
-    img.save(filename)
-    return filename
+    # Ball va Daraja
+    draw.text((50, 480), "Umumta'lim fani:")
+    draw.text((380, 480), "Kimyo (O'zbekiston)")
+    
+    draw.text((50, 510), "Umumiy to'plagan ball (Rash shkalasi):")
+    draw.text((380, 510), f"{score}")
+    
+    draw.text((50, 540), "Umumiy ballga nisbatan foiz ko'rsatkichi:")
+    draw.text((380, 540), f"{percent} %")
+    
+    draw.text((50, 570), "Sertifikat darajasi:")
+    draw.text((380, 570), level)
+    
+    draw.line([30, 610, W - 30, 610], fill="#cccccc", width=1)
+    
+    # Natijalar tarkibi
+    t_test = round(score * 0.72, 2)
+    t_yozma = round(score * 0.28, 2)
+    draw.text((50, 630), "Test sinovi natijasi:")
+    draw.text((650, 630), f"{t_test}")
+    
+    draw.text((50, 660), "Yozma ish natijasi:")
+    draw.text((650, 660), f"{t_yozma}")
+    
+    # Muddati (Amal qilish)
+    s_sana = datetime.now().strftime("%d.%m.%Y")
+    m_sana = (datetime.now().replace(year=datetime.now().year + 3)).strftime("%d.%m.%Y")
+    
+    draw.line([30, 850, W - 30, 850], fill="#0a0a0a", width=1)
+    draw.text((50, 880), f"Berilgan sanasi: {s_sana}")
+    draw.text((450, 880), f"Amal qilish muddati: {m_sana}")
+    
+    # Direktor va QR kod virtual o'rni
+    draw.rectangle([340, 920, 440, 1020], fill="black")
+    draw.rectangle([350, 930, 430, 1010], fill="white")
+    draw.rectangle([375, 955, 405, 985], fill="black")
+    
+    draw.text((200, 960), "Direktor")
+    draw.text((500, 960), "M.KARIMOV")
+    
+    img.save(cert_path)
+    return cert_path
 
 # ================= MENYULAR =================
 def main_menu(user_id):
@@ -263,7 +477,6 @@ def start_cmd(message):
     uid = message.from_user.id
     user_states.pop(uid, None)
     
-    # Referal ID ni tekshirish (/start 123456)
     parts = message.text.split()
     ref_id = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
     db_add_user(uid, message.from_user.full_name, message.from_user.username, ref_id)
@@ -362,12 +575,20 @@ def referral_link(message):
     )
     bot.send_message(uid, text)
 
-# ================= KIMYOVIY VIKTORINA (O'YIN) =================
+# ================= KIMYOVIY VIKTORINA =================
 @bot.message_handler(func=lambda m: m.text == "🎮 Kimyo Viktorina")
 def start_quiz(message):
     uid = message.from_user.id
     if not check_subscription(uid): return ask_to_subscribe(uid)
-    q_obj = random.choice(QUIZ_QUESTIONS)
+    
+    q_obj = random.choice([
+        {"q": "Sulfat kislotaning molekulyar formulasi qaysi?", "opts": ["H2SO4", "H2SO3", "H2S", "HNO3"], "ans": "H2SO4"},
+        {"q": "Kaliy permanganatning formulasi qaysi?", "opts": ["KMnO4", "K2MnO4", "MnO2", "KClO3"], "ans": "KMnO4"},
+        {"q": "Oltinning kimyoviy belgisi nima?", "opts": ["Au", "Ag", "Fe", "Cu"], "ans": "Au"},
+        {"q": "Avogadro doimiysi nechaga teng?", "opts": ["6.02×10²³", "22.4", "8.31", "1.6×10⁻¹⁹"], "ans": "6.02×10²³"},
+        {"q": "Eng yengil gaz qaysi?", "opts": ["Vodorod (H2)", "Geliy (He)", "Azot (N2)", "Kislorod (O2)"], "ans": "Vodorod (H2)"},
+        {"q": "Metanning formulasi qaysi?", "opts": ["CH4", "C2H6", "C2H4", "C2H2"], "ans": "CH4"}
+    ])
     opts = q_obj["opts"].copy()
     random.shuffle(opts)
     
@@ -383,9 +604,6 @@ def check_quiz(call):
     chosen = call.data.split("_", 1)[1]
     correct = user_data.get(uid, {}).get("quiz_ans")
 
-    if not correct:
-        return bot.answer_callback_query(call.id, "Savol eskirgan!")
-
     if chosen == correct:
         with sqlite3.connect("database.db") as conn:
             c = conn.cursor()
@@ -397,7 +615,7 @@ def check_quiz(call):
         )
     else:
         bot.edit_message_text(
-            f"❌ <b>Xato!</b> Siz tanladingiz: {chosen}\n✅ Toʻgʻri javob: <b>{correct}</b>",
+            f"❌ <b>Xato!</b>\n✅ Toʻgʻri javob: <b>{correct}</b>",
             call.message.chat.id, call.message.message_id
         )
     user_data.pop(uid, None)
@@ -411,7 +629,7 @@ def ask_dict_word(message):
     user_states[uid] = "wait_chem_word"
     bot.send_message(
         uid,
-        "📖 <b>Kimyoviy modda formulasini yozing</b> (masalan: <code>KMnO4</code>, <code>H2SO4</code>, <code>HNO3</code>, <code>CaCO3</code>, <code>NH3</code>, <code>NaOH</code>):",
+        "📖 <b>Kimyoviy modda formulasini yozing</b> (masalan: <code>KMnO4</code>, <code>H2SO4</code>, <code>HNO3</code>):",
         reply_markup=cancel_kb()
     )
 
@@ -419,11 +637,18 @@ def ask_dict_word(message):
 def search_chem_dict(message):
     uid = message.from_user.id
     query = message.text.strip().lower()
+    
+    CHEM_DICT = {
+        "kmno4": "🧪 <b>Kaliy permanganat (KMnO₄)</b>\nToʻq binafsha rangli kristall modda, kuchli oksidlovchi.\n• Kislotali muhitda: Mn⁺⁷ → Mn²⁺ (rangsiz eritma)",
+        "h2so4": "🧪 <b>Sulfat kislota (H₂SO₄)</b>\nKuchli ikki negizli mineral kislota.",
+        "hno3": "🧪 <b>Nitrat kislota (HNO₃)</b>\nKuchli bir negizli kislota."
+    }
+    
     res = CHEM_DICT.get(query)
     if res:
         bot.send_message(uid, res)
     else:
-        bot.send_message(uid, "🔍 Bu modda bazaga endi kiritilmoqda. Boshqa formula yozib koʻring (masalan: <code>KMnO4</code>).")
+        bot.send_message(uid, "🔍 Bu modda bazada topilmadi. Boshqa formula yozib koʻring (masalan: <code>KMnO4</code>).")
 
 # ================= NAMUNA DARSLAR =================
 @bot.message_handler(func=lambda m: m.text == "🎬 Namuna darslar")
@@ -495,7 +720,7 @@ def adm_save_lesson(message):
     user_states.pop(uid, None)
     bot.send_message(uid, f"✅ <b>«{info['title']}»</b> qoʻshildi!", reply_markup=admin_menu())
 
-# ================= WEB APP (40 TALIK TITR) + AVTO-SERTIFIKAT =================
+# ================= WEB APP (40 TALIK TITR) MA'LUMOTINI QABUL QILISH =================
 @bot.message_handler(content_types=['web_app_data'])
 def handle_webapp_data(message):
     uid = message.from_user.id
@@ -504,16 +729,35 @@ def handle_webapp_data(message):
     payload = json.loads(message.web_app_data.data)
     mode, meta, answers = payload.get("mode"), payload.get("meta"), payload.get("answers")
 
+    # Admin yangi test kodi yaratganda (HAR SAFAR RANDOM 6 XONALI KOD BERILADI)
     if mode == "create":
         if not db_is_admin(uid): return
+        
+        # Takrorlanmas 6 xonali random kod generatsiyasi
+        while True:
+            code = random.randint(100000, 999999)
+            with sqlite3.connect("database.db") as conn:
+                c = conn.cursor()
+                c.execute("SELECT test_code FROM tests WHERE test_code = ?", (code,))
+                if not c.fetchone():
+                    break
+                    
         with sqlite3.connect("database.db") as conn:
             c = conn.cursor()
-            c.execute("INSERT INTO tests (title, answers, created_at) VALUES (?, ?, ?)",
-                      (meta, json.dumps(answers), datetime.now().strftime("%Y-%m-%d %H:%M")))
-            code = c.lastrowid
+            c.execute("INSERT INTO tests (test_code, title, answers, created_at) VALUES (?, ?, ?, ?)",
+                      (code, meta, json.dumps(answers), datetime.now().strftime("%Y-%m-%d %H:%M")))
             conn.commit()
-        bot.send_message(uid, f"✅ <b>Yangi 40 talik Test yaratildi!</b>\n🔢 Kod: <code>{code}</code>\n📘 Mavzu: {meta}", reply_markup=admin_menu())
+            
+        bot.send_message(
+            uid, 
+            f"✅ <b>Yangi 40 talik Milliy Test muvaffaqiyatli yaratildi!</b>\n\n"
+            f"🔢 <b>Maxsus Test kodi:</b> <code>{code}</code>\n"
+            f"📘 Mavzu: <b>{meta}</b>\n\n"
+            f"Oʻquvchilar ushbu random kodni kiritib testni topshirishadi.", 
+            reply_markup=admin_menu()
+        )
 
+    # O'quvchi testni yechib tugatganda
     elif mode == "solve":
         if not meta.isdigit():
             return bot.send_message(uid, "⚠️ Test kodi faqat raqam boʻlishi kerak!", reply_markup=main_menu(uid))
@@ -523,7 +767,7 @@ def handle_webapp_data(message):
             c.execute("SELECT title, answers FROM tests WHERE test_code = ?", (code,))
             row = c.fetchone()
         if not row:
-            return bot.send_message(uid, f"❌ <code>{code}</code>-kodli test topilmadi!", reply_markup=main_menu(uid))
+            return bot.send_message(uid, f"❌ Bunday kodli test topilmadi! Qaytadan tekshirib ko'ring.", reply_markup=main_menu(uid))
 
         title, correct_keys = row[0], json.loads(row[1])
         raw_correct, rash_score, details = 0, 0.0, []
@@ -532,7 +776,10 @@ def handle_webapp_data(message):
             u = str(answers[i]).strip().lower()
             k = str(correct_keys[i]).strip().lower()
             q_num = i + 1
+            
+            # To'g'ri Rash ball taqsimoti
             weight = 1.5 if q_num <= 32 else (2.2 if q_num <= 35 else 4.08)
+            
             if u != "" and u == k:
                 raw_correct += 1
                 rash_score += weight
@@ -540,55 +787,109 @@ def handle_webapp_data(message):
             else:
                 details.append(f"{q_num}.❌")
 
-        rash_score = round(rash_score, 2)
+        rash_score = round(rash_score, 1)
         percent = round((rash_score / 75.0) * 100, 1)
 
-        if rash_score >= 70: daraja = "A+ daraja"
-        elif rash_score >= 65: daraja = "A daraja"
-        elif rash_score >= 60: daraja = "B+ daraja"
-        elif rash_score >= 55: daraja = "B daraja"
-        elif rash_score >= 50: daraja = "C+ daraja"
-        elif rash_score >= 46: daraja = "C daraja"
-        else: daraja = "Sertifikat baliga yetmadi"
+        # Qat'iy va rasmiy BMBA daraja shkalasi
+        if rash_score >= 70.0: daraja = "A+ daraja (A'lo)"
+        elif rash_score >= 65.0: daraja = "A daraja (A'lo)"
+        elif rash_score >= 60.0: daraja = "B+ daraja (Yaxshi)"
+        elif rash_score >= 55.0: daraja = "B daraja (Yaxshi)"
+        elif rash_score >= 50.0: daraja = "C+ daraja (Qoniqarli)"
+        elif rash_score >= 46.0: daraja = "C daraja (Qoniqarli)"
+        else: daraja = "Sertifikat darajasiga yetmadi"
 
+        # Bazaga natijani yozish
         with sqlite3.connect("database.db") as conn:
             c = conn.cursor()
-            c.execute("SELECT id FROM results WHERE user_id = ? AND test_code = ?", (uid, code))
-            if not c.fetchone():
-                c.execute(
-                    "INSERT INTO results (user_id, full_name, test_code, raw_correct, rash_score, percent, daraja, checked_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    (uid, message.from_user.full_name, code, raw_correct, rash_score, percent, daraja, datetime.now().strftime("%Y-%m-%d %H:%M"))
-                )
-                conn.commit()
+            c.execute("INSERT INTO results (user_id, full_name, test_code, raw_correct, rash_score, percent, daraja, checked_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                      (uid, message.from_user.full_name, code, raw_correct, rash_score, percent, daraja, datetime.now().strftime("%Y-%m-%d %H:%M")))
+            conn.commit()
 
-        res_text = (
-            f"📊 <b>TEST NATIJANGIZ (40 TALIK)</b>\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"👤 <b>Oʻquvchi:</b> {message.from_user.full_name}\n"
-            f"🔢 <b>Test kodi:</b> <code>{code}</code> ({title})\n"
-            f"✅ <b>Toʻgʻri javoblar:</b> {raw_correct} / 40 ta\n"
-            f"📈 <b>Ball:</b> <b>{rash_score} ball</b> ({percent}%)\n"
-            f"🎖 <b>Daraja:</b> <b>{daraja}</b>\n"
-            f"━━━━━━━━━━━━━━━━━━\n" + " | ".join(details)
+        # O'quvchi ma'lumotlarini keyingi rasm so'rashda ishlatish uchun saqlash
+        user_data[uid] = {
+            "test_code": code,
+            "title": title,
+            "score": rash_score,
+            "percent": percent,
+            "daraja": daraja,
+            "raw_correct": raw_correct,
+            "details": details
+        }
+        
+        # Agar 46 balldan yuqori olgan bo'lsa darhol rasm yuklashni so'rab, sertifikatga bog'laymiz
+        if rash_score >= 46.0:
+            user_states[uid] = "wait_user_photo"
+            bot.send_message(
+                uid,
+                f"📊 <b>NATIJANGIZ (40 TALIK):</b>\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"👤 Oʻquvchi: <b>{message.from_user.full_name}</b>\n"
+                f"🔢 Test kodi: <code>{code}</code> ({title})\n"
+                f"✅ Toʻgʻri: {raw_correct} / 40 ta\n"
+                f"📈 Rash ball: <b>{rash_score} ball</b> ({percent}%)\n"
+                f"🎖 Daraja: <b>{daraja}</b>\n"
+                f"━━━━━━━━━━━━━━━━━━\n" + " | ".join(details) + "\n\n"
+                f"📸 <b>Siz sertifikat darajasini qo'lga kiritdingiz!</b>\n\n"
+                f"Milliy shablondagi rasmiy sertifikatingizni yuklab olish uchun iltimos shaxsiy **3x4 yoki yuzingiz aniq tushgan oddiy rasmingizni** rasm (photo) ko'rinishida shu yerga yuboring!"
+            )
+        else:
+            # 46 dan past ball olgan bo'lsa
+            res_text = (
+                f"📊 <b>Sertifikat olish uchun ball yetarli emas (Minimal: 46 ball).</b>\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"👤 Oʻquvchi: {message.from_user.full_name}\n"
+                f"📈 Rash ballingiz: <b>{rash_score} ball</b> ({percent}%)\n"
+                f"🎖 Holat: {daraja}\n"
+                f"━━━━━━━━━━━━━━━━━━\n\n"
+                f"Ko'proq o'qib, boshqa test kodlari orqali qayta urinib ko'ring!"
+            )
+            bot.send_message(uid, res_text, reply_markup=main_menu(uid))
+
+# ================= RASH MODULI BO'YICHA RASMLI SERTIFIKAT TAYYORLASH =================
+@bot.message_handler(content_types=['photo'], func=lambda m: user_states.get(m.from_user.id) == "wait_user_photo")
+def receive_user_photo_cert(message):
+    uid = message.from_user.id
+    info = user_data.get(uid, {})
+    
+    # Rasmni vaqtincha saqlab olish
+    file_info = bot.get_file(message.photo[-1].file_id)
+    downloaded_file = bot.download_file(file_info.file_path)
+    
+    temp_photo_path = f"temp_user_{uid}.jpg"
+    with open(temp_photo_path, "wb") as new_file:
+        new_file.write(downloaded_file)
+        
+    bot.send_message(uid, "⏳ <b>Milliy Sertifikatingiz tayyorlanmoqda, iltimos biron soniya kuting...</b>")
+    
+    # Rasm bilan BMBA sertifikatini generatsiya qilish (Pillow ishlatilgan)
+    try:
+        cert_file = generate_bmba_certificate(
+            message.from_user.full_name, 
+            info["score"], 
+            info["percent"], 
+            info["daraja"], 
+            temp_photo_path
         )
-        bot.send_message(uid, res_text)
-
-        # Agar 46 balldan yuqori olsa AVTOMATIK SERTIFIKAT yuboramiz!
-        if rash_score >= 46:
-            try:
-                cert_file = generate_certificate_image(message.from_user.full_name, title, rash_score, daraja)
-                with open(cert_file, "rb") as cf:
-                    bot.send_photo(uid, cf, caption=f"🎓 <b>Tabriklaymiz! Siz {daraja} sertifikatini qoʻlga kiritdingiz!</b>\n📢 {KANAL_USER}")
-                os.remove(cert_file)
-            except Exception:
-                pass
-
-        # Yozma ishni rasm holatda yuborishni so'raymiz
-        user_data[uid] = {"test_code": code, "title": title, "score": rash_score}
-        user_states[uid] = "wait_written_photo"
-        kb = ReplyKeyboardMarkup(resize_keyboard=True)
-        kb.add(KeyboardButton("⏭ Yozma ish yoʻq (Oʻtkazib yuborish)"))
-        bot.send_message(uid, "📸 <b>Endi yozma ish (yechimlar) rasmini shu yerga tashlang:</b>", reply_markup=kb)
+        
+        with open(cert_file, "rb") as cf:
+            bot.send_photo(
+                uid, 
+                cf, 
+                caption=f"🎓 <b>Tiriklik darsi muvaffaqiyatli yakunlandi! Milliy darajadagi {info['daraja']} Sertifikatingiz tayyorlandi!</b>\n\n📢 {KANAL_USER}",
+                reply_markup=main_menu(uid)
+            )
+        os.remove(cert_file)
+    except Exception as e:
+        bot.send_message(uid, f"❌ Sertifikat tayyorlashda xatolik bo'ldi. Hisobot adminga yuborildi.")
+        
+    if os.path.exists(temp_photo_path):
+        os.remove(temp_photo_path)
+        
+    user_states[uid] = "wait_written_photo"
+    kb = ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.add(KeyboardButton("⏭ Yozma ish yoʻq (Oʻtkazib yuborish)"))
+    bot.send_message(uid, "📸 <b>Endi esa yozma ish (yechimlar) rasmini shu yerga yuklang (ustoz tekshiruvi uchun):</b>", reply_markup=kb)
 
 # ================= YOZMA ISH RASMINI QABUL QILISH =================
 @bot.message_handler(func=lambda m: m.text == "⏭ Yozma ish yoʻq (Oʻtkazib yuborish)")
@@ -603,9 +904,9 @@ def receive_written_photo(message):
     photo_id = message.photo[-1].file_id
     caption = (
         f"📝 <b>YANGI YOZMA ISH KELDI!</b>\n"
-        f"👤 Oʻquvchi: {message.from_user.full_name} (@{message.from_user.username or 'yoq'})\n"
+        f"👤 Oʻquvchi: {message.from_user.full_name}\n"
         f"🆔 ID: <code>{uid}</code> | Test: #{info.get('test_code')}\n"
-        f"📈 Joriy bali: {info.get('score')} ball"
+        f"📈 Joriy ball: {info.get('score')} ball"
     )
     kb = InlineKeyboardMarkup()
     kb.add(InlineKeyboardButton("✍️ Yozma ish uchun ball qoʻshish", callback_data=f"addw_{uid}_{info.get('test_code')}"))
@@ -621,7 +922,7 @@ def ask_written_bonus(call):
     adm_id = call.from_user.id
     user_data[adm_id] = {"target_uid": int(target_uid), "t_code": int(t_code)}
     user_states[adm_id] = "adm_give_w_score"
-    bot.send_message(adm_id, f"✍️ Oʻquvchi (ID: <code>{target_uid}</code>) yozma ishi uchun necha ball qoʻshasiz?")
+    bot.send_message(adm_id, f"✍️ Oʻquvchi (ID: {target_uid}) yozma ishi uchun necha ball qoʻshasiz?")
     bot.answer_callback_query(call.id)
 
 @bot.message_handler(func=lambda m: user_states.get(m.from_user.id) == "adm_give_w_score")
@@ -640,7 +941,7 @@ def save_written_bonus(message):
     try: bot.send_message(info["target_uid"], f"🎉 <b>Ustoz yozma ishingizni tekshirdi va +{bonus} ball qoʻshdi!</b>")
     except Exception: pass
 
-# ================= CRM: GURUHLARNI BOSHQARISH =================
+# ================= CRM VA GURUHLAR =================
 @bot.message_handler(func=lambda m: m.text == "👥 Guruhlarni boshqarish (CRM)")
 def crm_groups_menu(message):
     uid = message.from_user.id
@@ -648,7 +949,7 @@ def crm_groups_menu(message):
     user_states[uid] = "crm_set_user"
     bot.send_message(
         uid,
-        "👥 <b>Oʻquvchini guruhga biriktirish:</b>\nOʻquvchining Telegram <b>ID raqamini</b> yuboring (yoki bekor qiling):",
+        "👥 <b>Oʻquvchini guruhga biriktirish:</b>\nOʻquvchining Telegram <b>ID raqamini</b> yuboring:",
         reply_markup=cancel_kb()
     )
 
@@ -676,7 +977,7 @@ def crm_save_group(call):
     bot.send_message(call.message.chat.id, f"✅ Oʻquvchi <b>«{gname}»</b> guruhiga biriktirildi!", reply_markup=admin_menu())
     bot.answer_callback_query(call.id)
 
-# ================= REYTING, VAZIFA NAZORATI VA EXCEL/WORD/PDF =================
+# ================= REYTING VA VAZIFALAR =================
 @bot.message_handler(func=lambda m: m.text == "🏆 Umumiy Reyting")
 def show_global_rating(message):
     if not check_subscription(message.from_user.id): return ask_to_subscribe(message.chat.id)
@@ -686,10 +987,10 @@ def show_global_rating(message):
         rows = c.fetchall()
     if not rows: return bot.send_message(message.chat.id, "📭 Hali natijalar yoʻq.")
     medals = ["🥇", "🥈", "🥉"]
-    text = "🏆 <b>A+ KIMYO | TOP-20 REYTING</b>\n━━━━━━━━━━━━━━━━━━\n"
+    text = "🏆 <b>A+ KIMYO | TOP-20 REYTING:</b>\n━━━━━━━━━━━━━━━━━━\n"
     for idx, r in enumerate(rows, 1):
         m = medals[idx - 1] if idx <= 3 else f"<b>{idx}.</b>"
-        text += f"{m} {r[0]} — <b>{round(r[1], 2)} ball</b> ({r[2]}/40) | {r[3]}\n"
+        text += f"{m} {r[0]} — <b>{round(r[1], 1)} ball</b> ({r[2]}/40) | {r[3]}\n"
     bot.send_message(message.chat.id, text)
 
 @bot.message_handler(func=lambda m: m.text == "📑 Vazifa nazorati (Qilgan/Qilmagan)")
@@ -697,7 +998,7 @@ def ask_check_test_code(message):
     uid = message.from_user.id
     if not db_is_admin(uid): return
     user_states[uid] = "check_hw_code"
-    bot.send_message(uid, "🔢 <b>Test kodini</b> kiriting:", reply_markup=cancel_kb())
+    bot.send_message(uid, "🔢 6 xonali maxsus test kodini kiriting:", reply_markup=cancel_kb())
 
 @bot.message_handler(func=lambda m: user_states.get(m.from_user.id) == "check_hw_code")
 def show_hw_status(message):
@@ -721,7 +1022,7 @@ def show_hw_status(message):
     text = f"📑 <b>VAZIFA NAZORATI: Test #{code} ({t[0]})</b>\n━━━━━━━━━━━━━━━━━━\n"
     text += f"✅ <b>Vazifani bajarganlar ({len(done_rows)} ta):</b>\n"
     for r in done_rows:
-        text += f"  • {r[1]} — <b>{round(r[2], 2)} ball</b> ({r[3]}/40)\n"
+        text += f"  • {r[1]} — <b>{round(r[2], 1)} ball</b>\n"
     text += f"\n❌ <b>Vazifa qilmaganlar ({len(not_done)} ta):</b>\n"
     for u in not_done:
         text += f"  • {u[1]} [{u[3]}] (Tel: {u[2] or 'yoʻq'})\n"
@@ -761,14 +1062,14 @@ def handle_export(call):
         filename = "A_Plus_Kimyo_Hisobot.xlsx"
         wb = openpyxl.Workbook()
         ws = wb.active
-        ws.title = "Reyting va Vazifalar"
+        ws.title = "Reyting"
         ws.append(["№", "F.I.Sh.", "Guruh", "Telefon", "Test Kodi", "To'g'ri", "Umumiy Ball", "Holati", "Vaqti"])
         for idx, r in enumerate(rows, 1):
             holat = "Bajarilgan (" + r[6] + ")" if r[3] != 0 else "❌ Qilinmagan"
-            ws.append([idx, r[0], r[1], r[2], r[3] or "-", f"{r[4]}/40" if r[3] else "-", round(r[5], 2), holat, r[7]])
+            ws.append([idx, r[0], r[1], r[2], r[3] or "-", f"{r[4]}/40" if r[3] else "-", round(r[5], 1), holat, r[7]])
         wb.save(filename)
         with open(filename, "rb") as f:
-            bot.send_document(uid, f, caption="📊 <b>Excel elektron jadval</b>")
+            bot.send_document(uid, f, caption="📊 Excel elektron jadval")
 
     elif fmt == "word":
         filename = "A_Plus_Kimyo_Hisobot.docx"
@@ -780,10 +1081,10 @@ def handle_export(call):
         hdr[0].text, hdr[1].text, hdr[2].text, hdr[3].text, hdr[4].text = "№", "F.I.Sh.", "Guruh", "Ball", "Holati"
         for idx, r in enumerate(rows, 1):
             rc = table.add_row().cells
-            rc[0].text, rc[1].text, rc[2].text, rc[3].text, rc[4].text = str(idx), str(r[0]), str(r[1]), str(round(r[5], 2)), ("Bajarilgan" if r[3] != 0 else "Qilinmagan")
+            rc[0].text, rc[1].text, rc[2].text, rc[3].text, rc[4].text = str(idx), str(r[0]), str(r[1]), str(round(r[5], 1)), ("Bajarilgan" if r[3] != 0 else "Qilinmagan")
         doc.save(filename)
         with open(filename, "rb") as f:
-            bot.send_document(uid, f, caption="📄 <b>Word hujjat</b>")
+            bot.send_document(uid, f, caption="📄 Word hujjat")
 
     elif fmt == "pdf":
         filename = "A_Plus_Kimyo_Hisobot.pdf"
@@ -792,11 +1093,11 @@ def handle_export(call):
         y = 720
         for idx, r in enumerate(rows[:32], 1):
             status = "Bajarilgan" if r[3] != 0 else "Qilinmagan"
-            c_pdf.drawString(50, y, f"{idx}. {r[0]} [{r[1]}] | Ball: {round(r[5], 2)} | {status}")
+            c_pdf.drawString(50, y, f"{idx}. {r[0]} [{r[1]}] | Ball: {round(r[5], 1)} | {status}")
             y -= 20
         c_pdf.save()
         with open(filename, "rb") as f:
-            bot.send_document(uid, f, caption="📑 <b>PDF fayl</b>")
+            bot.send_document(uid, f, caption="📑 PDF fayl")
     bot.answer_callback_query(call.id, "Tayyor!")
 
 # ================= KURSGA YOZILISH =================
@@ -861,7 +1162,7 @@ def list_tests(message):
     if not db_is_admin(message.from_user.id): return
     with sqlite3.connect("database.db") as conn:
         c = conn.cursor()
-        c.execute("SELECT test_code, title FROM tests ORDER BY test_code DESC LIMIT 15")
+        c.execute("SELECT test_code, title FROM tests ORDER BY created_at DESC LIMIT 15")
         rows = c.fetchall()
     if not rows: return bot.send_message(message.chat.id, "📭 Testlar yoʻq.")
     bot.send_message(message.chat.id, "📋 <b>Testlar:</b>\n" + "\n".join([f"🔹 Kod: <code>{r[0]}</code> — {r[1]}" for r in rows]))
@@ -904,14 +1205,14 @@ def broadcast_send(message):
         except Exception: pass
     bot.send_message(uid, f"✅ {sent} ta oʻquvchiga yuborildi!", reply_markup=admin_menu())
 
-# ================= FLASK SERVER =================
+# ================= FLASK WEB SERVER VA INTERAKTIV TITR =================
 @app.route("/")
 def index():
     return "A+ Kimyo Bot 24/7 ishlamoqda!"
 
 @app.route("/titr")
 def serve_titr():
-    return send_file("titr.html")
+    return render_template_string(TITR_HTML)
 
 def run_web():
     port = int(os.environ.get("PORT", 8080))
