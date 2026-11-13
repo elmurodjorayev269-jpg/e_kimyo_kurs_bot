@@ -3,11 +3,11 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>A+ Kimyo | Elektron Titr (43 talik)</title>
+    <title>A+ Kimyo | Elektron Titr (40 talik)</title>
     <script src="https://telegram.org/js/telegram-web-app.js"></script>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
-        body { background-color: #17212b; color: #ffffff; padding-bottom: 80px; }
+        body { background-color: #17212b; color: #ffffff; padding-bottom: 85px; }
         .header { position: sticky; top: 0; background: #242f3d; padding: 12px 15px; z-index: 100; border-bottom: 1px solid #0e1621; display: flex; justify-content: space-between; align-items: center; }
         .header h2 { font-size: 16px; color: #6ab3f3; }
         .cols-header { display: grid; grid-template-columns: 45px repeat(4, 1fr); text-align: center; padding: 8px 10px; background: #1c2733; font-weight: bold; color: #8b9bb4; font-size: 14px; position: sticky; top: 45px; z-index: 99; }
@@ -16,20 +16,18 @@
         .opt-btn { width: 42px; height: 42px; border-radius: 50%; border: 2px solid #3d4d5d; background: #242f3d; color: #fff; font-weight: bold; font-size: 15px; margin: 0 auto; display: flex; align-items: center; justify-content: center; cursor: pointer; transition: 0.15s; }
         .opt-btn.active { background: #3390ec; border-color: #3390ec; box-shadow: 0 0 10px rgba(51, 144, 236, 0.5); }
         
-        /* 33-35 Moslashtirish */
         .match-row { padding: 10px 15px; border-bottom: 1px solid #202b36; }
         .match-grid { display: grid; grid-template-columns: repeat(6, 1fr); gap: 6px; margin-top: 8px; }
         .match-btn { height: 38px; border-radius: 8px; border: 1px solid #3d4d5d; background: #242f3d; color: #fff; font-weight: bold; cursor: pointer; }
         .match-btn.active { background: #3390ec; border-color: #3390ec; }
 
-        /* 36-43 Ochiq savollar (a va b) */
-        .open-row { padding: 12px 15px; border-bottom: 1px solid #202b36; }
-        .open-inputs { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 8px; }
-        .open-inputs input { width: 100%; padding: 10px; border-radius: 8px; border: 1px solid #3d4d5d; background: #242f3d; color: #fff; font-size: 15px; outline: none; }
-        .open-inputs input:focus { border-color: #3390ec; }
+        .open-row { padding: 12px 15px; border-bottom: 1px solid #202b36; display: flex; align-items: center; gap: 12px; }
+        .open-row label { font-weight: bold; color: #8b9bb4; min-width: 75px; }
+        .open-row input { flex: 1; padding: 10px 12px; border-radius: 8px; border: 1px solid #3d4d5d; background: #242f3d; color: #fff; font-size: 15px; outline: none; }
+        .open-row input:focus { border-color: #3390ec; }
 
         .section-title { background: #0e1621; padding: 10px 15px; font-size: 13px; color: #6ab3f3; text-transform: uppercase; letter-spacing: 0.5px; font-weight: bold; }
-        .footer { position: fixed; bottom: 0; left: 0; right: 0; background: #242f3d; padding: 12px 15px; border-top: 1px solid #0e1621; display: flex; gap: 10px; }
+        .footer { position: fixed; bottom: 0; left: 0; right: 0; background: #242f3d; padding: 12px 15px; border-top: 1px solid #0e1621; }
         .submit-btn { width: 100%; padding: 13px; background: #3390ec; color: #fff; border: none; border-radius: 10px; font-size: 16px; font-weight: bold; cursor: pointer; }
         .code-box { padding: 12px 15px; background: #242f3d; margin: 10px; border-radius: 10px; }
         .code-box input { width: 100%; padding: 10px; margin-top: 6px; border-radius: 8px; border: 1px solid #3d4d5d; background: #17212b; color: #fff; font-size: 16px; }
@@ -38,8 +36,8 @@
 <body>
 
 <div class="header">
-    <h2 id="page-title">A+ Kimyo | 43 talik Titr</h2>
-    <span id="counter" style="font-size: 13px; color: #8b9bb4;">0 / 43</span>
+    <h2 id="page-title">A+ Kimyo | 40 talik Titr</h2>
+    <span id="counter" style="font-size: 13px; color: #8b9bb4;">0 / 40</span>
 </div>
 
 <div class="code-box">
@@ -56,11 +54,11 @@
 <div class="section-title">33–35: Moslashtirish (A – F)</div>
 <div id="matching-questions"></div>
 
-<div class="section-title">36–43: Yozma / Ochiq savollar (a va b qismlar)</div>
+<div class="section-title">36–40: Ochiq savollar (Bitta javob kiriting)</div>
 <div id="open-questions"></div>
 
 <div class="footer">
-    <button class="submit-btn" onclick="submitTitr()">✅ Javoblarni yuborish</button>
+    <button class="submit-btn" onclick="submitTitr()">✅ Javoblarni tasdiqlash</button>
 </div>
 
 <script>
@@ -68,22 +66,22 @@
     tg.expand();
 
     const urlParams = new URLSearchParams(window.location.search);
-    const mode = urlParams.get('mode') || 'solve'; // 'solve' yoki 'create'
+    const mode = urlParams.get('mode') || 'solve';
 
     if (mode === 'create') {
-        document.getElementById('page-title').innerText = "➕ Yangi 43 talik Test Yaratish";
+        document.getElementById('page-title').innerText = "➕ Yangi 40 talik Test Yaratish";
         document.getElementById('code-label').innerText = "Test nomini (mavzusini) kiriting:";
         document.getElementById('test-meta').placeholder = "Masalan: Milliy Sertifikat #1";
     }
 
-    const answers = new Array(43).fill("");
+    const answers = new Array(40).fill("");
 
     function updateCounter() {
         const filled = answers.filter(x => x !== "").length;
-        document.getElementById('counter').innerText = `${filled} / 43`;
+        document.getElementById('counter').innerText = `${filled} / 40`;
     }
 
-    // 1-32 savollarni chizish
+    // 1-32 savollar
     const closedDiv = document.getElementById('closed-questions');
     for (let i = 0; i < 32; i++) {
         const row = document.createElement('div');
@@ -128,29 +126,20 @@
         matchDiv.appendChild(row);
     }
 
-    // 36-43 ochiq savollar (a va b)
+    // 36-40 bitta javobli ochiq savollar
     const openDiv = document.getElementById('open-questions');
-    for (let i = 35; i < 43; i++) {
+    for (let i = 35; i < 40; i++) {
         const row = document.createElement('div');
         row.className = 'open-row';
         row.innerHTML = `
-            <div style="font-weight:bold; color:#8b9bb4;">${i + 1}-savol:</div>
-            <div class="open-inputs">
-                <input type="text" id="q_${i}_a" placeholder="a) javobi" oninput="updateOpen(${i})">
-                <input type="text" id="q_${i}_b" placeholder="b) javobi" oninput="updateOpen(${i})">
-            </div>
+            <label>${i + 1}-savol:</label>
+            <input type="text" id="q_${i}" placeholder="Javobni yozing..." oninput="updateOpen(${i})">
         `;
         openDiv.appendChild(row);
     }
 
     function updateOpen(idx) {
-        const a = document.getElementById(`q_${idx}_a`).value.trim().toLowerCase();
-        const b = document.getElementById(`q_${idx}_b`).value.trim().toLowerCase();
-        if (a || b) {
-            answers[idx] = `${a};${b}`;
-        } else {
-            answers[idx] = "";
-        }
+        answers[idx] = document.getElementById(`q_${idx}`).value.trim().toLowerCase();
         updateCounter();
     }
 
@@ -164,12 +153,11 @@
         if (emptyCount > 0) {
             if (!confirm(`Diqqat! ${emptyCount} ta savol belgilanmagan. Baribir yuborasizmi?`)) return;
         }
-        const payload = JSON.stringify({
+        tg.sendData(JSON.stringify({
             mode: mode,
             meta: meta,
             answers: answers
-        });
-        tg.sendData(payload);
+        }));
     }
 </script>
 </body>
