@@ -21,11 +21,11 @@ from reportlab.pdfgen import canvas
 # ================= SOZLAMALAR =================
 BOT_TOKEN = "8636730483:AAFCHNjwvmaLZuRk3fd3sOIbN2QMYd-h_4g"
 ADMIN_PAROL = "kimyo2026"
+ADMIN_LICHKA = "@onlyibrohimov"
 KANAL_USER = "@kimyo_sertifkat_uchun"
 KARTA_RAQAM = "9860 3501 4209 7954"
 KARTA_EGASI = "Azizbek Ibrohimov"
 
-# Render avtomatik beradigan tashqi URL manzil
 RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "https://e-kimyo-kurs-bot.onrender.com")
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
@@ -44,7 +44,6 @@ def init_db():
                 full_name TEXT,
                 username TEXT,
                 phone TEXT DEFAULT '',
-                group_name TEXT DEFAULT 'Umumiy guruh',
                 is_admin INTEGER DEFAULT 0,
                 joined_at TEXT
             )
@@ -65,9 +64,20 @@ def init_db():
                 test_code INTEGER,
                 raw_correct INTEGER,
                 rash_score REAL,
+                written_score REAL DEFAULT 0,
                 percent REAL,
                 daraja TEXT,
                 checked_at TEXT
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS sample_lessons (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT,
+                description TEXT,
+                file_id TEXT,
+                file_type TEXT,
+                added_at TEXT
             )
         """)
         conn.commit()
@@ -103,15 +113,15 @@ def db_get_admins():
 # ================= MENYULAR =================
 def main_menu(user_id):
     kb = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    # Elektron Titr Web App tugmasi
     titr_solve_btn = KeyboardButton(
-        text="📊 Elektron Titr (43 talik MS)",
+        text="📊 Elektron Titr (40 talik MS)",
         web_app=WebAppInfo(url=f"{RENDER_URL}/titr?mode=solve")
     )
     kb.add(titr_solve_btn)
     kb.add(
+        KeyboardButton("🎬 Namuna darslar"),
         KeyboardButton("🏆 Umumiy Reyting"),
-        KeyboardButton("📋 Mening natijalarim"),
+        KeyboardButton("👤 Shaxsiy kabinet"),
         KeyboardButton("✍️ Kursga yozilish"),
         KeyboardButton("📞 Admin bilan aloqa")
     )
@@ -122,11 +132,12 @@ def main_menu(user_id):
 def admin_menu():
     kb = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
     titr_create_btn = KeyboardButton(
-        text="➕ Titr orqali Test Yaratish (43 ta)",
+        text="➕ Titr orqali Test Yaratish (40 ta)",
         web_app=WebAppInfo(url=f"{RENDER_URL}/titr?mode=create")
     )
     kb.add(titr_create_btn)
     kb.add(
+        KeyboardButton("🎬 Namuna dars qoʻshish"),
         KeyboardButton("📑 Vazifa nazorati (Qilgan/Qilmagan)"),
         KeyboardButton("📊 Elektron Jadval (Excel/Word/PDF)"),
         KeyboardButton("📋 Testlar roʻyxati"),
@@ -151,7 +162,10 @@ def start_cmd(message):
     text = (
         f"Assalomu alaykum, <b>{message.from_user.full_name}</b>! 👋\n\n"
         f"🧪 <b>A+ Kimyo | Online Maktabi</b> platformasiga xush kelibsiz!\n\n"
-        f"👇 Milliy Sertifikat (43 talik) testini topshirish uchun <b>«📊 Elektron Titr»</b> tugmasini bosing:"
+        f"🔹 <b>📊 Elektron Titr:</b> 40 talik Milliy Sertifikat testini topshirish\n"
+        f"🔹 <b>🎬 Namuna darslar:</b> Bepul video darslar va qoʻllanmalar\n"
+        f"🔹 <b>🏆 Reyting:</b> Oʻquvchilarning umumiy natijalari\n\n"
+        f"👇 Quyidagi menyudan kerakli boʻlimni tanlang:"
     )
     bot.send_message(uid, text, reply_markup=main_menu(uid))
 
@@ -182,20 +196,137 @@ def open_admin(message):
 
 @bot.message_handler(func=lambda m: m.text == "📞 Admin bilan aloqa")
 def contact_admin(message):
-    bot.send_message(message.chat.id, f"👨‍🏫 <b>Muallif:</b> Azizbek Ibrohimov\n📢 <b>Kanal:</b> {KANAL_USER}")
+    text = (
+        f"👨‍🏫 <b>Muallif va kurs rahbari:</b> Azizbek Ibrohimov\n\n"
+        f"💬 <b>Shaxsiy lichka:</b> {ADMIN_LICHKA}\n"
+        f"📢 <b>Rasmiy Telegram kanal:</b> {KANAL_USER}\n\n"
+        f"Savollaringiz boʻlsa, toʻgʻridan-toʻgʻri {ADMIN_LICHKA} ga yozishingiz mumkin!"
+    )
+    bot.send_message(message.chat.id, text)
 
-# ================= WEB APP (ELEKTRON TITR) MA'LUMOTLARINI QABUL QILISH =================
+# ================= SHAXSIY KABINET (YANGI IDEYA) =================
+@bot.message_handler(func=lambda m: m.text == "👤 Shaxsiy kabinet")
+def user_profile(message):
+    uid = message.from_user.id
+    with sqlite3.connect("database.db") as conn:
+        c = conn.cursor()
+        c.execute("SELECT full_name, phone, joined_at FROM users WHERE user_id = ?", (uid,))
+        u = c.fetchone()
+        c.execute("SELECT COUNT(*), COALESCE(AVG(rash_score), 0), COALESCE(MAX(rash_score), 0) FROM results WHERE user_id = ?", (uid,))
+        stats = c.fetchone()
+
+    text = (
+        f"👤 <b>SHAXSIY KABINET</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"📛 <b>Ism:</b> {u[0] if u else message.from_user.full_name}\n"
+        f"🆔 <b>ID:</b> <code>{uid}</code>\n"
+        f"📞 <b>Tel:</b> {u[1] if u and u[1] else 'Kiritilmagan'}\n"
+        f"📅 <b>Aʼzo boʻlgan sana:</b> {u[2] if u else '-'}\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"📝 <b>Ishlangan testlar:</b> {stats[0]} ta\n"
+        f"📈 <b>Oʻrtacha ball:</b> {round(stats[1], 1)} ball\n"
+        f"🏆 <b>Eng yuqori natija:</b> {round(stats[2], 1)} ball"
+    )
+    bot.send_message(uid, text)
+
+# ================= NAMUNA DARSLAR (O'QUVCHILAR UCHUN) =================
+@bot.message_handler(func=lambda m: m.text == "🎬 Namuna darslar")
+def show_sample_lessons(message):
+    with sqlite3.connect("database.db") as conn:
+        c = conn.cursor()
+        c.execute("SELECT id, title FROM sample_lessons ORDER BY id DESC LIMIT 20")
+        rows = c.fetchall()
+
+    if not rows:
+        return bot.send_message(
+            message.chat.id,
+            f"🎬 Hozircha botga namuna darslar yuklanmagan.\nBarcha darslarni kanalimizda koʻrishingiz mumkin: {KANAL_USER}"
+        )
+
+    kb = InlineKeyboardMarkup(row_width=1)
+    for r in rows:
+        kb.add(InlineKeyboardButton(f"▶️ {r[1]}", callback_data=f"lesson_{r[0]}"))
+    
+    bot.send_message(message.chat.id, "🎬 <b>Koʻrish yoki yuklab olish uchun namuna darsni tanlang:</b>", reply_markup=kb)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("lesson_"))
+def send_sample_lesson(call):
+    lid = int(call.data.split("_")[1])
+    with sqlite3.connect("database.db") as conn:
+        c = conn.cursor()
+        c.execute("SELECT title, description, file_id, file_type FROM sample_lessons WHERE id = ?", (lid,))
+        row = c.fetchone()
+
+    if not row:
+        return bot.answer_callback_query(call.id, "Dars topilmadi!", show_alert=True)
+
+    title, desc, file_id, ftype = row
+    caption = f"🎬 <b>{title}</b>\n\n{desc}\n\n👨‍🏫 {ADMIN_LICHKA} | 📢 {KANAL_USER}"
+    
+    if ftype == "video":
+        bot.send_video(call.message.chat.id, file_id, caption=caption)
+    elif ftype == "document":
+        bot.send_document(call.message.chat.id, file_id, caption=caption)
+    elif ftype == "photo":
+        bot.send_photo(call.message.chat.id, file_id, caption=caption)
+    bot.answer_callback_query(call.id)
+
+# ================= ADMIN: NAMUNA DARS QO'SHISH =================
+@bot.message_handler(func=lambda m: m.text == "🎬 Namuna dars qoʻshish")
+def adm_add_lesson_1(message):
+    uid = message.from_user.id
+    if not db_is_admin(uid): return
+    user_states[uid] = "les_title"
+    bot.send_message(uid, "🎬 <b>Namuna dars nomini kiriting</b> (masalan: <i>1-dars: Atom tuzilishi</i>):", reply_markup=cancel_kb())
+
+@bot.message_handler(func=lambda m: user_states.get(m.from_user.id) == "les_title")
+def adm_add_lesson_2(message):
+    uid = message.from_user.id
+    user_data[uid] = {"title": message.text}
+    user_states[uid] = "les_desc"
+    bot.send_message(uid, "📝 <b>Dars haqida qisqacha izoh yozing</b> (yoki <code>-</code> belgisini yuboring):")
+
+@bot.message_handler(func=lambda m: user_states.get(m.from_user.id) == "les_desc")
+def adm_add_lesson_3(message):
+    uid = message.from_user.id
+    user_data[uid]["desc"] = "" if message.text == "-" else message.text
+    user_states[uid] = "les_file"
+    bot.send_message(uid, "📎 Endi <b>Video dars, PDF fayl yoki Rasmni</b> yuboring:")
+
+@bot.message_handler(content_types=['video', 'document', 'photo'], func=lambda m: user_states.get(m.from_user.id) == "les_file")
+def adm_save_lesson(message):
+    uid = message.from_user.id
+    info = user_data[uid]
+    
+    if message.video:
+        fid, ftype = message.video.file_id, "video"
+    elif message.document:
+        fid, ftype = message.document.file_id, "document"
+    else:
+        fid, ftype = message.photo[-1].file_id, "photo"
+
+    with sqlite3.connect("database.db") as conn:
+        c = conn.cursor()
+        c.execute(
+            "INSERT INTO sample_lessons (title, description, file_id, file_type, added_at) VALUES (?, ?, ?, ?, ?)",
+            (info["title"], info["desc"], fid, ftype, datetime.now().strftime("%Y-%m-%d %H:%M"))
+        )
+        conn.commit()
+
+    user_states.pop(uid, None)
+    bot.send_message(uid, f"✅ <b>«{info['title']}»</b> namuna darslar boʻlimiga qoʻshildi!", reply_markup=admin_menu())
+
+# ================= WEB APP (40 TALIK TITR) QABUL QILISH =================
 @bot.message_handler(content_types=['web_app_data'])
 def handle_webapp_data(message):
     uid = message.from_user.id
-    raw_json = message.web_app_data.data
-    payload = json.loads(raw_json)
+    payload = json.loads(message.web_app_data.data)
     
     mode = payload.get("mode")
     meta = payload.get("meta")
-    answers = payload.get("answers")  # 43 talik massiv
+    answers = payload.get("answers")  # 40 talik massiv
 
-    # 1. ADMIN YANGI TEST YARATGANDA
+    # 1. ADMIN TEST YARATGANDA
     if mode == "create":
         if not db_is_admin(uid):
             return bot.send_message(uid, "⚠️ Siz admin emassiz!")
@@ -212,10 +343,10 @@ def handle_webapp_data(message):
 
         bot.send_message(
             uid,
-            f"✅ <b>Yangi 43 talik MS Testi Titr orqali yaratildi!</b>\n\n"
+            f"✅ <b>Yangi 40 talik MS Testi yaratildi!</b>\n\n"
             f"🔢 <b>Test kodi:</b> <code>{code}</code>\n"
             f"📘 <b>Mavzu:</b> {meta}\n\n"
-            f"Oʻquvchilar endi <b>«📊 Elektron Titr»</b> tugmasini bosib, <code>{code}</code> kodi orqali javob yuborishlari mumkin!",
+            f"Oʻquvchilar endi <b>«📊 Elektron Titr»</b> orqali <code>{code}</code> kodi bilan javob yuborishlari mumkin!",
             reply_markup=admin_menu()
         )
 
@@ -240,18 +371,18 @@ def handle_webapp_data(message):
         rash_score = 0.0
         details = []
 
-        for i in range(43):
+        for i in range(40):
             u = str(answers[i]).strip().lower()
             k = str(correct_keys[i]).strip().lower()
             q_num = i + 1
 
-            # Rash ball taqsimoti
+            # 40 talik ball taqsimoti (1-32: 1.5, 33-35: 2.2, 36-40: 4.08 -> Jami 75 ball)
             if q_num <= 32:
                 weight = 1.5
             elif q_num <= 35:
                 weight = 2.2
             else:
-                weight = 2.55
+                weight = 4.08
 
             if u != "" and u == k:
                 raw_correct += 1
@@ -282,18 +413,104 @@ def handle_webapp_data(message):
                 conn.commit()
 
         res_text = (
-            f"📊 <b>MILLIY SERTIFIKAT NATIJASI</b>\n"
+            f"📊 <b>TEST NATIJANGIZ (40 TALIK)</b>\n"
             f"━━━━━━━━━━━━━━━━━━\n"
             f"👤 <b>Oʻquvchi:</b> {message.from_user.full_name}\n"
             f"🔢 <b>Test kodi:</b> <code>{code}</code> ({title})\n"
-            f"✅ <b>Toʻgʻri javoblar:</b> {raw_correct} / 43 ta\n"
-            f"📈 <b>Rash bali:</b> <b>{rash_score} ball</b> ({percent}%)\n"
+            f"✅ <b>Toʻgʻri javoblar:</b> {raw_correct} / 40 ta\n"
+            f"📈 <b>Test bali:</b> <b>{rash_score} ball</b> ({percent}%)\n"
             f"🎖 <b>Daraja:</b> <b>{daraja}</b>\n"
-            f"━━━━━━━━━━━━━━━━━━\n" + " | ".join(details) + f"\n\n📢 {KANAL_USER}"
+            f"━━━━━━━━━━━━━━━━━━\n" + " | ".join(details)
         )
-        bot.send_message(uid, res_text, reply_markup=main_menu(uid))
+        bot.send_message(uid, res_text)
 
-# ================= REYTING VA SHAXSIY NATIJALAR =================
+        # O'quvchidan yozma ishni rasm holatda yuborishni so'raymiz!
+        user_data[uid] = {"test_code": code, "title": title, "score": rash_score}
+        user_states[uid] = "wait_written_photo"
+        
+        kb = ReplyKeyboardMarkup(resize_keyboard=True)
+        kb.add(KeyboardButton("⏭ Yozma ish yoʻq (Oʻtkazib yuborish)"))
+        bot.send_message(
+            uid,
+            "📸 <b>Endi yozma ish (yechimlaringiz) rasmini shu yerga tashlang!</b>\n"
+            "Ustoz Azizbek Ibrohimov yechimingizni koʻrib tekshiradilar:",
+            reply_markup=kb
+        )
+
+# ================= YOZMA ISH RASMINI QABUL QILISH VA ADMINGA YUBORISH =================
+@bot.message_handler(func=lambda m: m.text == "⏭ Yozma ish yoʻq (Oʻtkazib yuborish)")
+def skip_written_photo(message):
+    uid = message.from_user.id
+    user_states.pop(uid, None)
+    bot.send_message(uid, "✅ Test yakunlandi! Asosiy menyu:", reply_markup=main_menu(uid))
+
+@bot.message_handler(content_types=['photo'], func=lambda m: user_states.get(m.from_user.id) == "wait_written_photo")
+def receive_written_photo(message):
+    uid = message.from_user.id
+    info = user_data.get(uid, {})
+    photo_id = message.photo[-1].file_id
+
+    caption = (
+        f"📝 <b>YANGI YOZMA ISH KELDI!</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"👤 <b>Oʻquvchi:</b> {message.from_user.full_name}\n"
+        f"🔗 <b>Username:</b> @{message.from_user.username or 'yoq'}\n"
+        f"🆔 <b>ID:</b> <code>{uid}</code>\n"
+        f"🔢 <b>Test kodi:</b> <code>{info.get('test_code')}</code> ({info.get('title')})\n"
+        f"📈 <b>Test bali:</b> {info.get('score')} ball"
+    )
+
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("✍️ Yozma ish uchun ball qoʻshish", callback_data=f"addw_{uid}_{info.get('test_code')}"))
+
+    for adm in db_get_admins():
+        try:
+            bot.send_photo(adm, photo_id, caption=caption, reply_markup=kb)
+        except Exception:
+            pass
+
+    user_states.pop(uid, None)
+    bot.send_message(
+        uid,
+        "✅ <b>Yozma ish rasmi qabul qilindi va ustozga yuborildi!</b>",
+        reply_markup=main_menu(uid)
+    )
+
+# Admin yozma ishga qo'shimcha ball berishi (Yangi ideya)
+@bot.callback_query_handler(func=lambda call: call.data.startswith("addw_"))
+def ask_written_bonus(call):
+    _, target_uid, t_code = call.data.split("_")
+    adm_id = call.from_user.id
+    user_data[adm_id] = {"target_uid": int(target_uid), "t_code": int(t_code)}
+    user_states[adm_id] = "adm_give_w_score"
+    bot.send_message(adm_id, f"✍️ Oʻquvchi (ID: <code>{target_uid}</code>) ning yozma ishi uchun necha ball qoʻshasiz? (Raqam yozing, masalan: <code>5</code>):")
+    bot.answer_callback_query(call.id)
+
+@bot.message_handler(func=lambda m: user_states.get(m.from_user.id) == "adm_give_w_score")
+def save_written_bonus(message):
+    adm_id = message.from_user.id
+    try:
+        bonus = float(message.text.replace(",", "."))
+    except ValueError:
+        return bot.send_message(adm_id, "⚠️ Iltimos, faqat raqam kiriting (masalan: 4.5):")
+
+    info = user_data[adm_id]
+    with sqlite3.connect("database.db") as conn:
+        c = conn.cursor()
+        c.execute(
+            "UPDATE results SET written_score = ?, rash_score = rash_score + ? WHERE user_id = ? AND test_code = ?",
+            (bonus, bonus, info["target_uid"], info["t_code"])
+        )
+        conn.commit()
+
+    user_states.pop(adm_id, None)
+    bot.send_message(adm_id, f"✅ Yozma ish uchun <b>+{bonus} ball</b> qoʻshildi!", reply_markup=admin_menu())
+    try:
+        bot.send_message(info["target_uid"], f"🎉 <b>Ustoz yozma ishingizni tekshirdi va +{bonus} ball qoʻshdi!</b>")
+    except Exception:
+        pass
+
+# ================= REYTING VA HISOBOTLAR =================
 @bot.message_handler(func=lambda m: m.text == "🏆 Umumiy Reyting")
 def show_global_rating(message):
     with sqlite3.connect("database.db") as conn:
@@ -308,26 +525,9 @@ def show_global_rating(message):
     text = "🏆 <b>A+ KIMYO | TOP-20 REYTING</b>\n━━━━━━━━━━━━━━━━━━\n"
     for idx, r in enumerate(rows, 1):
         m = medals[idx - 1] if idx <= 3 else f"<b>{idx}.</b>"
-        text += f"{m} {r[0]} — <b>{r[1]} ball</b> ({r[2]}/43) | {r[3]}\n"
+        text += f"{m} {r[0]} — <b>{round(r[1], 2)} ball</b> ({r[2]}/40) | {r[3]}\n"
     bot.send_message(message.chat.id, text)
 
-@bot.message_handler(func=lambda m: m.text == "📋 Mening natijalarim")
-def my_results(message):
-    uid = message.from_user.id
-    with sqlite3.connect("database.db") as conn:
-        c = conn.cursor()
-        c.execute("SELECT test_code, raw_correct, rash_score, daraja, checked_at FROM results WHERE user_id = ? ORDER BY id DESC LIMIT 10", (uid,))
-        rows = c.fetchall()
-
-    if not rows:
-        return bot.send_message(uid, "📭 Siz hali birorta ham test ishlamagansiz.")
-
-    text = "📋 <b>SIZNING NATIJALARINGIZ:</b>\n━━━━━━━━━━━━━━━━━━\n"
-    for r in rows:
-        text += f"🔹 Test #{r[0]}: <b>{r[2]} ball</b> ({r[1]}/43) — {r[3]} <i>({r[4]})</i>\n"
-    bot.send_message(uid, text)
-
-# ================= ADMIN: VAZIFA NAZORATI (QILGAN / QILMAGAN) =================
 @bot.message_handler(func=lambda m: m.text == "📑 Vazifa nazorati (Qilgan/Qilmagan)")
 def ask_check_test_code(message):
     uid = message.from_user.id
@@ -338,23 +538,19 @@ def ask_check_test_code(message):
 @bot.message_handler(func=lambda m: user_states.get(m.from_user.id) == "check_hw_code")
 def show_hw_status(message):
     uid = message.from_user.id
-    if not message.text.isdigit():
-        return bot.send_message(uid, "⚠️ Test kodini raqamda yozing!")
+    if not message.text.isdigit(): return bot.send_message(uid, "⚠️ Raqam kiriting!")
     code = int(message.text)
 
     with sqlite3.connect("database.db") as conn:
         c = conn.cursor()
         c.execute("SELECT title FROM tests WHERE test_code = ?", (code,))
         t = c.fetchone()
-        if not t:
-            return bot.send_message(uid, "❌ Bunday test topilmadi!")
+        if not t: return bot.send_message(uid, "❌ Test topilmadi!")
 
-        # Bajarilganlar
         c.execute("SELECT user_id, full_name, rash_score, raw_correct FROM results WHERE test_code = ? ORDER BY rash_score DESC", (code,))
         done_rows = c.fetchall()
         done_ids = {r[0] for r in done_rows}
 
-        # Barcha o'quvchilar
         c.execute("SELECT user_id, full_name, phone FROM users WHERE is_admin = 0")
         all_users = c.fetchall()
 
@@ -364,7 +560,7 @@ def show_hw_status(message):
     text = f"📑 <b>VAZIFA NAZORATI: Test #{code} ({t[0]})</b>\n━━━━━━━━━━━━━━━━━━\n"
     text += f"✅ <b>Vazifani bajarganlar ({len(done_rows)} ta):</b>\n"
     for r in done_rows:
-        text += f"  • {r[1]} — <b>{r[2]} ball</b> ({r[3]}/43)\n"
+        text += f"  • {r[1]} — <b>{round(r[2], 2)} ball</b> ({r[3]}/40)\n"
 
     text += f"\n❌ <b>Vazifa qilmaganlar ({len(not_done)} ta):</b>\n"
     for u in not_done:
@@ -372,7 +568,6 @@ def show_hw_status(message):
 
     bot.send_message(uid, text, reply_markup=admin_menu())
 
-# ================= ADMIN: ELEKTRON JADVAL (EXCEL, WORD, PDF) =================
 @bot.message_handler(func=lambda m: m.text == "📊 Elektron Jadval (Excel/Word/PDF)")
 def export_menu(message):
     uid = message.from_user.id
@@ -384,7 +579,7 @@ def export_menu(message):
         InlineKeyboardButton("📄 Word (.docx)", callback_data="exp_word"),
         InlineKeyboardButton("📑 PDF (.pdf)", callback_data="exp_pdf")
     )
-    bot.send_message(uid, "📥 <b>Oʻquvchilar reytingi va vazifa holatini qaysi formatda yuklab olasiz?</b>", reply_markup=kb)
+    bot.send_message(uid, "📥 <b>Oʻquvchilar hisobotini qaysi formatda yuklab olasiz?</b>", reply_markup=kb)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("exp_"))
 def handle_export(call):
@@ -410,72 +605,53 @@ def handle_export(call):
         wb = openpyxl.Workbook()
         ws = wb.active
         ws.title = "Reyting va Vazifalar"
-
-        headers = ["№", "O'quvchi F.I.Sh.", "Telefon", "Test Kodi", "To'g'ri Javob", "Rash Ball", "Holati / Daraja", "Topshirgan Vaqti"]
-        ws.append(headers)
-
-        # Sarlavha dizayni
-        header_fill = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
-        for col in range(1, 9):
-            cell = ws.cell(row=1, column=col)
-            cell.fill = header_fill
-            cell.font = Font(bold=True, color="FFFFFF")
-            cell.alignment = Alignment(horizontal="center")
-
+        ws.append(["№", "O'quvchi F.I.Sh.", "Telefon", "Test Kodi", "To'g'ri Javob", "Umumiy Ball", "Holati", "Vaqti"])
         for idx, r in enumerate(rows, 1):
             holat = "Bajarilgan (" + r[5] + ")" if r[2] != 0 else "❌ Qilinmagan"
-            ws.append([idx, r[0], r[1], r[2] or "-", f"{r[3]}/43" if r[2] else "-", r[4], holat, r[6]])
-
+            ws.append([idx, r[0], r[1], r[2] or "-", f"{r[3]}/40" if r[2] else "-", round(r[4], 2), holat, r[6]])
         wb.save(filename)
         with open(filename, "rb") as f:
-            bot.send_document(uid, f, caption="📊 <b>Oʻquvchilar reytingi va vazifa holati (Excel jadval)</b>")
+            bot.send_document(uid, f, caption="📊 <b>Excel elektron jadval</b>")
 
     elif fmt == "word":
         filename = "A_Plus_Kimyo_Hisobot.docx"
         doc = Document()
-        doc.add_heading("A+ KIMYO | O'QUVCHILAR REYTINGI VA VAZIFA NAZORATI", 0)
-        table = doc.add_table(rows=1, cols=6)
+        doc.add_heading("A+ KIMYO | O'QUVCHILAR REYTINGI", 0)
+        table = doc.add_table(rows=1, cols=5)
         table.style = 'Table Grid'
         hdr = table.rows[0].cells
         hdr[0].text = "№"
-        hdr[1].text = "O'quvchi F.I.Sh."
-        hdr[2].text = "Telefon"
-        hdr[3].text = "To'g'ri"
-        hdr[4].text = "Rash Ball"
-        hdr[5].text = "Vazifa Holati"
-
+        hdr[1].text = "F.I.Sh."
+        hdr[2].text = "To'g'ri"
+        hdr[3].text = "Ball"
+        hdr[4].text = "Holati"
         for idx, r in enumerate(rows, 1):
-            row_cells = table.add_row().cells
-            row_cells[0].text = str(idx)
-            row_cells[1].text = str(r[0])
-            row_cells[2].text = str(r[1] or "-")
-            row_cells[3].text = f"{r[3]}/43" if r[2] else "-"
-            row_cells[4].text = str(r[4])
-            row_cells[5].text = "Bajarilgan" if r[2] != 0 else "Qilinmagan"
-
+            rc = table.add_row().cells
+            rc[0].text = str(idx)
+            rc[1].text = str(r[0])
+            rc[2].text = f"{r[3]}/40" if r[2] else "-"
+            rc[3].text = str(round(r[4], 2))
+            rc[4].text = "Bajarilgan" if r[2] != 0 else "Qilinmagan"
         doc.save(filename)
         with open(filename, "rb") as f:
-            bot.send_document(uid, f, caption="📄 <b>Oʻquvchilar hisoboti (Word hujjat)</b>")
+            bot.send_document(uid, f, caption="📄 <b>Word hujjat</b>")
 
     elif fmt == "pdf":
         filename = "A_Plus_Kimyo_Hisobot.pdf"
         c_pdf = canvas.Canvas(filename, pagesize=letter)
-        c_pdf.setFont("Helvetica-Bold", 14)
-        c_pdf.drawString(50, 750, "A+ KIMYO | O'QUVCHILAR REYTINGI VA VAZIFA HOLATI")
-        c_pdf.setFont("Helvetica", 10)
+        c_pdf.drawString(50, 750, "A+ KIMYO | O'QUVCHILAR REYTINGI")
         y = 720
         for idx, r in enumerate(rows[:32], 1):
             status = "Bajarilgan" if r[2] != 0 else "Qilinmagan"
-            line = f"{idx}. {r[0]} | Tel: {r[1] or '-'} | Ball: {r[4]} | Holati: {status}"
-            c_pdf.drawString(50, y, line)
+            c_pdf.drawString(50, y, f"{idx}. {r[0]} | Ball: {round(r[4], 2)} | {status}")
             y -= 20
         c_pdf.save()
         with open(filename, "rb") as f:
-            bot.send_document(uid, f, caption="📑 <b>Oʻquvchilar hisoboti (PDF fayl)</b>")
+            bot.send_document(uid, f, caption="📑 <b>PDF fayl</b>")
 
     bot.answer_callback_query(call.id, "Tayyor!")
 
-# ================= KURSGA YOZILISH VA TO'LOV CHEKI =================
+# ================= KURSGA YOZILISH =================
 @bot.message_handler(func=lambda m: m.text == "✍️ Kursga yozilish")
 def reg_1(message):
     uid = message.from_user.id
@@ -506,10 +682,7 @@ def reg_3(message):
 
     pay_text = (
         f"💳 <b>Toʻlov rekvizitlari:</b>\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"🔹 <b>Karta:</b> <code>9860350142097954</code>\n"
-        f"🔹 <b>Egasi:</b> <b>{KARTA_EGASI}</b>\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🔹 <b>Karta:</b> <code>9860350142097954</code> ({KARTA_EGASI})\n\n"
         f"📸 Toʻlovni qilib, <b>chek rasmini</b> shu yerga tashlang:"
     )
     bot.send_message(uid, pay_text, reply_markup=cancel_kb())
@@ -540,7 +713,7 @@ def pay_decision(call):
         bot.edit_message_caption(caption=call.message.caption + "\n\n❌ <b>RAD ETILDI</b>", chat_id=call.message.chat.id, message_id=call.message.message_id)
     bot.answer_callback_query(call.id)
 
-# Admin boshqa funksiyalari
+# Admin ro'yxat / o'chirish / rassilka
 @bot.message_handler(func=lambda m: m.text == "📋 Testlar roʻyxati")
 def list_tests(message):
     if not db_is_admin(message.from_user.id): return
@@ -549,7 +722,7 @@ def list_tests(message):
         c.execute("SELECT test_code, title, created_at FROM tests ORDER BY test_code DESC LIMIT 15")
         rows = c.fetchall()
     if not rows: return bot.send_message(message.chat.id, "📭 Testlar yoʻq.")
-    bot.send_message(message.chat.id, "📋 <b>Testlar:</b>\n" + "\n".join([f"🔹 Kod: <code>{r[0]}</code> — {r[1]} <i>({r[2]})</i>" for r in rows]))
+    bot.send_message(message.chat.id, "📋 <b>Testlar:</b>\n" + "\n".join([f"🔹 Kod: <code>{r[0]}</code> — {r[1]}" for r in rows]))
 
 @bot.message_handler(func=lambda m: m.text == "🗑 Testni oʻchirish")
 def del_test(message):
@@ -573,7 +746,7 @@ def del_test_do(message):
 def broadcast(message):
     if not db_is_admin(message.from_user.id): return
     user_states[message.from_user.id] = "broad"
-    bot.send_message(message.chat.id, "📢 Hammaga boradigan xabarni kiriting:", reply_markup=cancel_kb())
+    bot.send_message(message.chat.id, "📢 Hammaga yuboriladigan xabarni kiriting:", reply_markup=cancel_kb())
 
 @bot.message_handler(content_types=['text', 'photo', 'video', 'document'], func=lambda m: user_states.get(m.from_user.id) == "broad")
 def broadcast_send(message):
@@ -590,7 +763,7 @@ def broadcast_send(message):
         except Exception: pass
     bot.send_message(uid, f"✅ {sent} ta oʻquvchiga yuborildi!", reply_markup=admin_menu())
 
-# ================= FLASK WEB SERVER VA WEB APP =================
+# ================= FLASK SERVER =================
 @app.route("/")
 def index():
     return "A+ Kimyo Bot 24/7 ishlamoqda!"
@@ -607,5 +780,6 @@ if __name__ == "__main__":
     init_db()
     threading.Thread(target=run_web, daemon=True).start()
     bot.remove_webhook()
-    print("Bot va Elektron Titr ishga tushdi...")
+    print("Bot ishga tushdi...")
     bot.infinity_polling(none_stop=True, interval=0, timeout=20)
+    
