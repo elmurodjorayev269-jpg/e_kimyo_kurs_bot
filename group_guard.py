@@ -1,18 +1,22 @@
+import os
 import re
 import time
+import base64
 import threading
+import requests
+
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 
 # Qorovul sozlamalari
 GUARD_CONFIG = {
     "enabled": True,             # Qorovulni yoqish/o'chirish
     "block_links": True,         # Havola, @username va forwardlarni o'chirish
     "block_bad_words": True,     # So'kinish va haqoratlarni o'chirish
-    "block_media_nsfw": True,    # Video, GIF, stiker va dumaloq videolarni o'chirish
-    "max_warnings": 2,           # Nechta ogohlantirishdan keyin bloklansin (1 = darhol blok)
+    "ai_nsfw_check": True,       # AI orqali faqat 18+ rasm, stiker, GIF va videolarni ushlash
+    "max_warnings": 2,           # Nechta ogohlantirishdan keyin bloklansin
     "ban_forever": True,         # True = butunlay Ban, False = 24 soatga Mute
 }
 
-# 1. Alohida so'z sifatida tekshiriladigan qisqa haqoratlar (oddiy so'zlar ichida adashmasligi uchun)
 EXACT_BAD_WORDS = {
     "it", "eshak", "mol", "chochqa", "cho'chqa", "lox", "loh", "sucka", "suka",
     "blya", "blyat", "nah", "nax", "pox", "poh", "xuy", "huy", "xui", "hui",
@@ -21,9 +25,7 @@ EXACT_BAD_WORDS = {
     "fuck", "shit", "bitch", "dick", "cock", "pussy", "slut", "whore",
 }
 
-# 2. Qo'shimchali va yopishtirib yozilgan shakllari ham ushlanadigan o'zaklar
 ROOT_BAD_WORDS = {
-    # O'zbekcha haqorat va so'kinish o'zaklari (lotin)
     "ahmoq", "axmoq", "tentak", "jinni", "iflos", "harom", "xarom", "haromi", "xaromi",
     "qanjq", "qanjiq", "fohisha", "foxisha", "jalab", "jalap", "sharmanda", "betamiz",
     "beodob", "terpila", "kazzob", "muttaham", "maraz", "razill", "ablah", "ablax",
@@ -34,9 +36,7 @@ ROOT_BAD_WORDS = {
     "emchak", "ko't", "kotvachcha", "ko'tvachcha", "kotlik", "ko'tlik",
     "onangni", "onangdi", "oneni", "onengni", "enangni", "eneni", "singlingni",
     "opangni", "og'zingga", "ogzingga", "og'zinga", "ogzinga", "kallanga",
-    "basharangga", "aftingga", "daxuya", "daxshat", "chort", "chmo", "chmoshnik",
-
-    # O'zbekcha haqorat va so'kinish o'zaklari (kirill)
+    "basharangga", "aftingga", "daxuya", "chort", "chmo", "chmoshnik",
     "ахмок", "аҳмоқ", "тентак", "жинни", "ифлос", "харом", "ҳаром", "хароми", "ҳароми",
     "канжик", "қанжиқ", "фохиша", "фоҳиша", "жалаб", "жалап", "шарманда",
     "каззоб", "муттахам", "муттаҳам", "мараз", "аблах", "аблаҳ",
@@ -46,21 +46,16 @@ ROOT_BAD_WORDS = {
     "куток", "қўтоқ", "қутоқ", "аминг", "амингга", "эмчак", "кутвачча", "кўтвачча",
     "онангни", "онангди", "онени", "онангнинг", "энангни", "синглингни",
     "опангни", "огзингга", "оғзингга", "башарангга", "афтингга", "чмо", "чмошник",
-
-    # Ruscha so'kinish o'zaklari
     "бляд", "сучк", "хуйн", "хуев", "хуёв", "охуе", "ахуе", "нахуй", "похуй",
     "пизд", "ебан", "ёбан", "ебат", "ебал", "ебло", "уебок", "уёбок", "заеб",
     "мудак", "мудил", "гандон", "пидор", "шлюх", "шалав", "мраз", "тварь",
     "ублюд", "дебил", "идиот", "кретин", "сволоч", "падл", "гнид", "хуесос",
     "pizd", "pidor", "ebat", "ebal", "yeban", "xuyna", "huyna", "nahuy", "pohuy",
     "shlyux", "shalav", "mudak", "ublyud", "debil", "svoloch", "xuesos", "huesos",
-
-    # Inglizcha so'kinish o'zaklari
     "fucking", "fucker", "motherfuck", "bullshit", "asshole", "bastard", "dumbass",
     "jerkoff", "wanker", "cunt", "faggot", "nigger", "nigga",
 }
 
-# Harflar o'rniga raqam yoki o'xshash belgi qo'yib aldashni tuzatuvchi jadval
 LEET_MAP = str.maketrans({
     "0": "o", "1": "i", "3": "e", "4": "a", "5": "s", "7": "t", "8": "b",
     "@": "a", "$": "s", "!": "i",
@@ -71,18 +66,14 @@ LINK_REGEX = re.compile(
     re.IGNORECASE,
 )
 
-# Ogohlantirishlar hisoblagichi: {(chat_id, user_id): soni}
 warnings_db = {}
 
 
 def _normalize_text(text: str) -> str:
     lowered = text.lower().translate(LEET_MAP)
-    # O'zbekcha tutuq va o'/g' belgilarini birxillashtirish
     lowered = lowered.replace("o‘", "o").replace("o'", "o").replace("oʻ", "o")
     lowered = lowered.replace("g‘", "g").replace("g'", "g").replace("gʻ", "g")
-    # Belgilar va bo'shliqlarni olib tashlash
     cleaned = re.sub(r"[^a-zа-яёқғҳў]", "", lowered)
-    # Ketma-ket bir xil harflarni qisqartirish (masalan: "siiiik" -> "sik")
     cleaned = re.sub(r"(.)\1{2,}", r"\1", cleaned)
     return cleaned
 
@@ -90,12 +81,10 @@ def _normalize_text(text: str) -> str:
 def has_profanity(text: str) -> bool:
     if not text:
         return False
-
     lowered = text.lower().translate(LEET_MAP)
     lowered = lowered.replace("o‘", "o").replace("o'", "o").replace("oʻ", "o")
     lowered = lowered.replace("g‘", "g").replace("g'", "g").replace("gʻ", "g")
 
-    # 1. Alohida so'zlar bo'yicha tekshirish
     words = re.findall(r"[a-zа-яёқғҳў]+", lowered)
     for w in words:
         w_short = re.sub(r"(.)\1{2,}", r"\1", w)
@@ -105,12 +94,10 @@ def has_profanity(text: str) -> bool:
             if root in w or root in w_short:
                 return True
 
-    # 2. Harflar orasiga nuqta/probel qo'yib yozilgan matnni tekshirish (masalan: "s.i.k")
     joined = _normalize_text(text)
     for root in ROOT_BAD_WORDS:
         if root in joined:
             return True
-
     return False
 
 
@@ -118,13 +105,67 @@ def has_link_or_forward(message) -> bool:
     entities = (message.entities or []) + (message.caption_entities or [])
     if any(e.type in ("url", "text_link", "mention") for e in entities):
         return True
-
     text = f"{message.text or ''} {message.caption or ''}"
     if LINK_REGEX.search(text):
         return True
-
     if getattr(message, "forward_from", None) or getattr(message, "forward_from_chat", None) or getattr(message, "forward_date", None):
         return True
+    return False
+
+
+def is_nsfw_by_ai(bot, message) -> bool:
+    """Rasm, stiker, GIF yoki videoning muqovasini AI orqali tekshiradi."""
+    if not GEMINI_API_KEY:
+        return False
+
+    file_id = None
+    if message.photo:
+        file_id = message.photo[-1].file_id
+    elif message.sticker:
+        if message.sticker.thumb:
+            file_id = message.sticker.thumb.file_id
+        elif not message.sticker.is_animated and not message.sticker.is_video:
+            file_id = message.sticker.file_id
+    elif message.animation and message.animation.thumb:
+        file_id = message.animation.thumb.file_id
+    elif message.video and message.video.thumb:
+        file_id = message.video.thumb.file_id
+    elif message.video_note and message.video_note.thumb:
+        file_id = message.video_note.thumb.file_id
+
+    if not file_id:
+        return False
+
+    try:
+        file_info = bot.get_file(file_id)
+        img_bytes = bot.download_file(file_info.file_path)
+        b64_img = base64.b64encode(img_bytes).decode("utf-8")
+
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
+        payload = {
+            "contents": [{
+                "parts": [
+                    {
+                        "text": (
+                            "Does this image contain sexually explicit content, nudity, pornography, or NSFW material? "
+                            "Reply with strictly one word: YES or NO."
+                        )
+                    },
+                    {
+                        "inline_data": {
+                            "mime_type": "image/jpeg",
+                            "data": b64_img
+                        }
+                    }
+                ]
+            }]
+        }
+        resp = requests.post(url, json=payload, timeout=6)
+        if resp.status_code == 200:
+            answer = resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip().upper()
+            return answer.startswith("YES")
+    except Exception as e:
+        print(f"AI NSFW tekshiruv xatosi: {e}")
 
     return False
 
@@ -149,7 +190,7 @@ def _delete_later(bot, chat_id, message_id, delay=5):
         pass
 
 
-def apply_punishment(bot, message, reason: str):
+def apply_punishment(bot, message, reason: str, instant_ban: bool = False):
     chat_id = message.chat.id
     user = message.from_user
 
@@ -162,7 +203,7 @@ def apply_punishment(bot, message, reason: str):
     warnings_db[key] = warnings_db.get(key, 0) + 1
     count = warnings_db[key]
 
-    if count >= GUARD_CONFIG["max_warnings"]:
+    if instant_ban or count >= GUARD_CONFIG["max_warnings"]:
         try:
             if GUARD_CONFIG["ban_forever"]:
                 bot.ban_chat_member(chat_id, user.id)
@@ -226,12 +267,13 @@ def register_guard(bot):
             apply_punishment(bot, message, "guruhga havola yoki reklama tashlash taqiqlangan")
             return
 
-        # 2. So'kinish va haqorat tekshiruvi (ham matn, ham rasm ostidagi yozuvda)
+        # 2. So'kinish va haqorat tekshiruvi
         if GUARD_CONFIG["block_bad_words"] and has_profanity(full_text):
             apply_punishment(bot, message, "guruhda haqoratli so'z yozish taqiqlangan")
             return
 
-        # 3. Video, GIF va stiker nazorati (oddiy rasmga ruxsat beriladi)
-        if GUARD_CONFIG["block_media_nsfw"] and message.content_type in ("video", "animation", "sticker", "video_note"):
-            apply_punishment(bot, message, "guruhga video, GIF yoki stiker tashlash taqiqlangan")
-            return
+        # 3. AI orqali 18+ (porno) rasm, stiker, GIF va videolarni aniqlash
+        if GUARD_CONFIG["ai_nsfw_check"] and message.content_type in ("photo", "sticker", "animation", "video", "video_note"):
+            if is_nsfw_by_ai(bot, message):
+                apply_punishment(bot, message, "guruhga 18+ (behayo) kontent tashlash taqiqlangan", instant_ban=True)
+                return
