@@ -11,6 +11,7 @@ from telebot.types import (
     InlineKeyboardMarkup, InlineKeyboardButton,
     WebAppInfo
 )
+from group_guard import register_guard
 
 # Hisobot va Sertifikat kutubxonalari
 import openpyxl
@@ -20,8 +21,8 @@ from reportlab.pdfgen import canvas
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 # ================= SOZLAMALAR =================
-BOT_TOKEN = "8636730483:AAFCHNjwvmaLZuRk3fd3sOIbN2QMYd-h_4g"
-ADMIN_PAROL = "kimyo2026"
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8636730483:AAFCHNjwvmaLZuRk3fd3sOIbN2QMYd-h_4g")
+ADMIN_PAROL = os.environ.get("ADMIN_PAROL", "kimyo2026")
 ADMIN_LICHKA = "@onlyibrohimov"
 KANAL_USER = "@kimyo_sertifkat_uchun"
 KANAL_LINK = "https://t.me/kimyo_sertifkat_uchun"
@@ -32,6 +33,9 @@ RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "https://e-kimyo-kurs-bot.onr
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 app = Flask(__name__)
+
+# Guruh qorovulini eng birinchi bo'lib ulaymiz!
+register_guard(bot)
 
 user_states = {}
 user_data = {}
@@ -310,107 +314,93 @@ def db_get_admins():
 # ================= BMBA (DTM) SERTIFIKAT GENERATORI =================
 def generate_bmba_certificate(full_name, score, percent, level, photo_path):
     cert_path = f"bmba_cert_{random.randint(1000, 9999)}.png"
-    W, H = 842, 1191  # A4 o'lchamlari 96 DPI uchun
-    
-    # Oq qog'oz foni
+    W, H = 842, 1191
+
     img = Image.new("RGB", (W, H), color="white")
     draw = ImageDraw.Draw(img)
-    
-    # Milliy va professional chegaralar (Skrinshotdagidek)
+
     draw.rectangle([15, 15, W - 15, H - 15], outline="#1a1a1a", width=3)
     draw.line([30, 195, W - 30, 195], fill="#0a0a0a", width=2)
-    
-    # Gerb virtual o'rni
+
     draw.ellipse([386, 35, 456, 105], outline="#1b5e20", width=3)
     draw.ellipse([391, 40, 451, 100], fill="#0d47a1")
-    
-    font_normal = ImageFont.load_default()
-    
-    # Yuqori idoralar (Markazlashtirilgan)
+
     draw.text((150, 120), "O'ZBEKISTON RESPUBLIKASI OLIY TA'LIM, FAN VA INNOVATSIYALAR VAZIRLIGI", fill="black")
     draw.text((195, 138), "HUZURIDAGI BILIM VA MALAKALARNI BAHOLASH AGENTLIGI", fill="black")
-    
-    # To'g'risida sertifikat
+
     draw.text((220, 210), "UMUMTA'LIM FANINI BILISH DARAJASI TO'G'RISIDA", fill="black")
     draw.text((360, 230), "SERTIFIKAT", fill="black")
-    
-    # Random Sertifikat raqami (UZ26 + 6 xonali)
+
     cert_num = f"UZ26 {random.randint(100000, 999999)}"
-    draw.text((50, 280), "Sertifikat raqami:")
-    draw.text((180, 280), cert_num)
+    draw.text((50, 280), "Sertifikat raqami:", fill="black")
+    draw.text((180, 280), cert_num, fill="black")
     draw.line([30, 310, W - 30, 310], fill="#cccccc", width=1)
-    
-    # Shaxsiy Ma'lumotlar sathlari
+
     user_code = str(random.randint(1000000, 9999999))
-    draw.text((50, 330), "Talabgoringiz shaxsiy kodi:")
-    draw.text((260, 330), user_code)
-    
+    draw.text((50, 330), "Talabgoringiz shaxsiy kodi:", fill="black")
+    draw.text((260, 330), user_code, fill="black")
+
     name_parts = full_name.split()
     f_name = name_parts[0].upper() if len(name_parts) > 0 else "FOZILOV"
     i_name = name_parts[1].upper() if len(name_parts) > 1 else "SHOXRUX"
     o_name = (name_parts[2].upper() + " O'G'LI") if len(name_parts) > 2 else "SHAVKAT O'G'LI"
-    
-    draw.text((50, 365), "Familiyasi:")
-    draw.text((200, 365), f_name)
-    
-    draw.text((50, 395), "Ismi:")
-    draw.text((200, 395), i_name)
-    
-    draw.text((50, 425), "Otasining ismi:")
-    draw.text((200, 425), o_name)
-    
+
+    draw.text((50, 365), "Familiyasi:", fill="black")
+    draw.text((200, 365), f_name, fill="black")
+
+    draw.text((50, 395), "Ismi:", fill="black")
+    draw.text((200, 395), i_name, fill="black")
+
+    draw.text((50, 425), "Otasining ismi:", fill="black")
+    draw.text((200, 425), o_name, fill="black")
+
     draw.line([30, 460, W - 30, 460], fill="#cccccc", width=1)
-    
-    # O'quvchi rasmini o'ng tomonga kesib, chiroyli joylashtirish
+
     try:
         user_img = Image.open(photo_path)
-        user_img = ImageOps.fit(user_img, (130, 160)) 
+        user_img = ImageOps.fit(user_img, (130, 160))
         img.paste(user_img, (650, 330))
         draw.rectangle([650, 330, 780, 490], outline="#cccccc", width=1)
     except Exception:
         draw.rectangle([650, 330, 780, 490], outline="red", width=1)
         draw.text((670, 400), "Rasmda xato", fill="red")
 
-    # Ball va Daraja
-    draw.text((50, 480), "Umumta'lim fani:")
-    draw.text((380, 480), "Kimyo (O'zbekiston)")
-    
-    draw.text((50, 510), "Umumiy to'plagan ball (Rash shkalasi):")
-    draw.text((380, 510), f"{score}")
-    
-    draw.text((50, 540), "Umumiy ballga nisbatan foiz ko'rsatkichi:")
-    draw.text((380, 540), f"{percent} %")
-    
-    draw.text((50, 570), "Sertifikat darajasi:")
-    draw.text((380, 570), level)
-    
+    draw.text((50, 480), "Umumta'lim fani:", fill="black")
+    draw.text((380, 480), "Kimyo (O'zbekiston)", fill="black")
+
+    draw.text((50, 510), "Umumiy to'plagan ball (Rash shkalasi):", fill="black")
+    draw.text((380, 510), f"{score}", fill="black")
+
+    draw.text((50, 540), "Umumiy ballga nisbatan foiz ko'rsatkichi:", fill="black")
+    draw.text((380, 540), f"{percent} %", fill="black")
+
+    draw.text((50, 570), "Sertifikat darajasi:", fill="black")
+    draw.text((380, 570), level, fill="black")
+
     draw.line([30, 610, W - 30, 610], fill="#cccccc", width=1)
-    
-    # Natijalar tarkibi
+
     t_test = round(score * 0.72, 2)
     t_yozma = round(score * 0.28, 2)
-    draw.text((50, 630), "Test sinovi natijasi:")
-    draw.text((650, 630), f"{t_test}")
-    
-    draw.text((50, 660), "Yozma ish natijasi:")
-    draw.text((650, 660), f"{t_yozma}")
-    
-    # Muddati (Amal qilish)
+    draw.text((50, 630), "Test sinovi natijasi:", fill="black")
+    draw.text((650, 630), f"{t_test}", fill="black")
+
+    draw.text((50, 660), "Yozma ish natijasi:", fill="black")
+    draw.text((650, 660), f"{t_yozma}", fill="black")
+
     s_sana = datetime.now().strftime("%d.%m.%Y")
     m_sana = (datetime.now().replace(year=datetime.now().year + 3)).strftime("%d.%m.%Y")
-    
+
     draw.line([30, 850, W - 30, 850], fill="#0a0a0a", width=1)
-    draw.text((50, 880), f"Berilgan sanasi: {s_sana}")
-    draw.text((450, 880), f"Amal qilish muddati: {m_sana}")
-    
-    # Direktor va QR kod virtual o'rni
+    draw.text((50, 880), f"Berilgan sanasi: {s_sana}", fill="black")
+    draw.text((450, 880), f"Amal qilish muddati: {m_sana}", fill="black")
+
     draw.rectangle([340, 920, 440, 1020], fill="black")
     draw.rectangle([350, 930, 430, 1010], fill="white")
     draw.rectangle([375, 955, 405, 985], fill="black")
-    
-    draw.text((200, 960), "Direktor")
-    draw.text((500, 960), "M.KARIMOV")
-    
+
+    draw.text((200, 960), "Direktor", fill="black")
+    draw.text((500, 960), "M.KARIMOV", fill="black")
+
     img.save(cert_path)
     return cert_path
 
@@ -465,25 +455,27 @@ def cancel_kb():
 def verify_sub_callback(call):
     uid = call.from_user.id
     if check_subscription(uid):
-        try: bot.delete_message(call.message.chat.id, call.message.message_id)
-        except Exception: pass
+        try:
+            bot.delete_message(call.message.chat.id, call.message.message_id)
+        except Exception:
+            pass
         bot.send_message(uid, "✅ <b>Obuna tasdiqlandi!</b> Xush kelibsiz!", reply_markup=main_menu(uid))
     else:
         bot.answer_callback_query(call.id, "❌ Siz hali kanalga obuna boʻlmadingiz!", show_alert=True)
 
-# ================= /START VA ASOSIY BUYRUQLAR =================
-@bot.message_handler(commands=['start'])
+# ================= /START VA ASOSIY BUYRUQLAR (FAQAT SHAXSIY CHATDA) =================
+@bot.message_handler(chat_types=["private"], commands=['start'])
 def start_cmd(message):
     uid = message.from_user.id
     user_states.pop(uid, None)
-    
+
     parts = message.text.split()
     ref_id = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
     db_add_user(uid, message.from_user.full_name, message.from_user.username, ref_id)
 
     if not check_subscription(uid):
         return ask_to_subscribe(uid)
-    
+
     text = (
         f"Assalomu alaykum, <b>{message.from_user.full_name}</b>! 👋\n\n"
         f"🧪 <b>A+ Kimyo | Online Maktabi</b> platformasiga xush kelibsiz!\n\n"
@@ -495,7 +487,7 @@ def start_cmd(message):
     )
     bot.send_message(uid, text, reply_markup=main_menu(uid))
 
-@bot.message_handler(commands=['admin'])
+@bot.message_handler(chat_types=["private"], commands=['admin'])
 def admin_cmd(message):
     uid = message.from_user.id
     db_add_user(uid, message.from_user.full_name, message.from_user.username)
@@ -506,22 +498,23 @@ def admin_cmd(message):
     elif db_is_admin(uid):
         bot.send_message(uid, "⚙️ <b>Admin Panel:</b>", reply_markup=admin_menu())
     else:
-        bot.send_message(uid, "🔒 Parolni kiriting: <code>/admin kimyo2026</code>")
+        bot.send_message(uid, "🔒 Parolni kiriting: <code>/admin PAROL</code>")
 
-@bot.message_handler(func=lambda m: m.text in ["❌ Bekor qilish", "🔙 Asosiy menyu"])
+@bot.message_handler(chat_types=["private"], func=lambda m: m.text in ["❌ Bekor qilish", "🔙 Asosiy menyu"])
 def cancel_action(message):
     uid = message.from_user.id
     user_states.pop(uid, None)
     bot.send_message(uid, "🏠 Asosiy menyu:", reply_markup=main_menu(uid))
 
-@bot.message_handler(func=lambda m: m.text == "⚙️ Admin Panel")
+@bot.message_handler(chat_types=["private"], func=lambda m: m.text == "⚙️ Admin Panel")
 def open_admin(message):
     if db_is_admin(message.from_user.id):
         bot.send_message(message.chat.id, "⚙️ <b>Admin Panel:</b>", reply_markup=admin_menu())
 
-@bot.message_handler(func=lambda m: m.text == "📞 Admin bilan aloqa")
+@bot.message_handler(chat_types=["private"], func=lambda m: m.text == "📞 Admin bilan aloqa")
 def contact_admin(message):
-    if not check_subscription(message.from_user.id): return ask_to_subscribe(message.chat.id)
+    if not check_subscription(message.from_user.id):
+        return ask_to_subscribe(message.chat.id)
     bot.send_message(
         message.chat.id,
         f"👨‍🏫 <b>Muallif va kurs rahbari:</b> Azizbek Ibrohimov\n"
@@ -530,10 +523,11 @@ def contact_admin(message):
     )
 
 # ================= SHAXSIY KABINET VA REFERAL =================
-@bot.message_handler(func=lambda m: m.text == "👤 Shaxsiy kabinet")
+@bot.message_handler(chat_types=["private"], func=lambda m: m.text == "👤 Shaxsiy kabinet")
 def user_profile(message):
     uid = message.from_user.id
-    if not check_subscription(uid): return ask_to_subscribe(uid)
+    if not check_subscription(uid):
+        return ask_to_subscribe(uid)
     with sqlite3.connect("database.db") as conn:
         c = conn.cursor()
         c.execute("SELECT full_name, phone, group_name, bonus_points, joined_at FROM users WHERE user_id = ?", (uid,))
@@ -556,10 +550,11 @@ def user_profile(message):
     )
     bot.send_message(uid, text)
 
-@bot.message_handler(func=lambda m: m.text == "🔗 Doʻstlarni taklif qilish")
+@bot.message_handler(chat_types=["private"], func=lambda m: m.text == "🔗 Doʻstlarni taklif qilish")
 def referral_link(message):
     uid = message.from_user.id
-    if not check_subscription(uid): return ask_to_subscribe(uid)
+    if not check_subscription(uid):
+        return ask_to_subscribe(uid)
     bot_info = bot.get_me()
     ref_url = f"https://t.me/{bot_info.username}?start={uid}"
     with sqlite3.connect("database.db") as conn:
@@ -576,11 +571,12 @@ def referral_link(message):
     bot.send_message(uid, text)
 
 # ================= KIMYOVIY VIKTORINA =================
-@bot.message_handler(func=lambda m: m.text == "🎮 Kimyo Viktorina")
+@bot.message_handler(chat_types=["private"], func=lambda m: m.text == "🎮 Kimyo Viktorina")
 def start_quiz(message):
     uid = message.from_user.id
-    if not check_subscription(uid): return ask_to_subscribe(uid)
-    
+    if not check_subscription(uid):
+        return ask_to_subscribe(uid)
+
     q_obj = random.choice([
         {"q": "Sulfat kislotaning molekulyar formulasi qaysi?", "opts": ["H2SO4", "H2SO3", "H2S", "HNO3"], "ans": "H2SO4"},
         {"q": "Kaliy permanganatning formulasi qaysi?", "opts": ["KMnO4", "K2MnO4", "MnO2", "KClO3"], "ans": "KMnO4"},
@@ -591,7 +587,7 @@ def start_quiz(message):
     ])
     opts = q_obj["opts"].copy()
     random.shuffle(opts)
-    
+
     user_data[uid] = {"quiz_ans": q_obj["ans"]}
     kb = InlineKeyboardMarkup(row_width=2)
     btns = [InlineKeyboardButton(o, callback_data=f"quiz_{o}") for o in opts]
@@ -622,10 +618,11 @@ def check_quiz(call):
     bot.answer_callback_query(call.id)
 
 # ================= MODDALAR LUG'ATI =================
-@bot.message_handler(func=lambda m: m.text == "📖 Moddalar lugʻati")
+@bot.message_handler(chat_types=["private"], func=lambda m: m.text == "📖 Moddalar lugʻati")
 def ask_dict_word(message):
     uid = message.from_user.id
-    if not check_subscription(uid): return ask_to_subscribe(uid)
+    if not check_subscription(uid):
+        return ask_to_subscribe(uid)
     user_states[uid] = "wait_chem_word"
     bot.send_message(
         uid,
@@ -633,17 +630,17 @@ def ask_dict_word(message):
         reply_markup=cancel_kb()
     )
 
-@bot.message_handler(func=lambda m: user_states.get(m.from_user.id) == "wait_chem_word")
+@bot.message_handler(chat_types=["private"], func=lambda m: user_states.get(m.from_user.id) == "wait_chem_word")
 def search_chem_dict(message):
     uid = message.from_user.id
     query = message.text.strip().lower()
-    
+
     CHEM_DICT = {
         "kmno4": "🧪 <b>Kaliy permanganat (KMnO₄)</b>\nToʻq binafsha rangli kristall modda, kuchli oksidlovchi.\n• Kislotali muhitda: Mn⁺⁷ → Mn²⁺ (rangsiz eritma)",
         "h2so4": "🧪 <b>Sulfat kislota (H₂SO₄)</b>\nKuchli ikki negizli mineral kislota.",
         "hno3": "🧪 <b>Nitrat kislota (HNO₃)</b>\nKuchli bir negizli kislota."
     }
-    
+
     res = CHEM_DICT.get(query)
     if res:
         bot.send_message(uid, res)
@@ -651,9 +648,10 @@ def search_chem_dict(message):
         bot.send_message(uid, "🔍 Bu modda bazada topilmadi. Boshqa formula yozib koʻring (masalan: <code>KMnO4</code>).")
 
 # ================= NAMUNA DARSLAR =================
-@bot.message_handler(func=lambda m: m.text == "🎬 Namuna darslar")
+@bot.message_handler(chat_types=["private"], func=lambda m: m.text == "🎬 Namuna darslar")
 def show_sample_lessons(message):
-    if not check_subscription(message.from_user.id): return ask_to_subscribe(message.chat.id)
+    if not check_subscription(message.from_user.id):
+        return ask_to_subscribe(message.chat.id)
     with sqlite3.connect("database.db") as conn:
         c = conn.cursor()
         c.execute("SELECT id, title FROM sample_lessons ORDER BY id DESC LIMIT 20")
@@ -674,48 +672,58 @@ def send_sample_lesson(call):
         c = conn.cursor()
         c.execute("SELECT title, description, file_id, file_type FROM sample_lessons WHERE id = ?", (lid,))
         row = c.fetchone()
-    if not row: return bot.answer_callback_query(call.id, "Topilmadi!")
+    if not row:
+        return bot.answer_callback_query(call.id, "Topilmadi!")
 
     title, desc, file_id, ftype = row
     caption = f"🎬 <b>{title}</b>\n\n{desc}\n\n👨‍🏫 {ADMIN_LICHKA} | 📢 {KANAL_USER}"
-    if ftype == "video": bot.send_video(call.message.chat.id, file_id, caption=caption)
-    elif ftype == "document": bot.send_document(call.message.chat.id, file_id, caption=caption)
-    elif ftype == "photo": bot.send_photo(call.message.chat.id, file_id, caption=caption)
+    if ftype == "video":
+        bot.send_video(call.message.chat.id, file_id, caption=caption)
+    elif ftype == "document":
+        bot.send_document(call.message.chat.id, file_id, caption=caption)
+    elif ftype == "photo":
+        bot.send_photo(call.message.chat.id, file_id, caption=caption)
     bot.answer_callback_query(call.id)
 
-@bot.message_handler(func=lambda m: m.text == "🎬 Namuna dars qoʻshish")
+@bot.message_handler(chat_types=["private"], func=lambda m: m.text == "🎬 Namuna dars qoʻshish")
 def adm_add_lesson_1(message):
     uid = message.from_user.id
-    if not db_is_admin(uid): return
+    if not db_is_admin(uid):
+        return
     user_states[uid] = "les_title"
     bot.send_message(uid, "🎬 <b>Namuna dars nomini kiriting:</b>", reply_markup=cancel_kb())
 
-@bot.message_handler(func=lambda m: user_states.get(m.from_user.id) == "les_title")
+@bot.message_handler(chat_types=["private"], func=lambda m: user_states.get(m.from_user.id) == "les_title")
 def adm_add_lesson_2(message):
     uid = message.from_user.id
     user_data[uid] = {"title": message.text}
     user_states[uid] = "les_desc"
     bot.send_message(uid, "📝 <b>Izoh yozing</b> (yoki <code>-</code> yuboring):")
 
-@bot.message_handler(func=lambda m: user_states.get(m.from_user.id) == "les_desc")
+@bot.message_handler(chat_types=["private"], func=lambda m: user_states.get(m.from_user.id) == "les_desc")
 def adm_add_lesson_3(message):
     uid = message.from_user.id
     user_data[uid]["desc"] = "" if message.text == "-" else message.text
     user_states[uid] = "les_file"
     bot.send_message(uid, "📎 Endi <b>Video, PDF yoki Rasmni</b> yuboring:")
 
-@bot.message_handler(content_types=['video', 'document', 'photo'], func=lambda m: user_states.get(m.from_user.id) == "les_file")
+@bot.message_handler(chat_types=["private"], content_types=['video', 'document', 'photo'], func=lambda m: user_states.get(m.from_user.id) == "les_file")
 def adm_save_lesson(message):
     uid = message.from_user.id
     info = user_data[uid]
-    if message.video: fid, ftype = message.video.file_id, "video"
-    elif message.document: fid, ftype = message.document.file_id, "document"
-    else: fid, ftype = message.photo[-1].file_id, "photo"
+    if message.video:
+        fid, ftype = message.video.file_id, "video"
+    elif message.document:
+        fid, ftype = message.document.file_id, "document"
+    else:
+        fid, ftype = message.photo[-1].file_id, "photo"
 
     with sqlite3.connect("database.db") as conn:
         c = conn.cursor()
-        c.execute("INSERT INTO sample_lessons (title, description, file_id, file_type, added_at) VALUES (?, ?, ?, ?, ?)",
-                  (info["title"], info["desc"], fid, ftype, datetime.now().strftime("%Y-%m-%d %H:%M")))
+        c.execute(
+            "INSERT INTO sample_lessons (title, description, file_id, file_type, added_at) VALUES (?, ?, ?, ?, ?)",
+            (info["title"], info["desc"], fid, ftype, datetime.now().strftime("%Y-%m-%d %H:%M"))
+        )
         conn.commit()
     user_states.pop(uid, None)
     bot.send_message(uid, f"✅ <b>«{info['title']}»</b> qoʻshildi!", reply_markup=admin_menu())
@@ -724,16 +732,16 @@ def adm_save_lesson(message):
 @bot.message_handler(content_types=['web_app_data'])
 def handle_webapp_data(message):
     uid = message.from_user.id
-    if not check_subscription(uid): return ask_to_subscribe(uid)
+    if not check_subscription(uid):
+        return ask_to_subscribe(uid)
 
     payload = json.loads(message.web_app_data.data)
     mode, meta, answers = payload.get("mode"), payload.get("meta"), payload.get("answers")
 
-    # Admin yangi test kodi yaratganda (HAR SAFAR RANDOM 6 XONALI KOD BERILADI)
     if mode == "create":
-        if not db_is_admin(uid): return
-        
-        # Takrorlanmas 6 xonali random kod generatsiyasi
+        if not db_is_admin(uid):
+            return
+
         while True:
             code = random.randint(100000, 999999)
             with sqlite3.connect("database.db") as conn:
@@ -741,23 +749,24 @@ def handle_webapp_data(message):
                 c.execute("SELECT test_code FROM tests WHERE test_code = ?", (code,))
                 if not c.fetchone():
                     break
-                    
+
         with sqlite3.connect("database.db") as conn:
             c = conn.cursor()
-            c.execute("INSERT INTO tests (test_code, title, answers, created_at) VALUES (?, ?, ?, ?)",
-                      (code, meta, json.dumps(answers), datetime.now().strftime("%Y-%m-%d %H:%M")))
+            c.execute(
+                "INSERT INTO tests (test_code, title, answers, created_at) VALUES (?, ?, ?, ?)",
+                (code, meta, json.dumps(answers), datetime.now().strftime("%Y-%m-%d %H:%M"))
+            )
             conn.commit()
-            
+
         bot.send_message(
-            uid, 
+            uid,
             f"✅ <b>Yangi 40 talik Milliy Test muvaffaqiyatli yaratildi!</b>\n\n"
             f"🔢 <b>Maxsus Test kodi:</b> <code>{code}</code>\n"
             f"📘 Mavzu: <b>{meta}</b>\n\n"
-            f"Oʻquvchilar ushbu random kodni kiritib testni topshirishadi.", 
+            f"Oʻquvchilar ushbu random kodni kiritib testni topshirishadi.",
             reply_markup=admin_menu()
         )
 
-    # O'quvchi testni yechib tugatganda
     elif mode == "solve":
         if not meta.isdigit():
             return bot.send_message(uid, "⚠️ Test kodi faqat raqam boʻlishi kerak!", reply_markup=main_menu(uid))
@@ -767,7 +776,7 @@ def handle_webapp_data(message):
             c.execute("SELECT title, answers FROM tests WHERE test_code = ?", (code,))
             row = c.fetchone()
         if not row:
-            return bot.send_message(uid, f"❌ Bunday kodli test topilmadi! Qaytadan tekshirib ko'ring.", reply_markup=main_menu(uid))
+            return bot.send_message(uid, "❌ Bunday kodli test topilmadi! Qaytadan tekshirib ko'ring.", reply_markup=main_menu(uid))
 
         title, correct_keys = row[0], json.loads(row[1])
         raw_correct, rash_score, details = 0, 0.0, []
@@ -776,10 +785,8 @@ def handle_webapp_data(message):
             u = str(answers[i]).strip().lower()
             k = str(correct_keys[i]).strip().lower()
             q_num = i + 1
-            
-            # To'g'ri Rash ball taqsimoti
             weight = 1.5 if q_num <= 32 else (2.2 if q_num <= 35 else 4.08)
-            
+
             if u != "" and u == k:
                 raw_correct += 1
                 rash_score += weight
@@ -790,23 +797,29 @@ def handle_webapp_data(message):
         rash_score = round(rash_score, 1)
         percent = round((rash_score / 75.0) * 100, 1)
 
-        # Qat'iy va rasmiy BMBA daraja shkalasi
-        if rash_score >= 70.0: daraja = "A+ daraja (A'lo)"
-        elif rash_score >= 65.0: daraja = "A daraja (A'lo)"
-        elif rash_score >= 60.0: daraja = "B+ daraja (Yaxshi)"
-        elif rash_score >= 55.0: daraja = "B daraja (Yaxshi)"
-        elif rash_score >= 50.0: daraja = "C+ daraja (Qoniqarli)"
-        elif rash_score >= 46.0: daraja = "C daraja (Qoniqarli)"
-        else: daraja = "Sertifikat darajasiga yetmadi"
+        if rash_score >= 70.0:
+            daraja = "A+ daraja (A'lo)"
+        elif rash_score >= 65.0:
+            daraja = "A daraja (A'lo)"
+        elif rash_score >= 60.0:
+            daraja = "B+ daraja (Yaxshi)"
+        elif rash_score >= 55.0:
+            daraja = "B daraja (Yaxshi)"
+        elif rash_score >= 50.0:
+            daraja = "C+ daraja (Qoniqarli)"
+        elif rash_score >= 46.0:
+            daraja = "C daraja (Qoniqarli)"
+        else:
+            daraja = "Sertifikat darajasiga yetmadi"
 
-        # Bazaga natijani yozish
         with sqlite3.connect("database.db") as conn:
             c = conn.cursor()
-            c.execute("INSERT INTO results (user_id, full_name, test_code, raw_correct, rash_score, percent, daraja, checked_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                      (uid, message.from_user.full_name, code, raw_correct, rash_score, percent, daraja, datetime.now().strftime("%Y-%m-%d %H:%M")))
+            c.execute(
+                "INSERT INTO results (user_id, full_name, test_code, raw_correct, rash_score, percent, daraja, checked_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (uid, message.from_user.full_name, code, raw_correct, rash_score, percent, daraja, datetime.now().strftime("%Y-%m-%d %H:%M"))
+            )
             conn.commit()
 
-        # O'quvchi ma'lumotlarini keyingi rasm so'rashda ishlatish uchun saqlash
         user_data[uid] = {
             "test_code": code,
             "title": title,
@@ -816,8 +829,7 @@ def handle_webapp_data(message):
             "raw_correct": raw_correct,
             "details": details
         }
-        
-        # Agar 46 balldan yuqori olgan bo'lsa darhol rasm yuklashni so'rab, sertifikatga bog'laymiz
+
         if rash_score >= 46.0:
             user_states[uid] = "wait_user_photo"
             bot.send_message(
@@ -831,10 +843,9 @@ def handle_webapp_data(message):
                 f"🎖 Daraja: <b>{daraja}</b>\n"
                 f"━━━━━━━━━━━━━━━━━━\n" + " | ".join(details) + "\n\n"
                 f"📸 <b>Siz sertifikat darajasini qo'lga kiritdingiz!</b>\n\n"
-                f"Milliy shablondagi rasmiy sertifikatingizni yuklab olish uchun iltimos shaxsiy **3x4 yoki yuzingiz aniq tushgan oddiy rasmingizni** rasm (photo) ko'rinishida shu yerga yuboring!"
+                f"Milliy shablondagi rasmiy sertifikatingizni yuklab olish uchun iltimos shaxsiy <b>3x4 yoki yuzingiz aniq tushgan oddiy rasmingizni</b> rasm (photo) ko'rinishida shu yerga yuboring!"
             )
         else:
-            # 46 dan past ball olgan bo'lsa
             res_text = (
                 f"📊 <b>Sertifikat olish uchun ball yetarli emas (Minimal: 46 ball).</b>\n"
                 f"━━━━━━━━━━━━━━━━━━\n"
@@ -847,57 +858,55 @@ def handle_webapp_data(message):
             bot.send_message(uid, res_text, reply_markup=main_menu(uid))
 
 # ================= RASH MODULI BO'YICHA RASMLI SERTIFIKAT TAYYORLASH =================
-@bot.message_handler(content_types=['photo'], func=lambda m: user_states.get(m.from_user.id) == "wait_user_photo")
+@bot.message_handler(chat_types=["private"], content_types=['photo'], func=lambda m: user_states.get(m.from_user.id) == "wait_user_photo")
 def receive_user_photo_cert(message):
     uid = message.from_user.id
     info = user_data.get(uid, {})
-    
-    # Rasmni vaqtincha saqlab olish
+
     file_info = bot.get_file(message.photo[-1].file_id)
     downloaded_file = bot.download_file(file_info.file_path)
-    
+
     temp_photo_path = f"temp_user_{uid}.jpg"
     with open(temp_photo_path, "wb") as new_file:
         new_file.write(downloaded_file)
-        
+
     bot.send_message(uid, "⏳ <b>Milliy Sertifikatingiz tayyorlanmoqda, iltimos biron soniya kuting...</b>")
-    
-    # Rasm bilan BMBA sertifikatini generatsiya qilish (Pillow ishlatilgan)
+
     try:
         cert_file = generate_bmba_certificate(
-            message.from_user.full_name, 
-            info["score"], 
-            info["percent"], 
-            info["daraja"], 
+            message.from_user.full_name,
+            info["score"],
+            info["percent"],
+            info["daraja"],
             temp_photo_path
         )
-        
+
         with open(cert_file, "rb") as cf:
             bot.send_photo(
-                uid, 
-                cf, 
+                uid,
+                cf,
                 caption=f"🎓 <b>Tiriklik darsi muvaffaqiyatli yakunlandi! Milliy darajadagi {info['daraja']} Sertifikatingiz tayyorlandi!</b>\n\n📢 {KANAL_USER}",
                 reply_markup=main_menu(uid)
             )
         os.remove(cert_file)
-    except Exception as e:
-        bot.send_message(uid, f"❌ Sertifikat tayyorlashda xatolik bo'ldi. Hisobot adminga yuborildi.")
-        
+    except Exception:
+        bot.send_message(uid, "❌ Sertifikat tayyorlashda xatolik bo'ldi. Hisobot adminga yuborildi.")
+
     if os.path.exists(temp_photo_path):
         os.remove(temp_photo_path)
-        
+
     user_states[uid] = "wait_written_photo"
     kb = ReplyKeyboardMarkup(resize_keyboard=True)
     kb.add(KeyboardButton("⏭ Yozma ish yoʻq (Oʻtkazib yuborish)"))
     bot.send_message(uid, "📸 <b>Endi esa yozma ish (yechimlar) rasmini shu yerga yuklang (ustoz tekshiruvi uchun):</b>", reply_markup=kb)
 
 # ================= YOZMA ISH RASMINI QABUL QILISH =================
-@bot.message_handler(func=lambda m: m.text == "⏭ Yozma ish yoʻq (Oʻtkazib yuborish)")
+@bot.message_handler(chat_types=["private"], func=lambda m: m.text == "⏭ Yozma ish yoʻq (Oʻtkazib yuborish)")
 def skip_written_photo(message):
     user_states.pop(message.from_user.id, None)
     bot.send_message(message.chat.id, "✅ Test yakunlandi!", reply_markup=main_menu(message.from_user.id))
 
-@bot.message_handler(content_types=['photo'], func=lambda m: user_states.get(m.from_user.id) == "wait_written_photo")
+@bot.message_handler(chat_types=["private"], content_types=['photo'], func=lambda m: user_states.get(m.from_user.id) == "wait_written_photo")
 def receive_written_photo(message):
     uid = message.from_user.id
     info = user_data.get(uid, {})
@@ -911,8 +920,10 @@ def receive_written_photo(message):
     kb = InlineKeyboardMarkup()
     kb.add(InlineKeyboardButton("✍️ Yozma ish uchun ball qoʻshish", callback_data=f"addw_{uid}_{info.get('test_code')}"))
     for adm in db_get_admins():
-        try: bot.send_photo(adm, photo_id, caption=caption, reply_markup=kb)
-        except Exception: pass
+        try:
+            bot.send_photo(adm, photo_id, caption=caption, reply_markup=kb)
+        except Exception:
+            pass
     user_states.pop(uid, None)
     bot.send_message(uid, "✅ <b>Yozma ish rasmi ustozga yuborildi!</b>", reply_markup=main_menu(uid))
 
@@ -925,27 +936,34 @@ def ask_written_bonus(call):
     bot.send_message(adm_id, f"✍️ Oʻquvchi (ID: {target_uid}) yozma ishi uchun necha ball qoʻshasiz?")
     bot.answer_callback_query(call.id)
 
-@bot.message_handler(func=lambda m: user_states.get(m.from_user.id) == "adm_give_w_score")
+@bot.message_handler(chat_types=["private"], func=lambda m: user_states.get(m.from_user.id) == "adm_give_w_score")
 def save_written_bonus(message):
     adm_id = message.from_user.id
-    try: bonus = float(message.text.replace(",", "."))
-    except ValueError: return bot.send_message(adm_id, "⚠️ Faqat raqam kiriting:")
+    try:
+        bonus = float(message.text.replace(",", "."))
+    except ValueError:
+        return bot.send_message(adm_id, "⚠️ Faqat raqam kiriting:")
     info = user_data[adm_id]
     with sqlite3.connect("database.db") as conn:
         c = conn.cursor()
-        c.execute("UPDATE results SET written_score = ?, rash_score = rash_score + ? WHERE user_id = ? AND test_code = ?",
-                  (bonus, bonus, info["target_uid"], info["t_code"]))
+        c.execute(
+            "UPDATE results SET written_score = ?, rash_score = rash_score + ? WHERE user_id = ? AND test_code = ?",
+            (bonus, bonus, info["target_uid"], info["t_code"])
+        )
         conn.commit()
     user_states.pop(adm_id, None)
     bot.send_message(adm_id, f"✅ Yozma ish uchun <b>+{bonus} ball</b> qoʻshildi!", reply_markup=admin_menu())
-    try: bot.send_message(info["target_uid"], f"🎉 <b>Ustoz yozma ishingizni tekshirdi va +{bonus} ball qoʻshdi!</b>")
-    except Exception: pass
+    try:
+        bot.send_message(info["target_uid"], f"🎉 <b>Ustoz yozma ishingizni tekshirdi va +{bonus} ball qoʻshdi!</b>")
+    except Exception:
+        pass
 
 # ================= CRM VA GURUHLAR =================
-@bot.message_handler(func=lambda m: m.text == "👥 Guruhlarni boshqarish (CRM)")
+@bot.message_handler(chat_types=["private"], func=lambda m: m.text == "👥 Guruhlarni boshqarish (CRM)")
 def crm_groups_menu(message):
     uid = message.from_user.id
-    if not db_is_admin(uid): return
+    if not db_is_admin(uid):
+        return
     user_states[uid] = "crm_set_user"
     bot.send_message(
         uid,
@@ -953,10 +971,11 @@ def crm_groups_menu(message):
         reply_markup=cancel_kb()
     )
 
-@bot.message_handler(func=lambda m: user_states.get(m.from_user.id) == "crm_set_user")
+@bot.message_handler(chat_types=["private"], func=lambda m: user_states.get(m.from_user.id) == "crm_set_user")
 def crm_choose_group(message):
     uid = message.from_user.id
-    if not message.text.isdigit(): return bot.send_message(uid, "⚠️ ID raqam kiriting:")
+    if not message.text.isdigit():
+        return bot.send_message(uid, "⚠️ ID raqam kiriting:")
     target_id = int(message.text)
     kb = InlineKeyboardMarkup(row_width=1)
     kb.add(
@@ -978,14 +997,16 @@ def crm_save_group(call):
     bot.answer_callback_query(call.id)
 
 # ================= REYTING VA VAZIFALAR =================
-@bot.message_handler(func=lambda m: m.text == "🏆 Umumiy Reyting")
+@bot.message_handler(chat_types=["private"], func=lambda m: m.text == "🏆 Umumiy Reyting")
 def show_global_rating(message):
-    if not check_subscription(message.from_user.id): return ask_to_subscribe(message.chat.id)
+    if not check_subscription(message.from_user.id):
+        return ask_to_subscribe(message.chat.id)
     with sqlite3.connect("database.db") as conn:
         c = conn.cursor()
         c.execute("SELECT full_name, rash_score, raw_correct, daraja FROM results ORDER BY rash_score DESC LIMIT 20")
         rows = c.fetchall()
-    if not rows: return bot.send_message(message.chat.id, "📭 Hali natijalar yoʻq.")
+    if not rows:
+        return bot.send_message(message.chat.id, "📭 Hali natijalar yoʻq.")
     medals = ["🥇", "🥈", "🥉"]
     text = "🏆 <b>A+ KIMYO | TOP-20 REYTING:</b>\n━━━━━━━━━━━━━━━━━━\n"
     for idx, r in enumerate(rows, 1):
@@ -993,23 +1014,26 @@ def show_global_rating(message):
         text += f"{m} {r[0]} — <b>{round(r[1], 1)} ball</b> ({r[2]}/40) | {r[3]}\n"
     bot.send_message(message.chat.id, text)
 
-@bot.message_handler(func=lambda m: m.text == "📑 Vazifa nazorati (Qilgan/Qilmagan)")
+@bot.message_handler(chat_types=["private"], func=lambda m: m.text == "📑 Vazifa nazorati (Qilgan/Qilmagan)")
 def ask_check_test_code(message):
     uid = message.from_user.id
-    if not db_is_admin(uid): return
+    if not db_is_admin(uid):
+        return
     user_states[uid] = "check_hw_code"
     bot.send_message(uid, "🔢 6 xonali maxsus test kodini kiriting:", reply_markup=cancel_kb())
 
-@bot.message_handler(func=lambda m: user_states.get(m.from_user.id) == "check_hw_code")
+@bot.message_handler(chat_types=["private"], func=lambda m: user_states.get(m.from_user.id) == "check_hw_code")
 def show_hw_status(message):
     uid = message.from_user.id
-    if not message.text.isdigit(): return bot.send_message(uid, "⚠️ Raqam kiriting!")
+    if not message.text.isdigit():
+        return bot.send_message(uid, "⚠️ Raqam kiriting!")
     code = int(message.text)
     with sqlite3.connect("database.db") as conn:
         c = conn.cursor()
         c.execute("SELECT title FROM tests WHERE test_code = ?", (code,))
         t = c.fetchone()
-        if not t: return bot.send_message(uid, "❌ Test topilmadi!")
+        if not t:
+            return bot.send_message(uid, "❌ Test topilmadi!")
         c.execute("SELECT user_id, full_name, rash_score, raw_correct FROM results WHERE test_code = ? ORDER BY rash_score DESC", (code,))
         done_rows = c.fetchall()
         done_ids = {r[0] for r in done_rows}
@@ -1028,10 +1052,11 @@ def show_hw_status(message):
         text += f"  • {u[1]} [{u[3]}] (Tel: {u[2] or 'yoʻq'})\n"
     bot.send_message(uid, text, reply_markup=admin_menu())
 
-@bot.message_handler(func=lambda m: m.text == "📊 Elektron Jadval (Excel/Word/PDF)")
+@bot.message_handler(chat_types=["private"], func=lambda m: m.text == "📊 Elektron Jadval (Excel/Word/PDF)")
 def export_menu(message):
     uid = message.from_user.id
-    if not db_is_admin(uid): return
+    if not db_is_admin(uid):
+        return
     kb = InlineKeyboardMarkup(row_width=3)
     kb.add(
         InlineKeyboardButton("📊 Excel (.xlsx)", callback_data="exp_excel"),
@@ -1043,7 +1068,8 @@ def export_menu(message):
 @bot.callback_query_handler(func=lambda call: call.data.startswith("exp_"))
 def handle_export(call):
     uid = call.from_user.id
-    if not db_is_admin(uid): return
+    if not db_is_admin(uid):
+        return
     fmt = call.data.split("_")[1]
     with sqlite3.connect("database.db") as conn:
         c = conn.cursor()
@@ -1101,14 +1127,15 @@ def handle_export(call):
     bot.answer_callback_query(call.id, "Tayyor!")
 
 # ================= KURSGA YOZILISH =================
-@bot.message_handler(func=lambda m: m.text == "✍️ Kursga yozilish")
+@bot.message_handler(chat_types=["private"], func=lambda m: m.text == "✍️ Kursga yozilish")
 def reg_1(message):
     uid = message.from_user.id
-    if not check_subscription(uid): return ask_to_subscribe(uid)
+    if not check_subscription(uid):
+        return ask_to_subscribe(uid)
     user_states[uid] = "reg_name"
     bot.send_message(uid, "✍️ Ism va familiyangizni kiriting:", reply_markup=cancel_kb())
 
-@bot.message_handler(func=lambda m: user_states.get(m.from_user.id) == "reg_name")
+@bot.message_handler(chat_types=["private"], func=lambda m: user_states.get(m.from_user.id) == "reg_name")
 def reg_2(message):
     uid = message.from_user.id
     user_data[uid] = {"ism": message.text}
@@ -1117,10 +1144,11 @@ def reg_2(message):
     kb.add(KeyboardButton("📱 Telefon raqamni yuborish", request_contact=True), KeyboardButton("❌ Bekor qilish"))
     bot.send_message(uid, "📱 Telefon raqamingizni yuboring:", reply_markup=kb)
 
-@bot.message_handler(content_types=['contact', 'text'], func=lambda m: user_states.get(m.from_user.id) == "reg_phone")
+@bot.message_handler(chat_types=["private"], content_types=['contact', 'text'], func=lambda m: user_states.get(m.from_user.id) == "reg_phone")
 def reg_3(message):
     uid = message.from_user.id
-    if message.text == "❌ Bekor qilish": return cancel_action(message)
+    if message.text == "❌ Bekor qilish":
+        return cancel_action(message)
     phone = message.contact.phone_number if message.contact else message.text
     user_data[uid]["phone"] = phone
     user_states[uid] = "reg_receipt"
@@ -1128,9 +1156,9 @@ def reg_3(message):
         c = conn.cursor()
         c.execute("UPDATE users SET full_name = ?, phone = ? WHERE user_id = ?", (user_data[uid]["ism"], phone, uid))
         conn.commit()
-    bot.send_message(uid, f"💳 <b>Karta:</b> <code>9860350142097954</code> ({KARTA_EGASI})\n\n📸 Toʻlov chekini yuboring:", reply_markup=cancel_kb())
+    bot.send_message(uid, f"💳 <b>Karta:</b> <code>{KARTA_RAQAM}</code> ({KARTA_EGASI})\n\n📸 Toʻlov chekini yuboring:", reply_markup=cancel_kb())
 
-@bot.message_handler(content_types=['photo'], func=lambda m: user_states.get(m.from_user.id) == "reg_receipt")
+@bot.message_handler(chat_types=["private"], content_types=['photo'], func=lambda m: user_states.get(m.from_user.id) == "reg_receipt")
 def reg_done(message):
     uid = message.from_user.id
     info = user_data.get(uid, {})
@@ -1139,8 +1167,10 @@ def reg_done(message):
     kb.add(InlineKeyboardButton("✅ Tasdiqlash", callback_data=f"pay_ok_{uid}"), InlineKeyboardButton("❌ Rad etish", callback_data=f"pay_no_{uid}"))
     caption = f"🆕 <b>YANGI TOʻLOV CHEKI</b>\n👤 Ism: {info.get('ism')}\n📞 Tel: {info.get('phone')}\n🆔 ID: <code>{uid}</code>"
     for adm in db_get_admins():
-        try: bot.send_photo(adm, photo, caption=caption, reply_markup=kb)
-        except Exception: pass
+        try:
+            bot.send_photo(adm, photo, caption=caption, reply_markup=kb)
+        except Exception:
+            pass
     user_states.pop(uid, None)
     bot.send_message(uid, "✅ Chek yuborildi!", reply_markup=main_menu(uid))
 
@@ -1157,26 +1187,30 @@ def pay_decision(call):
     bot.answer_callback_query(call.id)
 
 # Admin boshqa funksiyalari
-@bot.message_handler(func=lambda m: m.text == "📋 Testlar roʻyxati")
+@bot.message_handler(chat_types=["private"], func=lambda m: m.text == "📋 Testlar roʻyxati")
 def list_tests(message):
-    if not db_is_admin(message.from_user.id): return
+    if not db_is_admin(message.from_user.id):
+        return
     with sqlite3.connect("database.db") as conn:
         c = conn.cursor()
         c.execute("SELECT test_code, title FROM tests ORDER BY created_at DESC LIMIT 15")
         rows = c.fetchall()
-    if not rows: return bot.send_message(message.chat.id, "📭 Testlar yoʻq.")
+    if not rows:
+        return bot.send_message(message.chat.id, "📭 Testlar yoʻq.")
     bot.send_message(message.chat.id, "📋 <b>Testlar:</b>\n" + "\n".join([f"🔹 Kod: <code>{r[0]}</code> — {r[1]}" for r in rows]))
 
-@bot.message_handler(func=lambda m: m.text == "🗑 Testni oʻchirish")
+@bot.message_handler(chat_types=["private"], func=lambda m: m.text == "🗑 Testni oʻchirish")
 def del_test(message):
-    if not db_is_admin(message.from_user.id): return
+    if not db_is_admin(message.from_user.id):
+        return
     user_states[message.from_user.id] = "del_t"
     bot.send_message(message.chat.id, "🗑 Oʻchiriladigan test kodini yuboring:", reply_markup=cancel_kb())
 
-@bot.message_handler(func=lambda m: user_states.get(m.from_user.id) == "del_t")
+@bot.message_handler(chat_types=["private"], func=lambda m: user_states.get(m.from_user.id) == "del_t")
 def del_test_do(message):
     uid = message.from_user.id
-    if not message.text.isdigit(): return bot.send_message(uid, "Faqat raqam!")
+    if not message.text.isdigit():
+        return bot.send_message(uid, "Faqat raqam!")
     with sqlite3.connect("database.db") as conn:
         c = conn.cursor()
         c.execute("DELETE FROM tests WHERE test_code = ?", (int(message.text),))
@@ -1184,16 +1218,18 @@ def del_test_do(message):
     user_states.pop(uid, None)
     bot.send_message(uid, "✅ Oʻchirildi!", reply_markup=admin_menu())
 
-@bot.message_handler(func=lambda m: m.text == "📢 Hammaga xabar")
+@bot.message_handler(chat_types=["private"], func=lambda m: m.text == "📢 Hammaga xabar")
 def broadcast(message):
-    if not db_is_admin(message.from_user.id): return
+    if not db_is_admin(message.from_user.id):
+        return
     user_states[message.from_user.id] = "broad"
     bot.send_message(message.chat.id, "📢 Hammaga yuboriladigan xabarni kiriting:", reply_markup=cancel_kb())
 
-@bot.message_handler(content_types=['text', 'photo', 'video', 'document'], func=lambda m: user_states.get(m.from_user.id) == "broad")
+@bot.message_handler(chat_types=["private"], content_types=['text', 'photo', 'video', 'document'], func=lambda m: user_states.get(m.from_user.id) == "broad")
 def broadcast_send(message):
     uid = message.from_user.id
-    if message.text == "❌ Bekor qilish": return cancel_action(message)
+    if message.text == "❌ Bekor qilish":
+        return cancel_action(message)
     with sqlite3.connect("database.db") as conn:
         c = conn.cursor()
         c.execute("SELECT user_id FROM users")
@@ -1201,8 +1237,11 @@ def broadcast_send(message):
     user_states.pop(uid, None)
     sent = 0
     for u in users:
-        try: bot.copy_message(u, message.chat.id, message.message_id); sent += 1
-        except Exception: pass
+        try:
+            bot.copy_message(u, message.chat.id, message.message_id)
+            sent += 1
+        except Exception:
+            pass
     bot.send_message(uid, f"✅ {sent} ta oʻquvchiga yuborildi!", reply_markup=admin_menu())
 
 # ================= FLASK WEB SERVER VA INTERAKTIV TITR =================
