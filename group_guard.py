@@ -7,17 +7,64 @@ GUARD_CONFIG = {
     "enabled": True,             # Qorovulni yoqish/o'chirish
     "block_links": True,         # Havola, @username va forwardlarni o'chirish
     "block_bad_words": True,     # So'kinish va haqoratlarni o'chirish
-    "block_media_nsfw": False,   # True bo'lsa: oddiy a'zolarning rasm/video/stikerlarini o'chiradi
+    "block_media_nsfw": True,    # Video, GIF, stiker va dumaloq videolarni o'chirish
     "max_warnings": 2,           # Nechta ogohlantirishdan keyin bloklansin (1 = darhol blok)
     "ban_forever": True,         # True = butunlay Ban, False = 24 soatga Mute
 }
 
-# Taqiqlangan so'zlar bazasi (kichik harflarda yozing)
-BAD_WORDS = {
-    "soz1",
-    "soz2",
-    "haqorat1",
+# 1. Alohida so'z sifatida tekshiriladigan qisqa haqoratlar (oddiy so'zlar ichida adashmasligi uchun)
+EXACT_BAD_WORDS = {
+    "it", "eshak", "mol", "chochqa", "cho'chqa", "lox", "loh", "sucka", "suka",
+    "blya", "blyat", "nah", "nax", "pox", "poh", "xuy", "huy", "xui", "hui",
+    "eb", "yeb", "sik", "seq", "sex", "seks", "porno", "porn", "xxx",
+    "сука", "бля", "блять", "лох", "хуй", "еб", "ёб", "секс", "порно",
+    "fuck", "shit", "bitch", "dick", "cock", "pussy", "slut", "whore",
 }
+
+# 2. Qo'shimchali va yopishtirib yozilgan shakllari ham ushlanadigan o'zaklar
+ROOT_BAD_WORDS = {
+    # O'zbekcha haqorat va so'kinish o'zaklari (lotin)
+    "ahmoq", "axmoq", "tentak", "jinni", "iflos", "harom", "xarom", "haromi", "xaromi",
+    "qanjq", "qanjiq", "fohisha", "foxisha", "jalab", "jalap", "sharmanda", "betamiz",
+    "beodob", "terpila", "kazzob", "muttaham", "maraz", "razill", "ablah", "ablax",
+    "hayvon", "xayvon", "to'ng'iz", "tongiz", "eshshak", "dalbayob", "dolboeb",
+    "dalbayop", "gandon", "gandoncha", "pidar", "pidaras", "pedik", "g'ar", "gar",
+    "sikin", "sikay", "sikey", "sikish", "sikaman", "sikadi", "sikilgan",
+    "qo'toq", "qotoq", "qutoq", "qu'toq", "amcha", "amlar", "aming", "amingga",
+    "emchak", "ko't", "kotvachcha", "ko'tvachcha", "kotlik", "ko'tlik",
+    "onangni", "onangdi", "oneni", "onengni", "enangni", "eneni", "singlingni",
+    "opangni", "og'zingga", "ogzingga", "og'zinga", "ogzinga", "kallanga",
+    "basharangga", "aftingga", "daxuya", "daxshat", "chort", "chmo", "chmoshnik",
+
+    # O'zbekcha haqorat va so'kinish o'zaklari (kirill)
+    "ахмок", "аҳмоқ", "тентак", "жинни", "ифлос", "харом", "ҳаром", "хароми", "ҳароми",
+    "канжик", "қанжиқ", "фохиша", "фоҳиша", "жалаб", "жалап", "шарманда",
+    "каззоб", "муттахам", "муттаҳам", "мараз", "аблах", "аблаҳ",
+    "хайвон", "ҳайвон", "тунгиз", "тўнғиз", "эшак", "эшшак",
+    "далбаёб", "долбоёб", "гандон", "пидар", "пидарас", "педик", "ғар",
+    "сикин", "сикай", "сикей", "сикиш", "сикаман", "сикади", "сикилган",
+    "куток", "қўтоқ", "қутоқ", "аминг", "амингга", "эмчак", "кутвачча", "кўтвачча",
+    "онангни", "онангди", "онени", "онангнинг", "энангни", "синглингни",
+    "опангни", "огзингга", "оғзингга", "башарангга", "афтингга", "чмо", "чмошник",
+
+    # Ruscha so'kinish o'zaklari
+    "бляд", "сучк", "хуйн", "хуев", "хуёв", "охуе", "ахуе", "нахуй", "похуй",
+    "пизд", "ебан", "ёбан", "ебат", "ебал", "ебло", "уебок", "уёбок", "заеб",
+    "мудак", "мудил", "гандон", "пидор", "шлюх", "шалав", "мраз", "тварь",
+    "ублюд", "дебил", "идиот", "кретин", "сволоч", "падл", "гнид", "хуесос",
+    "pizd", "pidor", "ebat", "ebal", "yeban", "xuyna", "huyna", "nahuy", "pohuy",
+    "shlyux", "shalav", "mudak", "ublyud", "debil", "svoloch", "xuesos", "huesos",
+
+    # Inglizcha so'kinish o'zaklari
+    "fucking", "fucker", "motherfuck", "bullshit", "asshole", "bastard", "dumbass",
+    "jerkoff", "wanker", "cunt", "faggot", "nigger", "nigga",
+}
+
+# Harflar o'rniga raqam yoki o'xshash belgi qo'yib aldashni tuzatuvchi jadval
+LEET_MAP = str.maketrans({
+    "0": "o", "1": "i", "3": "e", "4": "a", "5": "s", "7": "t", "8": "b",
+    "@": "a", "$": "s", "!": "i",
+})
 
 LINK_REGEX = re.compile(
     r"(https?://\S+|t\.me/\S+|telegram\.me/\S+|www\.\S+|@[a-zA-Z0-9_]{4,}|\b\S+\.(uz|ru|com|net|org|me|xyz|info)\b)",
@@ -28,18 +75,43 @@ LINK_REGEX = re.compile(
 warnings_db = {}
 
 
-def _clean_text(text: str) -> str:
-    return re.sub(r"[^a-zа-яё0-9ʻ’']", "", text.lower())
+def _normalize_text(text: str) -> str:
+    lowered = text.lower().translate(LEET_MAP)
+    # O'zbekcha tutuq va o'/g' belgilarini birxillashtirish
+    lowered = lowered.replace("o‘", "o").replace("o'", "o").replace("oʻ", "o")
+    lowered = lowered.replace("g‘", "g").replace("g'", "g").replace("gʻ", "g")
+    # Belgilar va bo'shliqlarni olib tashlash
+    cleaned = re.sub(r"[^a-zа-яёқғҳў]", "", lowered)
+    # Ketma-ket bir xil harflarni qisqartirish (masalan: "siiiik" -> "sik")
+    cleaned = re.sub(r"(.)\1{2,}", r"\1", cleaned)
+    return cleaned
 
 
 def has_profanity(text: str) -> bool:
     if not text:
         return False
-    words = re.findall(r"[a-zа-яё0-9ʻ’']+", text.lower())
-    if any(w in BAD_WORDS for w in words):
-        return True
-    normalized = _clean_text(text)
-    return any(bad in normalized for bad in BAD_WORDS)
+
+    lowered = text.lower().translate(LEET_MAP)
+    lowered = lowered.replace("o‘", "o").replace("o'", "o").replace("oʻ", "o")
+    lowered = lowered.replace("g‘", "g").replace("g'", "g").replace("gʻ", "g")
+
+    # 1. Alohida so'zlar bo'yicha tekshirish
+    words = re.findall(r"[a-zа-яёқғҳў]+", lowered)
+    for w in words:
+        w_short = re.sub(r"(.)\1{2,}", r"\1", w)
+        if w in EXACT_BAD_WORDS or w_short in EXACT_BAD_WORDS:
+            return True
+        for root in ROOT_BAD_WORDS:
+            if root in w or root in w_short:
+                return True
+
+    # 2. Harflar orasiga nuqta/probel qo'yib yozilgan matnni tekshirish (masalan: "s.i.k")
+    joined = _normalize_text(text)
+    for root in ROOT_BAD_WORDS:
+        if root in joined:
+            return True
+
+    return False
 
 
 def has_link_or_forward(message) -> bool:
@@ -69,7 +141,7 @@ def is_admin_or_channel(bot, message) -> bool:
         return False
 
 
-def _delete_later(bot, chat_id, message_id, delay=8):
+def _delete_later(bot, chat_id, message_id, delay=5):
     time.sleep(delay)
     try:
         bot.delete_message(chat_id, message_id)
@@ -154,12 +226,12 @@ def register_guard(bot):
             apply_punishment(bot, message, "guruhga havola yoki reklama tashlash taqiqlangan")
             return
 
-        # 2. So'kinish tekshiruvi
+        # 2. So'kinish va haqorat tekshiruvi (ham matn, ham rasm ostidagi yozuvda)
         if GUARD_CONFIG["block_bad_words"] and has_profanity(full_text):
             apply_punishment(bot, message, "guruhda haqoratli so'z yozish taqiqlangan")
             return
 
-        # 3. Keraksiz media nazorati
-        if message.content_type in ("photo", "video", "animation", "sticker", "video_note") and GUARD_CONFIG["block_media_nsfw"]:
-            apply_punishment(bot, message, "guruhga media yoki stiker tashlash cheklangan")
+        # 3. Video, GIF va stiker nazorati (oddiy rasmga ruxsat beriladi)
+        if GUARD_CONFIG["block_media_nsfw"] and message.content_type in ("video", "animation", "sticker", "video_note"):
+            apply_punishment(bot, message, "guruhga video, GIF yoki stiker tashlash taqiqlangan")
             return
