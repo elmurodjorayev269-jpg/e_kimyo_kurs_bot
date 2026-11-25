@@ -5,7 +5,7 @@ import sqlite3
 import random
 import threading
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from flask import Flask, render_template_string
 import telebot
 from telebot.types import (
@@ -36,10 +36,24 @@ YOPIQ_GURUH_ID = int(os.environ.get("YOPIQ_GURUH_ID", "-1001234567890"))
 
 RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "https://e-kimyo-kurs-bot.onrender.com")
 
+# O'zbekiston vaqt mintaqasi (UTC+5)
+UZ_TZ = timezone(timedelta(hours=5))
+
+def uz_now():
+    return datetime.now(UZ_TZ).replace(tzinfo=None)
+
+def next_8pm_deadline():
+    """Keyingi kechki soat 20:00 (8:00 PM) vaqtini hisoblaydi"""
+    now = uz_now()
+    target = now.replace(hour=20, minute=0, second=0, microsecond=0)
+    if now >= target:
+        target += timedelta(days=1)
+    return target
+
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 app = Flask(__name__)
 
-# Qorovulni ulash (group_guard.py bo'sh funksiya bo'lsa ham xato bermaydi)
+# Qorovulni ulash
 register_guard(bot)
 
 user_states = {}
@@ -52,7 +66,7 @@ LIVE_ATTENDANCE = {
     "session_id": None
 }
 
-# ================= HTML INTERAKTIV TITR SHABLONI (ADMIN VA O'QUVCHI UCHUN) =================
+# ================= HTML INTERAKTIV TITR SHABLONI =================
 TITR_HTML = """
 <!DOCTYPE html>
 <html lang="uz">
@@ -123,7 +137,7 @@ TITR_HTML = """
 
     if (mode === 'create') {
         document.getElementById('page-title').innerText = "➕ Yangi Test Yaratish (Titr)";
-        document.getElementById('code-label').innerText = "Test nomini kiriting (Admin):";
+        document.getElementById('code-label').innerText = "Test nomini kiriting (Kechki 20:00 gacha ochiq bo'ladi):";
         document.getElementById('test-meta').placeholder = "Masalan: Milliy Sertifikat #1";
         document.getElementById('send-btn').innerText = "💾 Test kalitlarini saqlash";
     }
@@ -135,7 +149,6 @@ TITR_HTML = """
         document.getElementById('counter').innerText = `${filled} / 40`;
     }
 
-    // 1-32 yopiq savollar
     const closedDiv = document.getElementById('closed-questions');
     for (let i = 0; i < 32; i++) {
         const row = document.createElement('div');
@@ -156,7 +169,6 @@ TITR_HTML = """
         closedDiv.appendChild(row);
     }
 
-    // 33-35 moslashtirish
     const matchDiv = document.getElementById('matching-questions');
     for (let i = 32; i < 35; i++) {
         const row = document.createElement('div');
@@ -180,7 +192,6 @@ TITR_HTML = """
         matchDiv.appendChild(row);
     }
 
-    // 36-40 ochiq savollar
     const openDiv = document.getElementById('open-questions');
     for (let i = 35; i < 40; i++) {
         const row = document.createElement('div');
@@ -257,8 +268,8 @@ def init_db():
             )
         """)
         existing_cols = [row[1] for row in c.execute("PRAGMA table_info(users)").fetchall()]
-        now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
-        trial_str = (datetime.now() + timedelta(days=3)).strftime("%Y-%m-%d %H:%M")
+        now_str = uz_now().strftime("%Y-%m-%d %H:%M")
+        trial_str = (uz_now() + timedelta(days=3)).strftime("%Y-%m-%d %H:%M")
         if "last_active" not in existing_cols:
             c.execute(f"ALTER TABLE users ADD COLUMN last_active TEXT DEFAULT '{now_str}'")
         if "paid_until" not in existing_cols:
@@ -281,9 +292,15 @@ def init_db():
                 test_code INTEGER PRIMARY KEY,
                 title TEXT,
                 answers TEXT,
-                created_at TEXT
+                created_at TEXT,
+                expires_at TEXT
             )
         """)
+        test_cols = [row[1] for row in c.execute("PRAGMA table_info(tests)").fetchall()]
+        if "expires_at" not in test_cols:
+            default_exp = next_8pm_deadline().strftime("%Y-%m-%d %H:%M")
+            c.execute(f"ALTER TABLE tests ADD COLUMN expires_at TEXT DEFAULT '{default_exp}'")
+
         c.execute("""
             CREATE TABLE IF NOT EXISTS results (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -311,15 +328,15 @@ def init_db():
         conn.commit()
 
 def update_user_activity(user_id):
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+    now_str = uz_now().strftime("%Y-%m-%d %H:%M")
     with sqlite3.connect("database.db") as conn:
         c = conn.cursor()
         c.execute("UPDATE users SET last_active = ? WHERE user_id = ?", (now_str, user_id))
         conn.commit()
 
 def db_add_user(user_id, full_name, username, ref_id=0):
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
-    trial_str = (datetime.now() + timedelta(days=3)).strftime("%Y-%m-%d %H:%M")
+    now_str = uz_now().strftime("%Y-%m-%d %H:%M")
+    trial_str = (uz_now() + timedelta(days=3)).strftime("%Y-%m-%d %H:%M")
     with sqlite3.connect("database.db") as conn:
         c = conn.cursor()
         c.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,))
@@ -362,7 +379,7 @@ def db_get_admins():
 
 # ================= 30 KUNLIK TO'LOV MUDDATI TUGAGANLARNI CHETLATISH =================
 def check_expired_subscriptions(manual_admin_id=None):
-    now = datetime.now()
+    now = uz_now()
     kicked_list = []
 
     with sqlite3.connect("database.db") as conn:
@@ -416,10 +433,10 @@ def check_expired_subscriptions(manual_admin_id=None):
         bot.send_message(manual_admin_id, "✅ Hozircha barcha oʻquvchilarning 30 kunlik toʻlov muddati joyida!")
 
 def background_watcher():
-    """Har 10 daqiqada serverni uyg'otadi (uxlab qolmasligi uchun) va har 30 daqiqada to'lov muddatini tekshiradi"""
+    """Har 10 daqiqada serverni uyg'otadi va har 30 daqiqada to'lov muddatini tekshiradi"""
     counter = 0
     while True:
-        time.sleep(600)  # 10 daqiqa
+        time.sleep(600)
         counter += 1
         try:
             requests.get(RENDER_URL, timeout=10)
@@ -508,8 +525,8 @@ def generate_bmba_certificate(full_name, score, percent, level, photo_path):
     draw.text((50, 660), "Yozma ish natijasi:", fill="black")
     draw.text((650, 660), f"{t_yozma}", fill="black")
 
-    s_sana = datetime.now().strftime("%d.%m.%Y")
-    m_sana = (datetime.now().replace(year=datetime.now().year + 3)).strftime("%d.%m.%Y")
+    s_sana = uz_now().strftime("%d.%m.%Y")
+    m_sana = (uz_now().replace(year=uz_now().year + 3)).strftime("%d.%m.%Y")
 
     draw.line([30, 850, W - 30, 850], fill="#0a0a0a", width=1)
     draw.text((50, 880), f"Berilgan sanasi: {s_sana}", fill="black")
@@ -525,7 +542,7 @@ def generate_bmba_certificate(full_name, score, percent, level, photo_path):
     img.save(cert_path)
     return cert_path
 
-# ================= MENYULAR (IKKALASIDA HAM TITR TUGMASI BOR) =================
+# ================= MENYULAR =================
 def main_menu(user_id):
     kb = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
     titr_solve_btn = KeyboardButton(
@@ -537,8 +554,6 @@ def main_menu(user_id):
         KeyboardButton("✅ Kunlik yoʻqlama"),
         KeyboardButton("🏆 Umumiy Reyting"),
         KeyboardButton("🎬 Namuna darslar"),
-        KeyboardButton("🎮 Kimyo Viktorina"),
-        KeyboardButton("📖 Moddalar lugʻati"),
         KeyboardButton("👤 Shaxsiy kabinet"),
         KeyboardButton("🔗 Doʻstlarni taklif qilish"),
         KeyboardButton("✍️ Kursga yozilish"),
@@ -604,7 +619,7 @@ def start_cmd(message):
     text = (
         f"Assalomu alaykum, <b>{message.from_user.full_name}</b>! 👋\n\n"
         f"🧪 <b>A+ Kimyo | Online Maktabi</b> platformasiga xush kelibsiz!\n\n"
-        f"🔹 <b>📊 Elektron Titr:</b> 40 talik MS testini topshirish va Sertifikat olish\n"
+        f"🔹 <b>📊 Elektron Titr:</b> 40 talik vazifa/testni topshirish (Kechki 20:00 gacha ochiq)\n"
         f"🔹 <b>✅ Kunlik yoʻqlama:</b> Jonli dars paytida belgilangan vaqtda davomatdan oʻting\n"
         f"🔹 <b>🎬 Namuna darslar:</b> Bepul video darslar va qoʻllanmalar\n"
         f"🔹 <b>✍️ Kursga yozilish:</b> 30 kunlik yopiq guruhga obuna boʻlish\n\n"
@@ -673,7 +688,7 @@ def adm_open_attendance_start(message):
         return bot.send_message(uid, "⚠️ Faqat musbat raqam kiriting (masalan: 10):")
 
     minutes = int(message.text)
-    now = datetime.now()
+    now = uz_now()
     expires = now + timedelta(minutes=minutes)
     session_id = now.strftime("%Y-%m-%d_%H:%M")
 
@@ -713,7 +728,7 @@ def daily_attendance(message):
     if not check_subscription(uid):
         return ask_to_subscribe(uid)
 
-    now = datetime.now()
+    now = uz_now()
     if not LIVE_ATTENDANCE["is_open"] or not LIVE_ATTENDANCE["expires_at"] or now > LIVE_ATTENDANCE["expires_at"]:
         LIVE_ATTENDANCE["is_open"] = False
         return bot.send_message(
@@ -852,86 +867,6 @@ def referral_link(message):
     )
     bot.send_message(uid, text)
 
-# ================= KIMYOVIY VIKTORINA =================
-@bot.message_handler(chat_types=["private"], func=lambda m: m.text == "🎮 Kimyo Viktorina")
-def start_quiz(message):
-    uid = message.from_user.id
-    if not check_subscription(uid):
-        return ask_to_subscribe(uid)
-    update_user_activity(uid)
-
-    q_obj = random.choice([
-        {"q": "Sulfat kislotaning molekulyar formulasi qaysi?", "opts": ["H2SO4", "H2SO3", "H2S", "HNO3"], "ans": "H2SO4"},
-        {"q": "Kaliy permanganatning formulasi qaysi?", "opts": ["KMnO4", "K2MnO4", "MnO2", "KClO3"], "ans": "KMnO4"},
-        {"q": "Oltinning kimyoviy belgisi nima?", "opts": ["Au", "Ag", "Fe", "Cu"], "ans": "Au"},
-        {"q": "Avogadro doimiysi nechaga teng?", "opts": ["6.02×10²³", "22.4", "8.31", "1.6×10⁻¹⁹"], "ans": "6.02×10²³"},
-        {"q": "Eng yengil gaz qaysi?", "opts": ["Vodorod (H2)", "Geliy (He)", "Azot (N2)", "Kislorod (O2)"], "ans": "Vodorod (H2)"},
-        {"q": "Metanning formulasi qaysi?", "opts": ["CH4", "C2H6", "C2H4", "C2H2"], "ans": "CH4"}
-    ])
-    opts = q_obj["opts"].copy()
-    random.shuffle(opts)
-
-    user_data[uid] = {"quiz_ans": q_obj["ans"]}
-    kb = InlineKeyboardMarkup(row_width=2)
-    btns = [InlineKeyboardButton(o, callback_data=f"quiz_{o}") for o in opts]
-    kb.add(*btns)
-    bot.send_message(uid, f"🎮 <b>TEZKOR KIMYO VIKTORINASI:</b>\n\n❓ {q_obj['q']}", reply_markup=kb)
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith("quiz_"))
-def check_quiz(call):
-    uid = call.from_user.id
-    update_user_activity(uid)
-    chosen = call.data.split("_", 1)[1]
-    correct = user_data.get(uid, {}).get("quiz_ans")
-
-    if chosen == correct:
-        with sqlite3.connect("database.db") as conn:
-            c = conn.cursor()
-            c.execute("UPDATE users SET bonus_points = bonus_points + 2 WHERE user_id = ?", (uid,))
-            conn.commit()
-        bot.edit_message_text(
-            f"✅ <b>Toʻgʻri topdingiz!</b> ({correct})\n💎 Sizga <b>+2 bonus ball</b> qoʻshildi!",
-            call.message.chat.id, call.message.message_id
-        )
-    else:
-        bot.edit_message_text(
-            f"❌ <b>Xato!</b>\n✅ Toʻgʻri javob: <b>{correct}</b>",
-            call.message.chat.id, call.message.message_id
-        )
-    user_data.pop(uid, None)
-    bot.answer_callback_query(call.id)
-
-# ================= MODDALAR LUG'ATI =================
-@bot.message_handler(chat_types=["private"], func=lambda m: m.text == "📖 Moddalar lugʻati")
-def ask_dict_word(message):
-    uid = message.from_user.id
-    if not check_subscription(uid):
-        return ask_to_subscribe(uid)
-    update_user_activity(uid)
-    user_states[uid] = "wait_chem_word"
-    bot.send_message(
-        uid,
-        "📖 <b>Kimyoviy modda formulasini yozing</b> (masalan: <code>KMnO4</code>, <code>H2SO4</code>, <code>HNO3</code>):",
-        reply_markup=cancel_kb()
-    )
-
-@bot.message_handler(chat_types=["private"], func=lambda m: user_states.get(m.from_user.id) == "wait_chem_word")
-def search_chem_dict(message):
-    uid = message.from_user.id
-    query = message.text.strip().lower()
-
-    CHEM_DICT = {
-        "kmno4": "🧪 <b>Kaliy permanganat (KMnO₄)</b>\nToʻq binafsha rangli kristall modda, kuchli oksidlovchi.\n• Kislotali muhitda: Mn⁺⁷ → Mn²⁺ (rangsiz eritma)",
-        "h2so4": "🧪 <b>Sulfat kislota (H₂SO₄)</b>\nKuchli ikki negizli mineral kislota.",
-        "hno3": "🧪 <b>Nitrat kislota (HNO₃)</b>\nKuchli bir negizli kislota."
-    }
-
-    res = CHEM_DICT.get(query)
-    if res:
-        bot.send_message(uid, res)
-    else:
-        bot.send_message(uid, "🔍 Bu modda bazada topilmadi. Boshqa formula yozib koʻring (masalan: <code>KMnO4</code>).")
-
 # ================= NAMUNA DARSLAR =================
 @bot.message_handler(chat_types=["private"], func=lambda m: m.text == "🎬 Namuna darslar")
 def show_sample_lessons(message):
@@ -1008,13 +943,13 @@ def adm_save_lesson(message):
         c = conn.cursor()
         c.execute(
             "INSERT INTO sample_lessons (title, description, file_id, file_type, added_at) VALUES (?, ?, ?, ?, ?)",
-            (info["title"], info["desc"], fid, ftype, datetime.now().strftime("%Y-%m-%d %H:%M"))
+            (info["title"], info["desc"], fid, ftype, uz_now().strftime("%Y-%m-%d %H:%M"))
         )
         conn.commit()
     user_states.pop(uid, None)
     bot.send_message(uid, f"✅ <b>«{info['title']}»</b> qoʻshildi!", reply_markup=admin_menu())
 
-# ================= WEB APP (40 TALIK TITR — ADMIN VA O'QUVCHI UCHUN) =================
+# ================= WEB APP (40 TALIK TITR — KECHKI 20:00 GACHA OCHIQ) =================
 @bot.message_handler(content_types=['web_app_data'])
 def handle_webapp_data(message):
     uid = message.from_user.id
@@ -1025,7 +960,7 @@ def handle_webapp_data(message):
     payload = json.loads(message.web_app_data.data)
     mode, meta, answers = payload.get("mode"), payload.get("meta"), payload.get("answers")
 
-    # 1. ADMIN TITR ORQALI TEST YARATSA
+    # 1. ADMIN TEST YARATSA (Kechki soat 20:00 gacha muddat belgilanadi)
     if mode == "create":
         if not db_is_admin(uid):
             return
@@ -1038,36 +973,59 @@ def handle_webapp_data(message):
                 if not c.fetchone():
                     break
 
+        now_str = uz_now().strftime("%Y-%m-%d %H:%M")
+        deadline_dt = next_8pm_deadline()
+        deadline_str = deadline_dt.strftime("%Y-%m-%d %H:%M")
+
         with sqlite3.connect("database.db") as conn:
             c = conn.cursor()
             c.execute(
-                "INSERT INTO tests (test_code, title, answers, created_at) VALUES (?, ?, ?, ?)",
-                (code, meta, json.dumps(answers), datetime.now().strftime("%Y-%m-%d %H:%M"))
+                "INSERT INTO tests (test_code, title, answers, created_at, expires_at) VALUES (?, ?, ?, ?, ?)",
+                (code, meta, json.dumps(answers), now_str, deadline_str)
             )
             conn.commit()
 
         bot.send_message(
             uid,
-            f"✅ <b>Yangi 40 talik Milliy Test muvaffaqiyatli yaratildi!</b>\n\n"
+            f"✅ <b>Yangi 40 talik Vazifa/Test yaratildi!</b>\n\n"
             f"🔢 <b>Maxsus Test kodi:</b> <code>{code}</code>\n"
-            f"📘 Mavzu: <b>{meta}</b>\n\n"
-            f"Oʻquvchilar ushbu random kodni kiritib testni topshirishadi.",
+            f"📘 Mavzu: <b>{meta}</b>\n"
+            f"⏰ <b>Yopilish vaqti:</b> <code>{deadline_str}</code> (kechki 20:00 da avtomatik yopiladi)\n\n"
+            f"Oʻquvchilar ushbu kodni kiritib belgilangan vaqtgacha vazifani topshirishadi.",
             reply_markup=admin_menu()
         )
 
-    # 2. O'QUVCHI TITR ORQALI TEST TOPSHIRSA
+    # 2. O'QUVCHI VAZIFA/TEST TOPSHIRSA (Kechki 20:00 dan o'tgan-o'tmaganini tekshiramiz)
     elif mode == "solve":
         if not meta.isdigit():
             return bot.send_message(uid, "⚠️ Test kodi faqat raqam boʻlishi kerak!", reply_markup=main_menu(uid))
         code = int(meta)
         with sqlite3.connect("database.db") as conn:
             c = conn.cursor()
-            c.execute("SELECT title, answers FROM tests WHERE test_code = ?", (code,))
+            c.execute("SELECT title, answers, expires_at FROM tests WHERE test_code = ?", (code,))
             row = c.fetchone()
         if not row:
             return bot.send_message(uid, "❌ Bunday kodli test topilmadi! Qaytadan tekshirib ko'ring.", reply_markup=main_menu(uid))
 
-        title, correct_keys = row[0], json.loads(row[1])
+        title, correct_keys_json, expires_at_str = row
+
+        # Muddatni tekshirish (kechki 20:00 da yopiladi)
+        if expires_at_str:
+            try:
+                exp_dt = datetime.strptime(expires_at_str, "%Y-%m-%d %H:%M")
+                if uz_now() > exp_dt:
+                    return bot.send_message(
+                        uid,
+                        f"⛔ <b>VAZIFA TOPSHIRISH VAQTI TUGAGAN!</b>\n\n"
+                        f"📘 Mavzu: <b>{title}</b> (#{code})\n"
+                        f"⏰ Yopilgan vaqti: <code>{expires_at_str}</code> (kechki 20:00 da yopilgan)\n\n"
+                        f"Afsuski, muddat oʻtib ketgani sababli javoblar qabul qilinmaydi.",
+                        reply_markup=main_menu(uid)
+                    )
+            except ValueError:
+                pass
+
+        correct_keys = json.loads(correct_keys_json)
         raw_correct, rash_score, details = 0, 0.0, []
 
         for i in range(40):
@@ -1105,7 +1063,7 @@ def handle_webapp_data(message):
             c = conn.cursor()
             c.execute(
                 "INSERT INTO results (user_id, full_name, test_code, raw_correct, rash_score, percent, daraja, checked_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (uid, message.from_user.full_name, code, raw_correct, rash_score, percent, daraja, datetime.now().strftime("%Y-%m-%d %H:%M"))
+                (uid, message.from_user.full_name, code, raw_correct, rash_score, percent, daraja, uz_now().strftime("%Y-%m-%d %H:%M"))
             )
             conn.commit()
 
@@ -1116,7 +1074,8 @@ def handle_webapp_data(message):
             "percent": percent,
             "daraja": daraja,
             "raw_correct": raw_correct,
-            "details": details
+            "details": details,
+            "expires_at": expires_at_str
         }
 
         if rash_score >= 46.0:
@@ -1189,7 +1148,7 @@ def receive_user_photo_cert(message):
     kb.add(KeyboardButton("⏭ Yozma ish yoʻq (Oʻtkazib yuborish)"))
     bot.send_message(uid, "📸 <b>Endi esa yozma ish (yechimlar) rasmini shu yerga yuklang (ustoz tekshiruvi uchun):</b>", reply_markup=kb)
 
-# ================= YOZMA ISH RASMINI QABUL QILISH =================
+# ================= YOZMA ISH RASMINI QABUL QILISH (BU HAM KECHKI 20:00 DA YOPILADI) =================
 @bot.message_handler(chat_types=["private"], func=lambda m: m.text == "⏭ Yozma ish yoʻq (Oʻtkazib yuborish)")
 def skip_written_photo(message):
     user_states.pop(message.from_user.id, None)
@@ -1200,6 +1159,20 @@ def receive_written_photo(message):
     uid = message.from_user.id
     update_user_activity(uid)
     info = user_data.get(uid, {})
+
+    exp_str = info.get("expires_at")
+    if exp_str:
+        try:
+            if uz_now() > datetime.strptime(exp_str, "%Y-%m-%d %H:%M"):
+                user_states.pop(uid, None)
+                return bot.send_message(
+                    uid,
+                    f"⛔ <b>Yozma ish yuborish vaqti tugagan!</b> (Kechki 20:00 da yopilgan: <code>{exp_str}</code>)",
+                    reply_markup=main_menu(uid)
+                )
+        except ValueError:
+            pass
+
     photo_id = message.photo[-1].file_id
     caption = (
         f"📝 <b>YANGI YOZMA ISH KELDI!</b>\n"
@@ -1321,7 +1294,7 @@ def show_hw_status(message):
     code = int(message.text)
     with sqlite3.connect("database.db") as conn:
         c = conn.cursor()
-        c.execute("SELECT title FROM tests WHERE test_code = ?", (code,))
+        c.execute("SELECT title, expires_at FROM tests WHERE test_code = ?", (code,))
         t = c.fetchone()
         if not t:
             return bot.send_message(uid, "❌ Test topilmadi!")
@@ -1334,7 +1307,7 @@ def show_hw_status(message):
     user_states.pop(uid, None)
     not_done = [u for u in all_users if u[0] not in done_ids]
 
-    text = f"📑 <b>VAZIFA NAZORATI: Test #{code} ({t[0]})</b>\n━━━━━━━━━━━━━━━━━━\n"
+    text = f"📑 <b>VAZIFA NAZORATI: Test #{code} ({t[0]})</b>\n⏰ Muddati: <code>{t[1]}</code>\n━━━━━━━━━━━━━━━━━━\n"
     text += f"✅ <b>Vazifani bajarganlar ({len(done_rows)} ta):</b>\n"
     for r in done_rows:
         text += f"  • {r[1]} — <b>{round(r[2], 1)} ball</b>\n"
@@ -1475,8 +1448,8 @@ def pay_decision(call):
     target = int(target)
 
     if act == "ok":
-        new_paid_until = (datetime.now() + timedelta(days=30)).strftime("%Y-%m-%d %H:%M")
-        now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+        new_paid_until = (uz_now() + timedelta(days=30)).strftime("%Y-%m-%d %H:%M")
+        now_str = uz_now().strftime("%Y-%m-%d %H:%M")
 
         with sqlite3.connect("database.db") as conn:
             c = conn.cursor()
@@ -1532,13 +1505,26 @@ def pay_decision(call):
 def list_tests(message):
     if not db_is_admin(message.from_user.id):
         return
+    now = uz_now()
     with sqlite3.connect("database.db") as conn:
         c = conn.cursor()
-        c.execute("SELECT test_code, title FROM tests ORDER BY created_at DESC LIMIT 15")
+        c.execute("SELECT test_code, title, expires_at FROM tests ORDER BY created_at DESC LIMIT 15")
         rows = c.fetchall()
     if not rows:
         return bot.send_message(message.chat.id, "📭 Testlar yoʻq.")
-    bot.send_message(message.chat.id, "📋 <b>Testlar:</b>\n" + "\n".join([f"🔹 Kod: <code>{r[0]}</code> — {r[1]}" for r in rows]))
+
+    lines = []
+    for code, title, exp_str in rows:
+        status = "🟢 Ochiq"
+        if exp_str:
+            try:
+                if now > datetime.strptime(exp_str, "%Y-%m-%d %H:%M"):
+                    status = "🔴 Yopilgan"
+            except ValueError:
+                pass
+        lines.append(f"🔹 Kod: <code>{code}</code> — {title} ({status} | {exp_str or '-'})")
+
+    bot.send_message(message.chat.id, "📋 <b>Testlar roʻyxati:</b>\n\n" + "\n".join(lines))
 
 @bot.message_handler(chat_types=["private"], func=lambda m: m.text == "🗑 Testni oʻchirish")
 def del_test(message):
