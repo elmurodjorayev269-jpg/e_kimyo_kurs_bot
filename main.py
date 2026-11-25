@@ -4,8 +4,9 @@ import time
 import sqlite3
 import random
 import threading
+import requests
 from datetime import datetime, timedelta
-from flask import Flask, send_file, render_template_string
+from flask import Flask, render_template_string
 import telebot
 from telebot.types import (
     ReplyKeyboardMarkup, KeyboardButton,
@@ -19,7 +20,7 @@ import openpyxl
 from docx import Document
 from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
-from PIL import Image, ImageDraw, ImageFont, ImageOps
+from PIL import Image, ImageOps, ImageDraw
 
 # ================= SOZLAMALAR =================
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "SIZNING_YANGI_BOT_TOKENINGIZ")
@@ -30,7 +31,7 @@ KANAL_LINK = "https://t.me/kimyo_sertifkat_uchun"
 KARTA_RAQAM = "9860 3501 4209 7954"
 KARTA_EGASI = "Azizbek Ibrohimov"
 
-# Yopiq o'quvchilar guruhi ID si (Bot ushbu guruhda ADMIN bo'lishi va "Invite users" + "Ban users" huquqi bo'lishi shart!)
+# Yopiq o'quvchilar guruhi ID si (Bot ushbu guruhda ADMIN bo'lishi shart!)
 YOPIQ_GURUH_ID = int(os.environ.get("YOPIQ_GURUH_ID", "-1001234567890"))
 
 RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "https://e-kimyo-kurs-bot.onrender.com")
@@ -38,20 +39,20 @@ RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "https://e-kimyo-kurs-bot.onr
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 app = Flask(__name__)
 
-# Guruh qorovulini eng birinchi bo'lib ulaymiz!
+# Qorovulni ulash (group_guard.py bo'sh funksiya bo'lsa ham xato bermaydi)
 register_guard(bot)
 
 user_states = {}
 user_data = {}
 
-# Jonli dars yo'qlamasi holati (global)
+# Jonli dars yo'qlamasi holati
 LIVE_ATTENDANCE = {
     "is_open": False,
     "expires_at": None,
     "session_id": None
 }
 
-# ================= HTML INTERAKTIV TITR SHABLONI =================
+# ================= HTML INTERAKTIV TITR SHABLONI (ADMIN VA O'QUVCHI UCHUN) =================
 TITR_HTML = """
 <!DOCTYPE html>
 <html lang="uz">
@@ -62,13 +63,13 @@ TITR_HTML = """
     <script src="https://telegram.org/js/telegram-web-app.js"></script>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
-        body { background-color: #17212b; color: #ffffff; padding-bottom: 90px; }
+        body { background-color: #17212b; color: #ffffff; padding-bottom: 95px; }
         .header { position: sticky; top: 0; background: #242f3d; padding: 12px 15px; z-index: 100; border-bottom: 1px solid #0e1621; display: flex; justify-content: space-between; align-items: center; }
         .header h2 { font-size: 16px; color: #6ab3f3; }
         .cols-header { display: grid; grid-template-columns: 45px repeat(4, 1fr); text-align: center; padding: 8px 10px; background: #1c2733; font-weight: bold; color: #8b9bb4; font-size: 14px; position: sticky; top: 45px; z-index: 99; }
         .q-row { display: grid; grid-template-columns: 45px repeat(4, 1fr); align-items: center; padding: 6px 10px; border-bottom: 1px solid #202b36; }
         .q-num { font-weight: bold; color: #8b9bb4; text-align: center; font-size: 15px; }
-        .opt-btn { width: 42px; height: 42px; border-radius: 50%; border: 2px solid #3d4d5d; background: #242f3d; color: #fff; font-weight: bold; font-size: 15px; margin: 0 auto; display: flex; align-items: center; justify-content: center; cursor: pointer; transition: 0.15s; }
+        .opt-btn { width: 42px; height: 42px; border-radius: 50%; border: 2px solid #3d4d5d; background: #242f3d; color: #fff; font-weight: bold; font-size: 15px; margin: 0 auto; display: flex; align-items: center; justify-content: center; cursor: pointer; transition: 0.15s; user-select: none; }
         .opt-btn.active { background: #3390ec; border-color: #3390ec; box-shadow: 0 0 10px rgba(51, 144, 236, 0.5); }
         .match-row { padding: 10px 15px; border-bottom: 1px solid #202b36; }
         .match-grid { display: grid; grid-template-columns: repeat(6, 1fr); gap: 6px; margin-top: 8px; }
@@ -79,21 +80,21 @@ TITR_HTML = """
         .open-row input { flex: 1; padding: 10px 12px; border-radius: 8px; border: 1px solid #3d4d5d; background: #242f3d; color: #fff; font-size: 15px; outline: none; }
         .open-row input:focus { border-color: #3390ec; }
         .section-title { background: #0e1621; padding: 10px 15px; font-size: 13px; color: #6ab3f3; text-transform: uppercase; letter-spacing: 0.5px; font-weight: bold; }
-        .footer { position: fixed; bottom: 0; left: 0; right: 0; background: #242f3d; padding: 12px 15px; border-top: 1px solid #0e1621; }
+        .footer { position: fixed; bottom: 0; left: 0; right: 0; background: #242f3d; padding: 12px 15px; border-top: 1px solid #0e1621; z-index: 101; }
         .submit-btn { width: 100%; padding: 13px; background: #3390ec; color: #fff; border: none; border-radius: 10px; font-size: 16px; font-weight: bold; cursor: pointer; }
-        .code-box { padding: 12px 15px; background: #242f3d; margin: 10px; border-radius: 10px; }
-        .code-box input { width: 100%; padding: 10px; margin-top: 6px; border-radius: 8px; border: 1px solid #3d4d5d; background: #17212b; color: #fff; font-size: 16px; }
+        .code-box { padding: 12px 15px; background: #242f3d; margin: 10px; border-radius: 10px; border: 1px solid #3390ec; }
+        .code-box input { width: 100%; padding: 10px; margin-top: 6px; border-radius: 8px; border: 1px solid #3d4d5d; background: #17212b; color: #fff; font-size: 16px; outline: none; }
     </style>
 </head>
 <body>
 
 <div class="header">
     <h2 id="page-title">A+ Kimyo | 40 talik Titr</h2>
-    <span id="counter" style="font-size: 13px; color: #8b9bb4;">0 / 40</span>
+    <span id="counter" style="font-size: 13px; color: #8b9bb4; font-weight: bold;">0 / 40</span>
 </div>
 
 <div class="code-box">
-    <label id="code-label" style="font-size: 13px; color: #8b9bb4;">Test kodini kiriting:</label>
+    <label id="code-label" style="font-size: 13px; color: #6ab3f3; font-weight: bold;">Test kodini kiriting:</label>
     <input type="text" id="test-meta" placeholder="6 xonali kod, masalan: 492815">
 </div>
 
@@ -110,7 +111,7 @@ TITR_HTML = """
 <div id="open-questions"></div>
 
 <div class="footer">
-    <button class="submit-btn" onclick="submitTitr()">✅ Javoblarni yuborish</button>
+    <button class="submit-btn" id="send-btn" onclick="submitTitr()">✅ Javoblarni yuborish</button>
 </div>
 
 <script>
@@ -121,9 +122,10 @@ TITR_HTML = """
     const mode = urlParams.get('mode') || 'solve';
 
     if (mode === 'create') {
-        document.getElementById('page-title').innerText = "➕ Yangi 40 talik Test Yaratish";
-        document.getElementById('code-label').innerText = "Test nomini kiriting:";
+        document.getElementById('page-title').innerText = "➕ Yangi Test Yaratish (Titr)";
+        document.getElementById('code-label').innerText = "Test nomini kiriting (Admin):";
         document.getElementById('test-meta').placeholder = "Masalan: Milliy Sertifikat #1";
+        document.getElementById('send-btn').innerText = "💾 Test kalitlarini saqlash";
     }
 
     const answers = new Array(40).fill("");
@@ -133,6 +135,7 @@ TITR_HTML = """
         document.getElementById('counter').innerText = `${filled} / 40`;
     }
 
+    // 1-32 yopiq savollar
     const closedDiv = document.getElementById('closed-questions');
     for (let i = 0; i < 32; i++) {
         const row = document.createElement('div');
@@ -153,6 +156,7 @@ TITR_HTML = """
         closedDiv.appendChild(row);
     }
 
+    // 33-35 moslashtirish
     const matchDiv = document.getElementById('matching-questions');
     for (let i = 32; i < 35; i++) {
         const row = document.createElement('div');
@@ -176,6 +180,7 @@ TITR_HTML = """
         matchDiv.appendChild(row);
     }
 
+    // 36-40 ochiq savollar
     const openDiv = document.getElementById('open-questions');
     for (let i = 35; i < 40; i++) {
         const row = document.createElement('div');
@@ -253,7 +258,6 @@ def init_db():
         """)
         existing_cols = [row[1] for row in c.execute("PRAGMA table_info(users)").fetchall()]
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
-        # Yangi kirganlar to'lov qilmaguncha paid_until = NULL yoki o'tgan vaqt bo'ladi (yoki 3 kun sinov)
         trial_str = (datetime.now() + timedelta(days=3)).strftime("%Y-%m-%d %H:%M")
         if "last_active" not in existing_cols:
             c.execute(f"ALTER TABLE users ADD COLUMN last_active TEXT DEFAULT '{now_str}'")
@@ -262,7 +266,6 @@ def init_db():
         if "is_active" not in existing_cols:
             c.execute("ALTER TABLE users ADD COLUMN is_active INTEGER DEFAULT 1")
 
-        # Davomat jurnali jadvali
         c.execute("""
             CREATE TABLE IF NOT EXISTS attendance_logs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -379,10 +382,8 @@ def check_expired_subscriptions(manual_admin_id=None):
             except ValueError:
                 continue
 
-            # 30 kunlik to'lov muddati tugagan bo'lsa
             if now > paid_until:
                 try:
-                    # Yopiq guruhdan chiqarish (ban)
                     bot.ban_chat_member(YOPIQ_GURUH_ID, uid)
                 except Exception as e:
                     print(f"Guruhdan chetlatishda xato ({uid}): {e}")
@@ -415,13 +416,21 @@ def check_expired_subscriptions(manual_admin_id=None):
         bot.send_message(manual_admin_id, "✅ Hozircha barcha oʻquvchilarning 30 kunlik toʻlov muddati joyida!")
 
 def background_watcher():
-    """Har 30 daqiqada 30 kunlik to'lov muddatini tekshiradi"""
+    """Har 10 daqiqada serverni uyg'otadi (uxlab qolmasligi uchun) va har 30 daqiqada to'lov muddatini tekshiradi"""
+    counter = 0
     while True:
-        time.sleep(1800)
+        time.sleep(600)  # 10 daqiqa
+        counter += 1
         try:
-            check_expired_subscriptions()
+            requests.get(RENDER_URL, timeout=10)
         except Exception as e:
-            print(f"Watcher xatosi: {e}")
+            print(f"Keep-alive ping xatosi: {e}")
+
+        if counter % 3 == 0:
+            try:
+                check_expired_subscriptions()
+            except Exception as e:
+                print(f"Watcher xatosi: {e}")
 
 # ================= BMBA (DTM) SERTIFIKAT GENERATORI =================
 def generate_bmba_certificate(full_name, score, percent, level, photo_path):
@@ -516,7 +525,7 @@ def generate_bmba_certificate(full_name, score, percent, level, photo_path):
     img.save(cert_path)
     return cert_path
 
-# ================= MENYULAR =================
+# ================= MENYULAR (IKKALASIDA HAM TITR TUGMASI BOR) =================
 def main_menu(user_id):
     kb = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
     titr_solve_btn = KeyboardButton(
@@ -595,8 +604,8 @@ def start_cmd(message):
     text = (
         f"Assalomu alaykum, <b>{message.from_user.full_name}</b>! 👋\n\n"
         f"🧪 <b>A+ Kimyo | Online Maktabi</b> platformasiga xush kelibsiz!\n\n"
-        f"🔹 <b>✅ Kunlik yoʻqlama:</b> Jonli dars paytida belgilangan vaqtda davomatdan oʻting\n"
         f"🔹 <b>📊 Elektron Titr:</b> 40 talik MS testini topshirish va Sertifikat olish\n"
+        f"🔹 <b>✅ Kunlik yoʻqlama:</b> Jonli dars paytida belgilangan vaqtda davomatdan oʻting\n"
         f"🔹 <b>🎬 Namuna darslar:</b> Bepul video darslar va qoʻllanmalar\n"
         f"🔹 <b>✍️ Kursga yozilish:</b> 30 kunlik yopiq guruhga obuna boʻlish\n\n"
         f"👇 Quyidagi menyudan kerakli boʻlimni tanlang:"
@@ -682,7 +691,6 @@ def adm_open_attendance_start(message):
         reply_markup=admin_menu()
     )
 
-    # Barcha aktiv o'quvchilarga xabar berish
     with sqlite3.connect("database.db") as conn:
         c = conn.cursor()
         c.execute("SELECT user_id FROM users WHERE is_admin = 0 AND is_active = 1")
@@ -706,7 +714,6 @@ def daily_attendance(message):
         return ask_to_subscribe(uid)
 
     now = datetime.now()
-    # 1. Jonli dars yo'qlamasi ochiqmi va vaqti o'tib ketmaganmi tekshiramiz
     if not LIVE_ATTENDANCE["is_open"] or not LIVE_ATTENDANCE["expires_at"] or now > LIVE_ATTENDANCE["expires_at"]:
         LIVE_ATTENDANCE["is_open"] = False
         return bot.send_message(
@@ -720,7 +727,6 @@ def daily_attendance(message):
 
     with sqlite3.connect("database.db") as conn:
         c = conn.cursor()
-        # O'quvchi ushbu jonli dars sessiyasida oldin belgilanganmi?
         c.execute("SELECT id FROM attendance_logs WHERE user_id = ? AND session_id = ?", (uid, session_id))
         if c.fetchone():
             return bot.send_message(uid, "✅ Siz ushbu jonli dars yoʻqlamasidan oʻtib boʻlgansiz! 👍")
@@ -1008,7 +1014,7 @@ def adm_save_lesson(message):
     user_states.pop(uid, None)
     bot.send_message(uid, f"✅ <b>«{info['title']}»</b> qoʻshildi!", reply_markup=admin_menu())
 
-# ================= WEB APP (40 TALIK TITR) MA'LUMOTINI QABUL QILISH =================
+# ================= WEB APP (40 TALIK TITR — ADMIN VA O'QUVCHI UCHUN) =================
 @bot.message_handler(content_types=['web_app_data'])
 def handle_webapp_data(message):
     uid = message.from_user.id
@@ -1019,6 +1025,7 @@ def handle_webapp_data(message):
     payload = json.loads(message.web_app_data.data)
     mode, meta, answers = payload.get("mode"), payload.get("meta"), payload.get("answers")
 
+    # 1. ADMIN TITR ORQALI TEST YARATSA
     if mode == "create":
         if not db_is_admin(uid):
             return
@@ -1048,6 +1055,7 @@ def handle_webapp_data(message):
             reply_markup=admin_menu()
         )
 
+    # 2. O'QUVCHI TITR ORQALI TEST TOPSHIRSA
     elif mode == "solve":
         if not meta.isdigit():
             return bot.send_message(uid, "⚠️ Test kodi faqat raqam boʻlishi kerak!", reply_markup=main_menu(uid))
@@ -1478,13 +1486,11 @@ def pay_decision(call):
             )
             conn.commit()
 
-        # 1. Guruhdan oldin ban qilingan bo'lsa, blokdan ochamiz
         try:
             bot.unban_chat_member(YOPIQ_GURUH_ID, target, only_if_banned=True)
         except Exception as e:
             print(f"Unban xatosi ({target}): {e}")
 
-        # 2. Yopiq guruh uchun FAQAT 1 KISHILIK (1 martalik) havola yaratamiz
         invite_text = ""
         try:
             invite_obj = bot.create_chat_invite_link(
