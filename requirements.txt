@@ -1,7 +1,7 @@
 pyTelegramBotAPI
 Flask
-openpyxl
-python-docx
-reportlab
-Pillow
 requests
+pandas
+openpyxl
+fpdf
+python-docx
