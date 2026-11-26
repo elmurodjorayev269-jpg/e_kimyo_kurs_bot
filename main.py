@@ -261,7 +261,7 @@ def rate_work(call):
         c = conn.cursor()
         c.execute("UPDATE written_works SET score = ? WHERE id = ?", (score, work_id))
         c.execute("SELECT user_id FROM written_works WHERE id = ?", (work_id,))
-         student_id = c.fetchone()[0]
+        student_id = c.fetchone()[0]
         conn.commit()
     bot.edit_message_caption(f"✅ Baholandi: <b>{score} ball</b>", chat_id=call.message.chat.id, message_id=call.message.message_id)
     try:
