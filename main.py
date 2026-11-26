@@ -3,7 +3,7 @@ import time
 import sqlite3
 import threading
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta
 from flask import Flask
 import telebot
 from telebot.types import (
@@ -15,7 +15,6 @@ from telebot.types import (
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "SIZNING_BOT_TOKENINGIZ")
 ADMIN_PAROL = os.environ.get("ADMIN_PAROL", "kimyo2026")
 ADMIN_LICHKA = "@onlyibrohimov"
-KANAL_LINK = "https://t.me/kimyo_sertifkat_uchun"
 KARTA_RAQAM = "9860 3501 4209 7954"
 KARTA_EGASI = "Azizbek Ibrohimov"
 
@@ -27,6 +26,7 @@ app = Flask(__name__)
 
 user_states = {}
 user_data = {}
+attendance_sessions = {}
 
 # ================= BAZA VA XAVFSIZLIK =================
 def init_db():
@@ -50,6 +50,26 @@ def init_db():
                 full_name TEXT,
                 photo_id TEXT,
                 score REAL DEFAULT -1,
+                checked_at TEXT
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS test_results (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                full_name TEXT,
+                score INTEGER,
+                tested_at TEXT
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS attendance (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                full_name TEXT,
+                group_name TEXT,
+                session_date TEXT,
+                session_id TEXT,
                 checked_at TEXT
             )
         """)
@@ -81,6 +101,8 @@ def student_menu():
     kb = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
     kb.add(
         KeyboardButton("📸 Vazifa yuborish"),
+        KeyboardButton("📝 Test ishlash (Avto-tekshirish)"),
+        KeyboardButton("🎖 Sertifikat olish"),
         KeyboardButton("👤 Shaxsiy kabinet"),
         KeyboardButton("📞 Admin bilan aloqa")
     )
@@ -89,6 +111,7 @@ def student_menu():
 def admin_menu():
     kb = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
     kb.add(
+        KeyboardButton("📊 Dars davomatini boshlash"),
         KeyboardButton("👥 O'quvchilarni boshqarish"),
         KeyboardButton("📢 Xabar yuborish"),
         KeyboardButton("🔙 Bosh menyu")
@@ -110,7 +133,7 @@ def start_cmd(message):
     if is_admin:
         return bot.send_message(uid, "⚙️ <b>Admin Panel:</b>", reply_markup=admin_menu())
     elif is_active:
-        bot.send_message(uid, f"Xush kelibsiz!", reply_markup=student_menu())
+        bot.send_message(uid, "Xush kelibsiz!", reply_markup=student_menu())
     else:
         text = (f"Assalomu alaykum!\n"
                 f"🧪 <b>A+ Kimyo</b> platformasiga xush kelibsiz.\n"
@@ -153,11 +176,11 @@ def cancel_action(message):
 def contact_admin(message):
     bot.send_message(message.chat.id, f"👨‍🏫 Murojaat uchun: {ADMIN_LICHKA}")
 
-# ================= TO'LOV JARAYONI (Ism -> Nomer -> Chek) =================
+# ================= TO'LOV JARAYONI =================
 @bot.message_handler(chat_types=["private"], func=lambda m: m.text == "✍️ Kursga yozilish")
 def reg_1(message):
     user_states[message.from_user.id] = "reg_name"
-    bot.send_message(message.chat.id, "📝 Iltimos, Ism va Familiyangizni yozing:\n<i>(Masalan: Karim Karimov)</i>", reply_markup=cancel_kb())
+    bot.send_message(message.chat.id, "📝 Iltimos, Ism va Familiyangizni yozing:\n<i>(Masalan: Azizbek Ibrohimov)</i>", reply_markup=cancel_kb())
 
 @bot.message_handler(chat_types=["private"], content_types=['text'], func=lambda m: user_states.get(m.from_user.id) == "reg_name")
 def reg_2(message):
@@ -210,13 +233,14 @@ def pay_decision(call):
         user_states[call.from_user.id] = f"choose_group_{target_id}"
         kb = InlineKeyboardMarkup(row_width=1)
         kb.add(
-            InlineKeyboardButton("✨ 1-Guruh: Milliy Sertifikat", callback_data=f"setgrp_{target_id}_1-Guruh"),
-            InlineKeyboardButton("⚡️ 2-Guruh: Noldan Kimyo", callback_data=f"setgrp_{target_id}_2-Guruh"),
+            InlineKeyboardButton("4️⃣ 4-Guruh: Milliy Sertifikat", callback_data=f"setgrp_{target_id}_4-Guruh"),
+            InlineKeyboardButton("5️⃣ 5-Guruh: Milliy Sertifikat", callback_data=f"setgrp_{target_id}_5-Guruh"),
+            InlineKeyboardButton("6️⃣ 6-Guruh: Milliy Sertifikat", callback_data=f"setgrp_{target_id}_6-Guruh"),
             InlineKeyboardButton("❌ Bekor qilish", callback_data=f"pay_no_{target_id}")
         )
         bot.send_message(call.message.chat.id, f"O'quvchi (ID: <code>{target_id}</code>) qaysi guruhga qo'shilishi kerak?", reply_markup=kb)
     else:
-        bot.send_message(target_id, "❌ <b>To'lov tasdiqlanmadi.</b>")
+        bot.send_message(target_id, "To'lov tasdiqlanmadi.</b>")
         bot.edit_message_caption("❌ <b>RAD ETILDI</b>", chat_id=call.message.chat.id, message_id=call.message.message_id)
     bot.answer_callback_query(call.id)
 
@@ -224,6 +248,7 @@ def pay_decision(call):
 def finalize_payment(call):
     target_id = int(call.data.split("_")[1])
     group_name = call.data.split("_")[2]
+    expiry_date = (datetime.now() + timedelta(days=30)).strftime("%Y-%m-%d")
 
     try:
         bot.unban_chat_member(YOPIQ_GURUH_ID, target_id, only_if_banned=True)
@@ -234,13 +259,154 @@ def finalize_payment(call):
 
     with sqlite3.connect("database.db") as conn:
         c = conn.cursor()
-        c.execute("UPDATE users SET is_active = 1, group_name = ? WHERE user_id = ?", (group_name, target_id))
+        c.execute("UPDATE users SET is_active = 1, group_name = ?, paid_until = ? WHERE user_id = ?", 
+                  (group_name, expiry_date, target_id))
         conn.commit()
 
-    bot.send_message(target_id, f"🎉 <b>To'lovingiz tasdiqlandi!</b>\n\nGuruh: {group_name}\nSiz uchun maxsus havola: {invite_link}", reply_markup=student_menu())
+    bot.send_message(target_id, f"🎉 <b>To'lovingiz tasdiqlandi!</b>\n\nGuruh: {group_name}\nTo'lov muddati: {expiry_date} gacha\nSiz uchun maxsus havola: {invite_link}", reply_markup=student_menu())
     bot.edit_message_caption(f"✅ <b>TASDIQLANDI</b>\nGuruh: {group_name}", chat_id=call.message.chat.id, message_id=call.message.message_id)
     user_states.pop(call.from_user.id, None)
     bot.answer_callback_query(call.id)
+
+# ================= DARS DAVOMATI (KUNLIK CHEKLANGAN) =================
+@bot.message_handler(chat_types=["private"], func=lambda m: m.text == "📊 Dars davomatini boshlash")
+def start_attendance(message):
+    _, is_admin = db_check_user(message.from_user.id)
+    if not is_admin:
+        return
+    user_states[message.from_user.id] = "att_group"
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(
+        InlineKeyboardButton("4️⃣ 4-Guruh", callback_data="att_grp_4-Guruh"),
+        InlineKeyboardButton("5️⃣ 5-Guruh", callback_data="att_grp_5-Guruh"),
+        InlineKeyboardButton("6️⃣ 6-Guruh", callback_data="att_grp_6-Guruh")
+    )
+    bot.send_message(message.chat.id, "Qaysi guruh uchun davomat o'tkazmoqchisiz?", reply_markup=kb)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("att_grp_"))
+def trigger_attendance(call):
+    group_name = call.data.split("_")[2]
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    session_id = datetime.now().strftime("%H%M%S")
+    session_key = f"{group_name}_{today_str}"
+    
+    attendance_sessions[session_key] = True
+    
+    with sqlite3.connect("database.db") as conn:
+        c = conn.cursor()
+        c.execute("SELECT user_id FROM users WHERE group_name = ? AND is_active = 1", (group_name,))
+        students = c.fetchall()
+
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("✅ DARSDA VAQTIDAMAN", callback_data=f"here_{session_key}_{session_id}"))
+
+    count = 0
+    for s in students:
+        try:
+            bot.send_message(s[0], f"⏰ <b>Diqqat, davomat ({today_str})!</b>\n\n<b>{group_name}</b> darsi boshlandi. Ishtirokingizni tasdiqlang:", reply_markup=kb)
+            count += 1
+        except Exception:
+            pass
+
+    bot.edit_message_caption(f"<b>{group_name}</b> uchun bugungi davomat boshlandi ({count} o'quvchiga yuborildi).", chat_id=call.message.chat.id, message_id=call.message.message_id)
+    bot.answer_callback_query(call.id)
+
+    threading.Thread(target=close_attendance, args=(session_key, group_name), daemon=True).start()
+
+def close_attendance(session_key, group_name):
+    time.sleep(600)
+    attendance_sessions[session_key] = False
+    with sqlite3.connect("database.db") as conn:
+        c = conn.cursor()
+        c.execute("SELECT COUNT(DISTINCT user_id) FROM attendance WHERE session_date = ? AND group_name = ?", (datetime.now().strftime("%Y-%m-%d"), group_name))
+        present_count = c.fetchone()[0]
+    for adm in db_get_admins():
+        try:
+            bot.send_message(adm, f"🛑 <b>Davomat sessiyasi yakunlandi ({group_name}).</b>\nBugun qatnashganlar: <b>{present_count} ta</b> o'quvchi.")
+        except Exception:
+            pass
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("here_"))
+def mark_attendance(call):
+    parts = call.data.split("_")
+    session_key = f"{parts[1]}_{parts[2]}"
+    uid = call.from_user.id
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    
+    if not attendance_sessions.get(session_key, False):
+        return bot.answer_callback_query(call.id, "❌ Davomat vaqti tugadi yoki faol emas!", show_alert=True)
+    
+    with sqlite3.connect("database.db") as conn:
+        c = conn.cursor()
+        c.execute("SELECT full_name, group_name FROM users WHERE user_id = ?", (uid,))
+        user = c.fetchone()
+        if not user:
+            return bot.answer_callback_query(call.id, "🚫 Ro'yxatdan o'tmagansiz.")
+        
+        c.execute("SELECT id FROM attendance WHERE user_id = ? AND session_date = ?", (uid, today_str))
+        if c.fetchone():
+            return bot.answer_callback_query(call.id, "⚠️ Siz bugun ushbu guruh davomatida allaqachon qatnashgansiz!", show_alert=True)
+            
+        c.execute("INSERT INTO attendance (user_id, full_name, group_name, session_date, session_id, checked_at) VALUES (?, ?, ?, ?, ?, ?)",
+                  (uid, user[0], user[1], today_str, parts[3], datetime.now().strftime("%H:%M")))
+        conn.commit()
+        
+    bot.answer_callback_query(call.id, "✅ Davomatingiz qabul qilindi!", show_alert=True)
+    bot.edit_message_reply_markup(chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=None)
+
+# ================= KENGAYTIRILGAN FUNKSIYALI TEST VA SERTIFIKAT =================
+@bot.message_handler(chat_types=["private"], func=lambda m: m.text == "📝 Test ishlash (Avto-tekshirish)")
+def start_test_process(message):
+    uid = message.from_user.id
+    is_active, _ = db_check_user(uid)
+    if not is_active:
+        return bot.send_message(uid, "🚫 Ruxsat yo'q. Kursga yoziling.")
+    user_states[uid] = "test_q1"
+    bot.send_message(uid, "🧪 <b>1-savol:</b> H2O molekulyar massasi qanday?\n\nA) 16\nB) 18\nC) 20", reply_markup=cancel_kb())
+
+@bot.message_handler(chat_types=["private"], content_types=['text'], func=lambda m: user_states.get(m.from_user.id) in ["test_q1", "test_q2"])
+def handle_test_answers(message):
+    uid = message.from_user.id
+    state = user_states[uid]
+    text = message.text.upper()
+    
+    if state == "test_q1":
+        user_data[uid] = {"q1_score": 1 if text == "B" else 0}
+        user_states[uid] = "test_q2"
+        bot.send_message(uid, "🧪 <b>2-savol:</b> Eng kuchli kislitani ko'rsating:\n\nA) HCl\nB) H2SO4\nC) HF")
+    elif state == "test_q2":
+        q2_score = 1 if text == "A" else 0
+        total_score = (user_data[uid]["q1_score"] + q2_score) * 50
+        
+        with sqlite3.connect("database.db") as conn:
+            c = conn.cursor()
+            c.execute("SELECT full_name FROM users WHERE user_id = ?", (uid,))
+            name = c.fetchone()[0]
+            c.execute("INSERT INTO test_results (user_id, full_name, score, tested_at) VALUES (?, ?, ?, ?)",
+                      (uid, name, total_score, datetime.now().strftime("%Y-%m-%d %H:%M")))
+            conn.commit()
+            
+        user_states.pop(uid, None)
+        bot.send_message(uid, f"🎉 <b>Test yakunlandi!</b>\nTo'plagan ballingiz: <b>{total_score} ball</b>", reply_markup=student_menu())
+
+@bot.message_handler(chat_types=["private"], func=lambda m: m.text == "🎖 Sertifikat olish")
+def generate_certificate(message):
+    uid = message.from_user.id
+    is_active, _ = db_check_user(uid)
+    if not is_active:
+        return bot.send_message(uid, "🚫 Sertifikat olish uchun avval kursni tugatishingiz kerak.")
+    
+    with sqlite3.connect("database.db") as conn:
+        c = conn.cursor()
+        c.execute("SELECT full_name FROM users WHERE user_id = ?", (uid,))
+        name = c.fetchone()[0]
+        
+    cert_text = (f"📜 <b>A+ KIMYO TA'LIM PLATFORMASI</b>\n\n"
+                 f"Ushbu sertifikat <b>{name}</b> ga\n"
+                 f"Kimyo fanidan o'quv kursini muvaffaqiyatli tamomlagani uchun beriladi.\n\n"
+                 f"Sana: {datetime.now().strftime('%d.%m.%Y')}\n"
+                 f"Tasdiqladi: {KARTA_EGASI}")
+    bot.send_message(uid, cert_text)
 
 # ================= VAZIFA TOPSHIRISH =================
 @bot.message_handler(chat_types=["private"], func=lambda m: m.text == "📸 Vazifa yuborish")
@@ -300,7 +466,7 @@ def profile(message):
     uid = message.from_user.id
     with sqlite3.connect("database.db") as conn:
         c = conn.cursor()
-        c.execute("SELECT full_name, phone, group_name FROM users WHERE user_id = ?", (uid,))
+        c.execute("SELECT full_name, phone, group_name, paid_until FROM users WHERE user_id = ?", (uid,))
         user_info = c.fetchone()
         c.execute("SELECT COUNT(*), AVG(score) FROM written_works WHERE user_id = ? AND score >= 0", (uid,))
         stats = c.fetchone()
@@ -308,7 +474,8 @@ def profile(message):
     text = (f"👤 <b>SHAXSIY KABINET</b>\n\n"
             f"👤 F.I.Sh: {user_info[0]}\n"
             f"📞 Tel: {user_info[1]}\n"
-            f"👥 Guruh: {user_info[2]}\n\n"
+            f"👥 Guruh: {user_info[2]}\n"
+            f"⏳ To'lov muddati: {user_info[3] or 'Muddatsiz'}\n\n"
             f"📊 Topshirilgan vazifalar: {stats[0]} ta\n"
             f"📈 O'rtacha ball: {avg_score}")
     bot.send_message(uid, text)
@@ -318,9 +485,9 @@ def profile(message):
 def admin_users(message):
     with sqlite3.connect("database.db") as conn:
         c = conn.cursor()
-        c.execute("SELECT full_name, group_name, is_active FROM users WHERE is_admin = 0")
+        c.execute("SELECT full_name, group_name, paid_until, is_active FROM users WHERE is_admin = 0")
         users = c.fetchall()
-    text = "👥 <b>O'quvchilar ro'yxati:</b>\n" + "\n".join([f"• {u[0]} | {u[1]} ({'Aktiv' if u[2] else 'Kutilmoqda'})" for u in users])
+    text = "👥 <b>O'quvchilar ro'yxati:</b>\n" + "\n".join([f"• {u[0]} | {u[1]} | {u[2]} ({'Aktiv' if u[3] else 'Kutilmoqda'})" for u in users])
     bot.send_message(message.chat.id, text)
 
 @bot.message_handler(chat_types=["private"], func=lambda m: m.text == "📢 Xabar yuborish")
@@ -341,6 +508,38 @@ def broadcast_send(message):
         except Exception:
             pass
     bot.send_message(message.chat.id, "✅ Xabar barchaga muvaffaqiyatli yuborildi!", reply_markup=admin_menu())
+
+# ================= CRM & MUDDAT NAZORATI =================
+def check_subscriptions():
+    while True:
+        try:
+            today = datetime.now().strftime("%Y-%m-%d")
+            with sqlite3.connect("database.db") as conn:
+                c = conn.cursor()
+                c.execute("SELECT user_id, paid_until, full_name FROM users WHERE is_active = 1 AND paid_until IS NOT NULL")
+                users = c.fetchall()
+                
+                for uid, paid_until, name in users:
+                    exp_date = datetime.strptime(paid_until, "%Y-%m-%d")
+                    curr_date = datetime.strptime(today, "%Y-%m-%d")
+                    days_left = (exp_date - curr_date).days
+                    
+                    if 0 < days_left <= 3:
+                        try:
+                            bot.send_message(uid, f"⚠️ <b>Diqqat, {name}!</b>\n\nObuna muddatingiz tugashiga <b>{days_left} kun</b> qoldi. Bloklanmaslik uchun to'lovni amalga oshiring.")
+                        except Exception:
+                            pass
+                    elif days_left <= 0:
+                        try:
+                            bot.unban_chat_member(YOPIQ_GURUH_ID, uid)
+                            c.execute("UPDATE users SET is_active = 0 WHERE user_id = ?", (uid,))
+                            conn.commit()
+                            bot.send_message(uid, "🚫 <b>Obuna muddatingiz yakunlandi.</b>\n\nSiz guruhdan chetlatildingiz. Qayta kirish uchun kursga ro'yxatdan o'ting.")
+                        except Exception as e:
+                            print(f"Foydalanuvchini chiqarish xatosi: {e}")
+        except Exception as e:
+            print(f"CRM tekshirish xatosi: {e}")
+        time.sleep(86400) # Kuniga bir marta tekshiradi
 
 # ================= SERVER VA POLLING =================
 @app.route("/")
@@ -366,4 +565,5 @@ if __name__ == "__main__":
     init_db()
     threading.Thread(target=app.run, args=("0.0.0.0", int(os.environ.get("PORT", 8080))), daemon=True).start()
     threading.Thread(target=keep_alive, daemon=True).start()
+    threading.Thread(target=check_subscriptions, daemon=True).start()
     bot_polling()
