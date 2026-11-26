@@ -39,6 +39,7 @@ def init_db():
                 phone TEXT DEFAULT '',
                 group_name TEXT DEFAULT 'Guruh tanlanmagan',
                 paid_until TEXT,
+                missed_hw INTEGER DEFAULT 0,
                 is_active INTEGER DEFAULT 0,
                 is_admin INTEGER DEFAULT 0
             )
@@ -194,7 +195,7 @@ def reg_2(message):
 @bot.message_handler(chat_types=["private"], content_types=['contact', 'text'], func=lambda m: user_states.get(m.from_user.id) == "reg_phone")
 def reg_3(message):
     uid = message.from_user.id
-    if not message.contact and message.text == "❌ Bekor qilish":
+    if not message.contact and message.text == "":
         return cancel_action(message)
     phone = message.contact.phone_number if message.contact else message.text
     user_data[uid]["phone"] = phone
@@ -236,11 +237,11 @@ def pay_decision(call):
             InlineKeyboardButton("4️⃣ 4-Guruh: Milliy Sertifikat", callback_data=f"setgrp_{target_id}_4-Guruh"),
             InlineKeyboardButton("5️⃣ 5-Guruh: Milliy Sertifikat", callback_data=f"setgrp_{target_id}_5-Guruh"),
             InlineKeyboardButton("6️⃣ 6-Guruh: Milliy Sertifikat", callback_data=f"setgrp_{target_id}_6-Guruh"),
-            InlineKeyboardButton("❌ Bekor qilish", callback_data=f"pay_no_{target_id}")
+            InlineKeyboardButton("", callback_data=f"pay_no_{target_id}")
         )
         bot.send_message(call.message.chat.id, f"O'quvchi (ID: <code>{target_id}</code>) qaysi guruhga qo'shilishi kerak?", reply_markup=kb)
     else:
-        bot.send_message(target_id, "To'lov tasdiqlanmadi.</b>")
+        bot.send_message(target_id, "❌ <b>To'lov tasdiqlanmadi.</b>")
         bot.edit_message_caption("❌ <b>RAD ETILDI</b>", chat_id=call.message.chat.id, message_id=call.message.message_id)
     bot.answer_callback_query(call.id)
 
@@ -259,7 +260,7 @@ def finalize_payment(call):
 
     with sqlite3.connect("database.db") as conn:
         c = conn.cursor()
-        c.execute("UPDATE users SET is_active = 1, group_name = ?, paid_until = ? WHERE user_id = ?", 
+        c.execute("UPDATE users SET is_active = 1, group_name = ?, paid_until = ?, missed_hw = 0 WHERE user_id = ?", 
                   (group_name, expiry_date, target_id))
         conn.commit()
 
@@ -334,7 +335,7 @@ def mark_attendance(call):
     today_str = datetime.now().strftime("%Y-%m-%d")
     
     if not attendance_sessions.get(session_key, False):
-        return bot.answer_callback_query(call.id, "❌ Davomat vaqti tugadi yoki faol emas!", show_alert=True)
+        return bot.answer_callback_query(call.id, " vaqti tugadi yoki faol emas!", show_alert=True)
     
     with sqlite3.connect("database.db") as conn:
         c = conn.cursor()
@@ -408,7 +409,7 @@ def generate_certificate(message):
                  f"Tasdiqladi: {KARTA_EGASI}")
     bot.send_message(uid, cert_text)
 
-# ================= VAZIFA TOPSHIRISH =================
+# ================= VAZIFA TOPSHIRISH VA KETMA-KETLIK TEKSHIRISH =================
 @bot.message_handler(chat_types=["private"], func=lambda m: m.text == "📸 Vazifa yuborish")
 def ask_written_photo(message):
     uid = message.from_user.id
@@ -428,6 +429,7 @@ def receive_written_photo(message):
         name = c.fetchone()[0]
         c.execute("INSERT INTO written_works (user_id, full_name, photo_id, checked_at) VALUES (?, ?, ?, ?)",
                   (uid, name, photo_id, datetime.now().strftime("%Y-%m-%d %H:%M")))
+        c.execute("UPDATE users SET missed_hw = 0 WHERE user_id = ?", (uid,)) # Vazifa topshirildi, hisoblagich nollandi
         work_id = c.lastrowid
         conn.commit()
 
@@ -466,7 +468,7 @@ def profile(message):
     uid = message.from_user.id
     with sqlite3.connect("database.db") as conn:
         c = conn.cursor()
-        c.execute("SELECT full_name, phone, group_name, paid_until FROM users WHERE user_id = ?", (uid,))
+        c.execute("SELECT full_name, phone, group_name, paid_until, missed_hw FROM users WHERE user_id = ?", (uid,))
         user_info = c.fetchone()
         c.execute("SELECT COUNT(*), AVG(score) FROM written_works WHERE user_id = ? AND score >= 0", (uid,))
         stats = c.fetchone()
@@ -475,7 +477,8 @@ def profile(message):
             f"👤 F.I.Sh: {user_info[0]}\n"
             f"📞 Tel: {user_info[1]}\n"
             f"👥 Guruh: {user_info[2]}\n"
-            f"⏳ To'lov muddati: {user_info[3] or 'Muddatsiz'}\n\n"
+            f"⏳ To'lov muddati: {user_info[3] or 'Muddatsiz'}\n"
+            f"⚠️ Ketma-ket topshirilmagan vazifalar: {user_info[4]} ta\n\n"
             f"📊 Topshirilgan vazifalar: {stats[0]} ta\n"
             f"📈 O'rtacha ball: {avg_score}")
     bot.send_message(uid, text)
@@ -510,36 +513,57 @@ def broadcast_send(message):
     bot.send_message(message.chat.id, "✅ Xabar barchaga muvaffaqiyatli yuborildi!", reply_markup=admin_menu())
 
 # ================= CRM & MUDDAT NAZORATI =================
-def check_subscriptions():
+def check_subscriptions_and_hw():
     while True:
         try:
             today = datetime.now().strftime("%Y-%m-%d")
             with sqlite3.connect("database.db") as conn:
                 c = conn.cursor()
-                c.execute("SELECT user_id, paid_until, full_name FROM users WHERE is_active = 1 AND paid_until IS NOT NULL")
+                c.execute("SELECT user_id, paid_until, full_name, missed_hw FROM users WHERE is_active = 1")
                 users = c.fetchall()
                 
-                for uid, paid_until, name in users:
-                    exp_date = datetime.strptime(paid_until, "%Y-%m-%d")
-                    curr_date = datetime.strptime(today, "%Y-%m-%d")
-                    days_left = (exp_date - curr_date).days
-                    
-                    if 0 < days_left <= 3:
-                        try:
-                            bot.send_message(uid, f"⚠️ <b>Diqqat, {name}!</b>\n\nObuna muddatingiz tugashiga <b>{days_left} kun</b> qoldi. Bloklanmaslik uchun to'lovni amalga oshiring.")
-                        except Exception:
-                            pass
-                    elif days_left <= 0:
+                for uid, paid_until, name, missed_hw in users:
+                    # 1. Obuna muddati nazorati
+                    if paid_until:
+                        exp_date = datetime.strptime(paid_until, "%Y-%m-%d")
+                        curr_date = datetime.strptime(today, "%Y-%m-%d")
+                        days_left = (exp_date - curr_date).days
+                        
+                        if 0 < days_left <= 3:
+                            try:
+                                bot.send_message(uid, f"⚠️ <b>Diqqat, {name}!</b>\n\nObuna muddatingiz tugashiga <b>{days_left} kun</b> qoldi. Bloklanmaslik uchun to'lovni amalga oshiring.")
+                            except Exception:
+                                pass
+                        elif days_left <= 0:
+                            try:
+                                bot.unban_chat_member(YOPIQ_GURUH_ID, uid)
+                                c.execute("UPDATE users SET is_active = 0 WHERE user_id = ?", (uid,))
+                                conn.commit()
+                                bot.send_message(uid, "🚫 <b>Obuna muddatingiz yakunlandi.</b>\n\nSiz guruhdan chetlatildingiz. Qayta kirish uchun kursga ro'yxatdan o'ting.")
+                            except Exception as e:
+                                print(f"Foydalanuvchini chiqarish xatosi: {e}")
+                                
+                    # 2. Ketma-ket vazifa topshirmaganlik nazorati (5 marta)
+                    if missed_hw >= 5:
                         try:
                             bot.unban_chat_member(YOPIQ_GURUH_ID, uid)
-                            c.execute("UPDATE users SET is_active = 0 WHERE user_id = ?", (uid,))
+                            c.execute("UPDATE users SET is_active = 0, missed_hw = 0 WHERE user_id = ?", (uid,))
                             conn.commit()
-                            bot.send_message(uid, "🚫 <b>Obuna muddatingiz yakunlandi.</b>\n\nSiz guruhdan chetlatildingiz. Qayta kirish uchun kursga ro'yxatdan o'ting.")
+                            bot.send_message(uid, "🚫 <b>Ogohlantirish!</b>\n\nKetma-ket 5 ta vazifani bajarmaganingiz uchun yopiq guruhdan chetlatildingiz.")
                         except Exception as e:
-                            print(f"Foydalanuvchini chiqarish xatosi: {e}")
+                            print(f"Vazifa uchun chiqarish xatosi: {e}")
         except Exception as e:
             print(f"CRM tekshirish xatosi: {e}")
         time.sleep(86400) # Kuniga bir marta tekshiradi
+
+# ================= ADMINGA VAZIFA BERISHNIESLATISH =================
+def trigger_hw_reminder():
+    while True:
+        time.sleep(43200) # Har 12 soatda
+        with sqlite3.connect("database.db") as conn:
+            c = conn.cursor()
+            c.execute("UPDATE users SET missed_hw = missed_hw + 1 WHERE is_active = 1") # Har davrda o'tkazib yuborilgan deb hisoblaymiz (yoki admin qo'lda belgilaydi)
+            conn.commit()
 
 # ================= SERVER VA POLLING =================
 @app.route("/")
@@ -565,5 +589,5 @@ if __name__ == "__main__":
     init_db()
     threading.Thread(target=app.run, args=("0.0.0.0", int(os.environ.get("PORT", 8080))), daemon=True).start()
     threading.Thread(target=keep_alive, daemon=True).start()
-    threading.Thread(target=check_subscriptions, daemon=True).start()
+    threading.Thread(target=check_subscriptions_and_hw, daemon=True).start()
     bot_polling()
